@@ -18,7 +18,9 @@ export default function MeetingModal() {
   // Listen for hotspot-trigger with triggerId "meeting-room"
   useEffect(() => {
     function onMsg(e: MessageEvent) {
-      if (e.origin !== window.location.origin) return;
+      // Allow messages from same origin or from 3DVista iframe
+      const allowed = e.origin === window.location.origin || e.origin === "null";
+      if (!allowed) return;
 
       const { type, triggerId } = e.data || {};
 
