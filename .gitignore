@@ -36,6 +36,9 @@ yarn-error.log*
 # vercel
 .vercel
 
+# 3dvista tour files (large binary assets - deploy separately)
+/public/3dvista/
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts
