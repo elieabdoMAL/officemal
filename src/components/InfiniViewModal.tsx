@@ -44,9 +44,8 @@ export default function InfiniViewModal() {
         onClick={(e) => e.stopPropagation()}
         style={{
           position: "relative",
-          width: isMobile ? "98vw" : "85vw",
-          height: isMobile ? "92vh" : "85vh",
-          maxWidth: "1400px",
+          width: "98vw",
+          height: "98vh",
           background: "rgba(0, 0, 0, 0.15)",
           backdropFilter: "blur(20px)",
           borderRadius: "20px",
