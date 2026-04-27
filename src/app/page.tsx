@@ -1,6 +1,8 @@
 "use client";
 
 import MeetingModal from "@/components/MeetingModal";
+import PasscodeModal from "@/components/PasscodeModal";
+import InfiniViewModal from "@/components/InfiniViewModal";
 
 export default function Page() {
   return (
@@ -17,6 +19,8 @@ export default function Page() {
         allow="vr; gyroscope; accelerometer; autoplay"
       />
       <MeetingModal />
+      <PasscodeModal />
+      <InfiniViewModal />
     </div>
   );
 }
