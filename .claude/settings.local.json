@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(awk 'NR==225 { print length\\($0\\) }' \"c:/Users/user/Desktop/expo360/public/3dvista/script_general.js\")"
+    ]
+  }
+}

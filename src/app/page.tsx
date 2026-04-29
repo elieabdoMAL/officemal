@@ -3,6 +3,8 @@
 import MeetingModal from "@/components/MeetingModal";
 import PasscodeModal from "@/components/PasscodeModal";
 import InfiniViewModal from "@/components/InfiniViewModal";
+import MalModal from "@/components/MalModal";
+import Controls from "@/components/Controls";
 
 export default function Page() {
   return (
@@ -21,6 +23,8 @@ export default function Page() {
       <MeetingModal />
       <PasscodeModal />
       <InfiniViewModal />
+      <MalModal />
+      <Controls />
     </div>
   );
 }
