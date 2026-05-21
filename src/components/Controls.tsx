@@ -183,7 +183,18 @@ export default function Controls() {
         style={buttonStyle}
         title="Recenter Camera"
       >
-        <div style={innerBase}>⟳</div>
+        <div style={innerBase}>
+          <img
+            src="/camera-switch-front-back-svgrepo-com.svg"
+            alt=""
+            width={26}
+            height={26}
+            style={{
+              filter:
+                "brightness(0) saturate(100%) invert(100%) opacity(0.9)",
+            }}
+          />
+        </div>
       </button>
     </div>
   );

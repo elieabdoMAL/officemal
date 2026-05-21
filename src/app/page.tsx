@@ -5,6 +5,8 @@ import PasscodeModal from "@/components/PasscodeModal";
 import InfiniViewModal from "@/components/InfiniViewModal";
 import MalModal from "@/components/MalModal";
 import Controls from "@/components/Controls";
+import Receptionist from "@/components/Receptionist";
+import KioskLock from "@/components/KioskLock";
 
 export default function Page() {
   return (
@@ -25,6 +27,8 @@ export default function Page() {
       <InfiniViewModal />
       <MalModal />
       <Controls />
+      <Receptionist />
+      <KioskLock />
     </div>
   );
 }
