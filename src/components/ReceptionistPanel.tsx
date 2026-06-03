@@ -2,7 +2,6 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-// Minimal SpeechRecognition typings (not in TS lib by default).
 type SpeechRecognitionResult = {
   isFinal: boolean;
   0: { transcript: string };
@@ -24,9 +23,6 @@ type SpeechRecognitionLike = {
 };
 type SpeechRecognitionCtor = new () => SpeechRecognitionLike;
 
-const TRIGGER_ID = "receptionist";
-const IDLE_TIMEOUT_MS = 60_000;
-
 type ChatMessage = { role: "user" | "assistant"; content: string };
 type Status = "idle" | "connecting" | "ready" | "thinking" | "error";
 
@@ -34,15 +30,20 @@ type LiveAvatarSessionInstance = {
   start: () => Promise<void>;
   stop: () => Promise<void>;
   attach: (el: HTMLMediaElement) => void;
-  // In FULL mode the avatar's own LLM generates the reply. We just feed the
-  // user's input via message(); the avatar emits AVATAR_TRANSCRIPTION events
-  // with the response text as it speaks it.
   message: (text: string) => string;
   on: (event: string, cb: (...args: unknown[]) => void) => unknown;
 };
 
-export default function Receptionist() {
-  const [isOpen, setIsOpen] = useState(false);
+type Props = {
+  // When true the session starts immediately on mount. When false the user
+  // sees a "Start" button first — browsers block autoplay+getUserMedia inside
+  // deeply-nested iframes without a user gesture, so the gesture is the safer
+  // default for the 3DVista Web Frame embed.
+  autoStart?: boolean;
+};
+
+export default function ReceptionistPanel({ autoStart = false }: Props) {
+  const [active, setActive] = useState(autoStart);
   const [status, setStatus] = useState<Status>("idle");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -52,36 +53,9 @@ export default function Receptionist() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const sessionRef = useRef<LiveAvatarSessionInstance | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
-  const idleTimerRef = useRef<number | null>(null);
-  // Track whether the in-progress assistant bubble is still being filled by
-  // streaming AVATAR_TRANSCRIPTION_CHUNK events so we can append vs create.
   const assistantStreamingRef = useRef(false);
 
-  const resetIdleTimer = useCallback(() => {
-    if (idleTimerRef.current !== null) window.clearTimeout(idleTimerRef.current);
-    idleTimerRef.current = window.setTimeout(() => {
-      setIsOpen(false);
-    }, IDLE_TIMEOUT_MS);
-  }, []);
-
-  useEffect(() => {
-    const onMsg = (e: MessageEvent) => {
-      const allowed = e.origin === window.location.origin || e.origin === "null";
-      if (!allowed) return;
-      const { type, triggerId } = e.data || {};
-      if (type === "hotspot-trigger" && triggerId === TRIGGER_ID) {
-        setIsOpen(true);
-      }
-    };
-    window.addEventListener("message", onMsg);
-    return () => window.removeEventListener("message", onMsg);
-  }, []);
-
   const teardown = useCallback(async () => {
-    if (idleTimerRef.current !== null) {
-      window.clearTimeout(idleTimerRef.current);
-      idleTimerRef.current = null;
-    }
     try {
       recognitionRef.current?.abort();
     } catch {}
@@ -95,19 +69,16 @@ export default function Receptionist() {
     }
     setStatus("idle");
     setIsRecording(false);
-    setMessages([]);
     assistantStreamingRef.current = false;
   }, []);
 
   useEffect(() => {
-    if (!isOpen) {
+    if (!active) {
       teardown();
       return;
     }
 
     let cancelled = false;
-    // Local handle so cleanup can stop the session even if it never made it
-    // into sessionRef (e.g. cancelled mid-start during Strict Mode double-run).
     let localSession: LiveAvatarSessionInstance | null = null;
 
     const start = async () => {
@@ -134,7 +105,6 @@ export default function Receptionist() {
             videoRef.current.play().catch(() => {});
           }
           setStatus("ready");
-          resetIdleTimer();
         });
 
         session.on(mod.SessionEvent.SESSION_DISCONNECTED, () => {
@@ -142,14 +112,12 @@ export default function Receptionist() {
           setStatus("idle");
         });
 
-        // Avatar response transcripts (full, after each spoken turn).
         session.on(mod.AgentEventsEnum.AVATAR_TRANSCRIPTION, (...args: unknown[]) => {
           if (cancelled) return;
           const evt = args[0] as { text?: string } | undefined;
           if (!evt?.text) return;
           setMessages((prev) => {
             const copy = prev.slice();
-            // If the last message was streaming, replace it; otherwise append.
             if (
               assistantStreamingRef.current &&
               copy.length &&
@@ -165,7 +133,6 @@ export default function Receptionist() {
           setStatus("ready");
         });
 
-        // Streaming chunks of the avatar's response while it speaks.
         session.on(mod.AgentEventsEnum.AVATAR_TRANSCRIPTION_CHUNK, (...args: unknown[]) => {
           if (cancelled) return;
           const evt = args[0] as { text?: string } | undefined;
@@ -198,7 +165,7 @@ export default function Receptionist() {
 
         sessionRef.current = session;
       } catch (err) {
-        console.error("[Receptionist] start error:", err);
+        console.error("[ReceptionistPanel] start error:", err);
         if (!cancelled) {
           setErrorMsg(err instanceof Error ? err.message : "Could not start avatar");
           setStatus("error");
@@ -208,44 +175,43 @@ export default function Receptionist() {
 
     start();
 
-    const onVisibility = () => {
-      if (document.visibilityState === "hidden") setIsOpen(false);
+    // HeyGen counts a tab close as a "still alive" session until its server
+    // timeout — that eats the concurrency cap. Synchronously stop on unload.
+    const onUnload = () => {
+      try {
+        localSession?.stop();
+      } catch {}
     };
-    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("pagehide", onUnload);
+    window.addEventListener("beforeunload", onUnload);
 
     return () => {
       cancelled = true;
-      document.removeEventListener("visibilitychange", onVisibility);
-      // Aggressively stop whatever session was created — fire and forget.
-      // Prevents LiveAvatar's concurrency cap from being eaten by zombie
-      // sessions left behind by Strict Mode double-mount or fast remounts.
+      window.removeEventListener("pagehide", onUnload);
+      window.removeEventListener("beforeunload", onUnload);
       const s = localSession;
       if (s) {
         s.stop().catch(() => {});
       }
     };
-  }, [isOpen, resetIdleTimer, teardown]);
+  }, [active, teardown]);
 
-  const sendMessage = useCallback(
-    (text: string) => {
-      const trimmed = text.trim();
-      if (!trimmed) return;
-      if (!sessionRef.current) return;
-      resetIdleTimer();
+  const sendMessage = useCallback((text: string) => {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    if (!sessionRef.current) return;
 
-      setMessages((prev) => [...prev, { role: "user", content: trimmed }]);
-      setStatus("thinking");
-      assistantStreamingRef.current = false;
-      try {
-        sessionRef.current.message(trimmed);
-      } catch (err) {
-        console.error("[Receptionist] message error:", err);
-        setErrorMsg(err instanceof Error ? err.message : "Message error");
-        setStatus("error");
-      }
-    },
-    [resetIdleTimer]
-  );
+    setMessages((prev) => [...prev, { role: "user", content: trimmed }]);
+    setStatus("thinking");
+    assistantStreamingRef.current = false;
+    try {
+      sessionRef.current.message(trimmed);
+    } catch (err) {
+      console.error("[ReceptionistPanel] message error:", err);
+      setErrorMsg(err instanceof Error ? err.message : "Message error");
+      setStatus("error");
+    }
+  }, []);
 
   const startRecording = () => {
     if (recognitionRef.current) return;
@@ -255,7 +221,7 @@ export default function Receptionist() {
     };
     const Ctor = w.SpeechRecognition || w.webkitSpeechRecognition;
     if (!Ctor) {
-      setErrorMsg("Voice input not supported in this browser. Type instead.");
+      setErrorMsg("Voice input not supported. Type instead.");
       return;
     }
     const recognition = new Ctor();
@@ -280,9 +246,8 @@ export default function Receptionist() {
       recognition.start();
       recognitionRef.current = recognition;
       setIsRecording(true);
-      resetIdleTimer();
     } catch (err) {
-      console.error("[Receptionist] speech start error:", err);
+      console.error("[ReceptionistPanel] speech start error:", err);
     }
   };
 
@@ -300,48 +265,46 @@ export default function Receptionist() {
     sendMessage(t);
   };
 
-  if (!isOpen) {
+  if (!active) {
     return (
-      <button
-        onClick={() => setIsOpen(true)}
-        title="Talk to receptionist"
+      <div
         style={{
-          position: "fixed",
-          right: 20,
-          bottom: 20,
-          padding: "12px 16px",
-          background: "rgba(0, 0, 0, 0.55)",
-          color: "white",
-          border: "1px solid rgba(255,255,255,0.4)",
-          borderRadius: 999,
-          backdropFilter: "blur(10px)",
-          fontSize: 14,
-          fontFamily: "sans-serif",
-          fontWeight: 600,
-          cursor: "pointer",
-          zIndex: 1900,
-          boxShadow: "0 8px 32px rgba(0,0,0,0.3)",
+          width: "100%",
+          height: "100%",
           display: "flex",
           alignItems: "center",
-          gap: 8,
+          justifyContent: "center",
+          background: "rgba(0,0,0,0.35)",
+          backdropFilter: "blur(8px)",
+          fontFamily: "sans-serif",
+          color: "white",
         }}
       >
-        <span style={{ fontSize: 18 }}>🎙️</span>
-        Talk to receptionist
-      </button>
+        <button
+          onClick={() => setActive(true)}
+          style={{
+            padding: "14px 22px",
+            background: "rgba(0,112,243,0.9)",
+            border: "none",
+            borderRadius: 999,
+            color: "white",
+            fontSize: 16,
+            fontWeight: 600,
+            cursor: "pointer",
+            boxShadow: "0 8px 32px rgba(0,0,0,0.4)",
+          }}
+        >
+          🎙️ Talk to receptionist
+        </button>
+      </div>
     );
   }
 
   return (
     <div
       style={{
-        position: "fixed",
-        right: 20,
-        bottom: 20,
-        width: 340,
-        maxWidth: "calc(100vw - 40px)",
-        height: 520,
-        maxHeight: "calc(100vh - 40px)",
+        width: "100%",
+        height: "100%",
         background: "rgba(0, 0, 0, 0.45)",
         backdropFilter: "blur(20px)",
         border: "1px solid rgba(255,255,255,0.2)",
@@ -350,47 +313,16 @@ export default function Receptionist() {
         display: "flex",
         flexDirection: "column",
         overflow: "hidden",
-        zIndex: 1950,
         fontFamily: "sans-serif",
         color: "white",
+        boxSizing: "border-box",
       }}
     >
       <div
         style={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          padding: "10px 14px",
-          borderBottom: "1px solid rgba(255,255,255,0.15)",
-        }}
-      >
-        <div style={{ fontSize: 14, fontWeight: 600 }}>Receptionist</div>
-        <button
-          onClick={() => setIsOpen(false)}
-          title="Close"
-          style={{
-            background: "rgba(255,255,255,0.2)",
-            border: "none",
-            borderRadius: "50%",
-            width: 30,
-            height: 30,
-            color: "white",
-            cursor: "pointer",
-            fontSize: 14,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-          }}
-        >
-          ✕
-        </button>
-      </div>
-
-      <div
-        style={{
           position: "relative",
           width: "100%",
-          aspectRatio: "3 / 4",
+          flex: "0 0 55%",
           background: "rgba(0,0,0,0.4)",
           overflow: "hidden",
         }}
@@ -410,8 +342,8 @@ export default function Receptionist() {
               alignItems: "center",
               justifyContent: "center",
               fontSize: 13,
-              color: "rgba(255,255,255,0.8)",
-              background: "rgba(0,0,0,0.4)",
+              color: "rgba(255,255,255,0.85)",
+              background: "rgba(0,0,0,0.5)",
               textAlign: "center",
               padding: 12,
             }}
@@ -432,6 +364,7 @@ export default function Receptionist() {
           flexDirection: "column",
           gap: 6,
           fontSize: 13,
+          minHeight: 0,
         }}
       >
         {messages.length === 0 && (
@@ -464,6 +397,7 @@ export default function Receptionist() {
           gap: 6,
           padding: 10,
           borderTop: "1px solid rgba(255,255,255,0.15)",
+          flexShrink: 0,
         }}
       >
         <button
@@ -509,6 +443,7 @@ export default function Receptionist() {
             color: "white",
             outline: "none",
             fontFamily: "sans-serif",
+            minWidth: 0,
           }}
         />
         <button
@@ -524,6 +459,7 @@ export default function Receptionist() {
             fontWeight: 600,
             cursor: typed.trim() ? "pointer" : "default",
             opacity: typed.trim() ? 1 : 0.5,
+            flexShrink: 0,
           }}
         >
           Send

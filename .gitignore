@@ -39,6 +39,9 @@ yarn-error.log*
 # 3dvista tour files (large binary assets - deploy separately)
 /public/3dvista/
 
+# kiosk build output
+/dist-kiosk/
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts

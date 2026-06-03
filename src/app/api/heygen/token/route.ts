@@ -15,11 +15,16 @@ export const dynamic = "force-dynamic";
 const TOKEN_URL =
   process.env.HEYGEN_TOKEN_URL || "https://api.liveavatar.com/v1/sessions/token";
 
-const DEFAULT_AVATAR_ID = "513fd1b7-7ef9-466d-9af2-344e51eeb833"; // Ann Therapist
-const DEFAULT_VOICE_ID = "de5574fc-009e-4a01-a881-9919ef8f5a0c"; // Ann - IA
-// Context = persona + system prompt + LLM config, owned in the LiveAvatar
-// dashboard. We currently auto-pin to the "OfficeMal Receptionist" context.
-const DEFAULT_CONTEXT_ID = "462d5ce5-3f79-45bf-bc45-161f5f7b57b2";
+// Avatar look ID — pick a green-screen look so the panorama embed can
+// chroma-key the background to transparent in the browser. Override per
+// environment with NEXT_PUBLIC_HEYGEN_AVATAR_ID.
+const DEFAULT_AVATAR_ID = "075abc67-2fae-4548-8ca9-b815fcbd34c7";
+// LiveAvatar requires a context (persona + system prompt + LLM) on FULL-mode
+// sessions; default to the OfficeMal Receptionist context created in the
+// LiveAvatar dashboard. Override with HEYGEN_CONTEXT_ID.
+const DEFAULT_CONTEXT_ID = "f3f90002-6a15-4f0e-94af-3692d6014585";
+// Voice falls back to whatever the avatar is configured with in the dashboard.
+// Override with HEYGEN_VOICE_ID.
 
 export async function POST() {
   const apiKey = process.env.HEYGEN_API_KEY;
@@ -33,10 +38,18 @@ export async function POST() {
 
   const avatarId =
     process.env.NEXT_PUBLIC_HEYGEN_AVATAR_ID?.trim() || DEFAULT_AVATAR_ID;
-  const voiceId =
-    process.env.HEYGEN_VOICE_ID?.trim() || DEFAULT_VOICE_ID;
+  const voiceId = process.env.HEYGEN_VOICE_ID?.trim();
   const contextId =
     process.env.HEYGEN_CONTEXT_ID?.trim() || DEFAULT_CONTEXT_ID;
+
+  const persona: Record<string, string> = { context_id: contextId };
+  if (voiceId) persona.voice_id = voiceId;
+
+  const requestBody = {
+    mode: "FULL",
+    avatar_id: avatarId,
+    avatar_persona: persona,
+  };
 
   try {
     const res = await fetch(TOKEN_URL, {
@@ -45,14 +58,7 @@ export async function POST() {
         "X-API-KEY": apiKey,
         "content-type": "application/json",
       },
-      body: JSON.stringify({
-        mode: "FULL",
-        avatar_id: avatarId,
-        avatar_persona: {
-          voice_id: voiceId,
-          context_id: contextId,
-        },
-      }),
+      body: JSON.stringify(requestBody),
       cache: "no-store",
     });
 
