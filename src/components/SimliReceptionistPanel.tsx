@@ -8,10 +8,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 // Flow:
 //   1. POST /api/simli/session -> server starts a Simli Auto session (Haiku as
 //      the LLM via Anthropic's OpenAI-compat endpoint, Simli's bundled TTS) and
-//      returns a LiveKit { roomUrl }.
-//   2. We join the LiveKit room, attach the avatar's remote video+audio, and
-//      publish the user's mic. Simli runs the whole STT -> LLM -> TTS loop, so
-//      there is no message()/typing path — the user just talks.
+//      returns a Daily.co room { roomUrl }. (Simli runs its Auto sessions on
+//      Daily, not LiveKit — confirmed from a live response.)
+//   2. We join the Daily room. Daily auto-captures the user's mic; we attach
+//      the avatar's remote video+audio tracks to <video>/<audio>. Simli runs
+//      the whole STT -> LLM -> TTS loop, so there is no typing path — the user
+//      just talks.
 
 type Status = "idle" | "connecting" | "ready" | "speaking" | "error";
 
@@ -22,26 +24,14 @@ type Props = {
   autoStart?: boolean;
 };
 
-// Simli returns one roomUrl that embeds the LiveKit join token as a query param.
-// livekit-client's Room.connect() wants the base URL and token separately, so
-// split them. Token param name isn't formally documented; accept the common
-// ones. Returns [baseUrl, token | undefined].
-function splitRoomUrl(roomUrl: string): [string, string | undefined] {
-  try {
-    const u = new URL(roomUrl);
-    const token =
-      u.searchParams.get("access_token") ??
-      u.searchParams.get("token") ??
-      u.searchParams.get("jwt") ??
-      undefined;
-    // Strip the query so the base wss:// URL is clean for connect().
-    u.search = "";
-    return [u.toString(), token ?? undefined];
-  } catch {
-    // Not a parseable URL — hand it back whole and let connect() try.
-    return [roomUrl, undefined];
-  }
-}
+// Minimal shape of the Daily call object we use (avoids importing SDK types at
+// module scope; the SDK is dynamically imported to keep it out of the bundle).
+type DailyCallLike = {
+  join: (opts: { url: string }) => Promise<unknown>;
+  leave: () => Promise<void>;
+  destroy: () => Promise<void>;
+  on: (event: string, cb: (e: unknown) => void) => unknown;
+};
 
 export default function SimliReceptionistPanel({ autoStart = false }: Props) {
   const [active, setActive] = useState(autoStart);
@@ -50,16 +40,16 @@ export default function SimliReceptionistPanel({ autoStart = false }: Props) {
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  // LiveKit Room instance — typed loosely so we don't import the SDK types at
-  // module scope (the SDK is dynamically imported to keep it out of the main
-  // bundle, matching how the LiveAvatar SDK was loaded).
-  const roomRef = useRef<{ disconnect: (stopTracks?: boolean) => Promise<void> } | null>(null);
+  const callRef = useRef<DailyCallLike | null>(null);
 
   const teardown = useCallback(async () => {
     try {
-      await roomRef.current?.disconnect();
+      await callRef.current?.leave();
     } catch {}
-    roomRef.current = null;
+    try {
+      await callRef.current?.destroy();
+    } catch {}
+    callRef.current = null;
     if (videoRef.current) videoRef.current.srcObject = null;
     if (audioRef.current) audioRef.current.srcObject = null;
     setStatus("idle");
@@ -72,7 +62,15 @@ export default function SimliReceptionistPanel({ autoStart = false }: Props) {
     }
 
     let cancelled = false;
-    let localRoom: { disconnect: (stopTracks?: boolean) => Promise<void> } | null = null;
+    let localCall: DailyCallLike | null = null;
+
+    // Attach a remote track to its element via a one-track MediaStream — the
+    // portable way to render a raw MediaStreamTrack from Daily.
+    const attachTrack = (el: HTMLMediaElement | null, track: MediaStreamTrack) => {
+      if (!el) return;
+      el.srcObject = new MediaStream([track]);
+      el.play().catch(() => {});
+    };
 
     const start = async () => {
       setStatus("connecting");
@@ -87,56 +85,64 @@ export default function SimliReceptionistPanel({ autoStart = false }: Props) {
         if (cancelled) return;
         if (!roomUrl) throw new Error("No roomUrl returned");
 
-        const { Room, RoomEvent, Track } = await import("livekit-client");
+        const DailyIframe = (await import("@daily-co/daily-js")).default;
         if (cancelled) return;
 
-        const room = new Room();
-        localRoom = room;
+        // Mic on (so Simli's STT hears the user), camera off (we only render the
+        // avatar, the user isn't on screen).
+        const call = DailyIframe.createCallObject({
+          audioSource: true,
+          videoSource: false,
+        }) as unknown as DailyCallLike;
+        localCall = call;
 
-        // Attach the avatar's tracks as they arrive. Simli publishes one video
-        // (the talking head) and one audio (the TTS voice) track.
-        room.on(RoomEvent.TrackSubscribed, (track) => {
+        // Avatar tracks arrive as 'track-started'. participant.local === false
+        // means it's a remote (the avatar) track, not our own mic echo.
+        call.on("track-started", (e: unknown) => {
           if (cancelled) return;
-          if (track.kind === Track.Kind.Video && videoRef.current) {
-            track.attach(videoRef.current);
-            videoRef.current.play().catch(() => {});
-          } else if (track.kind === Track.Kind.Audio && audioRef.current) {
-            track.attach(audioRef.current);
-            audioRef.current.play().catch(() => {});
+          const evt = e as {
+            track?: MediaStreamTrack;
+            type?: string;
+            participant?: { local?: boolean } | null;
+          };
+          if (!evt.track || evt.participant?.local) return;
+          if (evt.type === "video") {
+            attachTrack(videoRef.current, evt.track);
+          } else if (evt.type === "audio") {
+            attachTrack(audioRef.current, evt.track);
+            setStatus("speaking");
           }
         });
 
-        // Avatar starts/stops talking -> drive the status label.
-        room.on(RoomEvent.ActiveSpeakersChanged, (speakers) => {
+        // Remote audio stopping is our cue the avatar finished a turn.
+        call.on("track-stopped", (e: unknown) => {
           if (cancelled) return;
-          // Any remote (non-local) speaker means the avatar is talking.
-          const avatarTalking = speakers.some((p) => !p.isLocal);
-          setStatus(avatarTalking ? "speaking" : "ready");
+          const evt = e as { type?: string; participant?: { local?: boolean } | null };
+          if (evt.participant?.local) return;
+          if (evt.type === "audio") setStatus("ready");
         });
 
-        room.on(RoomEvent.Disconnected, () => {
+        call.on("left-meeting", () => {
           if (cancelled) return;
           setStatus("idle");
         });
 
-        const [url, token] = splitRoomUrl(roomUrl);
-        if (!token) {
-          // If the token wasn't a recognized query param, connect() will reject
-          // and we surface a clear message rather than a cryptic LiveKit error.
-          throw new Error(
-            "Could not extract LiveKit token from Simli roomUrl — check the param name."
-          );
-        }
-        await room.connect(url, token);
+        call.on("error", (e: unknown) => {
+          if (cancelled) return;
+          const msg = (e as { errorMsg?: string })?.errorMsg || "Call error";
+          console.error("[SimliReceptionist] daily error:", e);
+          setErrorMsg(msg);
+          setStatus("error");
+        });
+
+        await call.join({ url: roomUrl });
         if (cancelled) {
-          await room.disconnect().catch(() => {});
+          await call.leave().catch(() => {});
+          await call.destroy().catch(() => {});
           return;
         }
 
-        // Publish the mic so Simli can hear the user. Simli does STT server-side.
-        await room.localParticipant.setMicrophoneEnabled(true);
-
-        roomRef.current = room;
+        callRef.current = call;
         setStatus("ready");
       } catch (err) {
         console.error("[SimliReceptionist] start error:", err);
@@ -150,10 +156,10 @@ export default function SimliReceptionistPanel({ autoStart = false }: Props) {
     start();
 
     // A tab close leaves the Simli session billing until its idle timeout —
-    // disconnect synchronously to release it (and the concurrency slot).
+    // leave synchronously to release it (and the concurrency slot).
     const onUnload = () => {
       try {
-        localRoom?.disconnect();
+        localCall?.leave();
       } catch {}
     };
     window.addEventListener("pagehide", onUnload);
@@ -163,7 +169,10 @@ export default function SimliReceptionistPanel({ autoStart = false }: Props) {
       cancelled = true;
       window.removeEventListener("pagehide", onUnload);
       window.removeEventListener("beforeunload", onUnload);
-      if (localRoom) localRoom.disconnect().catch(() => {});
+      if (localCall) {
+        localCall.leave().catch(() => {});
+        localCall.destroy().catch(() => {});
+      }
     };
   }, [active, teardown]);
 

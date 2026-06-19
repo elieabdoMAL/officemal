@@ -8,6 +8,7 @@
     "start": "next start"
   },
   "dependencies": {
+    "@daily-co/daily-js": "^0.91.0",
     "@heygen/liveavatar-web-sdk": "^0.0.18",
     "livekit-client": "^2.15.7",
     "next": "16.2.1",
