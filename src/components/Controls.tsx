@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { BlazeITAPI } from "@/types/blazeIT";
 
 const CONTAINER_NAMES = {
@@ -84,19 +84,44 @@ const innerBase: React.CSSProperties = {
   transition: "all 0.3s ease",
 };
 
+const IDLE_TIMEOUT_MS = 30_000;
+
 export default function Controls() {
   const [isMuted, setIsMuted] = useState(false);
   const [isVRActive, setIsVRActive] = useState(false);
+  const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const toggleMute = useCallback(() => {
     const next = !isMuted;
     trigger(next ? CONTAINER_NAMES.mute : CONTAINER_NAMES.unmute);
 
+    // Mute media elements in this document (parent page's audio/video).
     document.querySelectorAll("audio, video").forEach((el) => {
       if (el instanceof HTMLAudioElement || el instanceof HTMLVideoElement) {
         el.muted = next;
       }
     });
+
+    // Tell the receptionist iframe (nested inside the 3DVista iframe) to mute.
+    // querySelectorAll above can't cross iframe boundaries, so we postMessage.
+    // The 3DVista iframe forwards to its own children via the same broadcast.
+    const broadcastMute = (win: Window | null) => {
+      if (!win) return;
+      try {
+        win.postMessage({ type: "receptionist-mute", muted: next }, "*");
+      } catch {}
+    };
+    const tdv = document.querySelector(
+      'iframe[src*="3dvista"]'
+    ) as HTMLIFrameElement | null;
+    broadcastMute(tdv?.contentWindow ?? null);
+    // Reach the receptionist iframe directly (same-origin) so we don't depend
+    // on the 3DVista iframe forwarding the message.
+    if (tdv?.contentDocument) {
+      tdv.contentDocument
+        .querySelectorAll<HTMLIFrameElement>("iframe")
+        .forEach((f) => broadcastMute(f.contentWindow));
+    }
 
     setIsMuted(next);
   }, [isMuted]);
@@ -109,6 +134,24 @@ export default function Controls() {
 
   const recenter = useCallback(() => {
     trigger(CONTAINER_NAMES.recenter);
+  }, []);
+
+  useEffect(() => {
+    const resetTimer = () => {
+      if (idleTimer.current) clearTimeout(idleTimer.current);
+      idleTimer.current = setTimeout(() => {
+        trigger(CONTAINER_NAMES.recenter);
+      }, IDLE_TIMEOUT_MS);
+    };
+
+    const events = ["mousemove", "mousedown", "touchstart", "keydown", "wheel"] as const;
+    events.forEach((ev) => window.addEventListener(ev, resetTimer, { passive: true, capture: true }));
+    resetTimer();
+
+    return () => {
+      if (idleTimer.current) clearTimeout(idleTimer.current);
+      events.forEach((ev) => window.removeEventListener(ev, resetTimer, { capture: true } as EventListenerOptions));
+    };
   }, []);
 
   const hover = (e: React.MouseEvent<HTMLButtonElement>) => {

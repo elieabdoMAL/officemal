@@ -6,6 +6,7 @@ import InfiniViewModal from "@/components/InfiniViewModal";
 import MalModal from "@/components/MalModal";
 import Controls from "@/components/Controls";
 import KioskLock from "@/components/KioskLock";
+import KioskHeartbeat from "@/components/KioskHeartbeat";
 
 export default function Page() {
   return (
@@ -27,6 +28,7 @@ export default function Page() {
       <MalModal />
       <Controls />
       <KioskLock />
+      <KioskHeartbeat />
     </div>
   );
 }

@@ -69,12 +69,36 @@ export default function ImmersiveReceptionistPanel() {
   const [status, setStatus] = useState<Status>("connecting");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [isListening, setIsListening] = useState(false);
+  const [isMuted, setIsMuted] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const sessionRef = useRef<LiveAvatarSessionInstance | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const rafRef = useRef<number | null>(null);
+
+  // Listen for the parent (3DVista panorama) telling us to mute/unmute. The
+  // panorama's own mute button has no idea this iframe exists, so the
+  // panorama code posts a message and we mirror its state here.
+  // Accepted shapes:
+  //   { type: 'receptionist-mute', muted: true|false }   -> set explicit state
+  //   { type: 'receptionist-mute', toggle: true }        -> flip current state
+  useEffect(() => {
+    const onMsg = (e: MessageEvent) => {
+      const data = e.data as
+        | { type?: string; muted?: boolean; toggle?: boolean }
+        | null
+        | undefined;
+      if (!data || data.type !== "receptionist-mute") return;
+      if (data.toggle) {
+        setIsMuted((m) => !m);
+      } else if (typeof data.muted === "boolean") {
+        setIsMuted(data.muted);
+      }
+    };
+    window.addEventListener("message", onMsg);
+    return () => window.removeEventListener("message", onMsg);
+  }, []);
 
   const sendMessage = useCallback((text: string) => {
     const trimmed = text.trim();
@@ -89,6 +113,51 @@ export default function ImmersiveReceptionistPanel() {
       setStatus("error");
     }
   }, []);
+
+  // Mute by disabling the audio MediaStreamTrack at the source. Setting
+  // .muted/.volume on the video element wasn't enough because LiveKit attaches
+  // audio via srcObject — the browser plays it independent of element controls
+  // in some cases. Disabling the track stops audio at the WebRTC layer, which
+  // works regardless of where the track is attached.
+  useEffect(() => {
+    const applyMute = () => {
+      // Our own video element first.
+      const v = videoRef.current;
+      if (v) {
+        v.muted = isMuted;
+        v.volume = isMuted ? 0 : 1;
+      }
+      // The SDK puts the audio track on the video's srcObject; mute it there.
+      const stream = v?.srcObject as MediaStream | null | undefined;
+      if (stream && typeof stream.getAudioTracks === "function") {
+        for (const track of stream.getAudioTracks()) {
+          track.enabled = !isMuted;
+        }
+      }
+      // Catch any sibling <audio>/<video> the SDK appended elsewhere.
+      document.querySelectorAll<HTMLMediaElement>("audio, video").forEach((el) => {
+        if (el === v) return;
+        if (el.getAttribute("src")) return;
+        el.muted = isMuted;
+        el.volume = isMuted ? 0 : 1;
+        const s = el.srcObject as MediaStream | null | undefined;
+        if (s && typeof s.getAudioTracks === "function") {
+          for (const track of s.getAudioTracks()) {
+            track.enabled = !isMuted;
+          }
+        }
+      });
+    };
+    applyMute();
+    // The SDK attaches the stream asynchronously after SESSION_STREAM_READY;
+    // re-apply a couple of times so we catch the moment the track shows up.
+    const t1 = window.setTimeout(applyMute, 300);
+    const t2 = window.setTimeout(applyMute, 1500);
+    return () => {
+      window.clearTimeout(t1);
+      window.clearTimeout(t2);
+    };
+  }, [isMuted, status]);
 
   // Paint loop: chroma-key the avatar video onto the canvas every frame.
   useEffect(() => {
@@ -310,12 +379,11 @@ export default function ImmersiveReceptionistPanel() {
         overflow: "hidden",
       }}
     >
-      {/* Source video, hidden — feeds the canvas. */}
+      {/* Source video, hidden — feeds the canvas and plays the avatar's audio. */}
       <video
         ref={videoRef}
         autoPlay
         playsInline
-        muted={false}
         style={{
           position: "absolute",
           width: 1,
