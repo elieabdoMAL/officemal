@@ -43,8 +43,15 @@ const DEFAULT_SYSTEM_PROMPT =
     "answer questions about the office and its services, and keep replies short and " +
     "conversational — one or two sentences, since they are spoken aloud.";
 
+// Env values can pick up a stray BOM or surrounding whitespace depending on how
+// they were set (some shells prepend ﻿ when piping). A BOM in an HTTP
+// header value throws "Cannot convert argument to a ByteString", so scrub it.
+function cleanEnv(v: string | undefined): string | undefined {
+  return v?.replace(/^﻿/, "").trim();
+}
+
 export async function POST() {
-  const simliApiKey = process.env.SIMLI_API_KEY;
+  const simliApiKey = cleanEnv(process.env.SIMLI_API_KEY);
   if (!simliApiKey) {
     console.error("[simli/session] SIMLI_API_KEY env var is not set");
     return NextResponse.json(
@@ -53,7 +60,7 @@ export async function POST() {
     );
   }
 
-  const anthropicKey = process.env.ANTHROPIC_API_KEY;
+  const anthropicKey = cleanEnv(process.env.ANTHROPIC_API_KEY);
   if (!anthropicKey) {
     console.error("[simli/session] ANTHROPIC_API_KEY env var is not set");
     return NextResponse.json(
