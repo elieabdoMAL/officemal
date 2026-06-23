@@ -23,7 +23,7 @@ export default function ReceptionistEmbedPage() {
       }}
     >
       {PROVIDER === "simli" ? (
-        <SimliReceptionistPanel autoStart />
+        <SimliReceptionistPanel />
       ) : (
         <ImmersiveReceptionistPanel />
       )}

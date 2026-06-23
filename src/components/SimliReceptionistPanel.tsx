@@ -2,77 +2,88 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-// Simli Auto (E2E) receptionist. Drop-in alternative to ReceptionistPanel that
-// uses Simli + Haiku instead of LiveAvatar FULL mode.
+// Simli Auto (E2E) receptionist. Uses Simli + Haiku instead of LiveAvatar.
 //
-// Flow:
-//   1. POST /api/simli/session -> server starts a Simli Auto session (Haiku as
-//      the LLM via Anthropic's OpenAI-compat endpoint, Simli's bundled TTS) and
-//      returns a Daily.co room { roomUrl }. (Simli runs its Auto sessions on
-//      Daily, not LiveKit — confirmed from a live response.)
-//   2. We join the Daily room. Daily auto-captures the user's mic; we attach
-//      the avatar's remote video+audio tracks to <video>/<audio>. Simli runs
-//      the whole STT -> LLM -> TTS loop, so there is no typing path — the user
-//      just talks.
+// Behaviour:
+//   - On load: connect, show the avatar, and let Simli speak its First Message
+//     on its own. The mic starts MUTED so she greets without listening.
+//   - Push-to-talk: press & hold the frame -> mic on (listening); release ->
+//     mic off -> Simli answers. The avatar is always visible.
+//
+// Flow: POST /api/simli/session starts a Simli Auto session (Haiku LLM via
+// Anthropic's OpenAI-compat endpoint, Simli's bundled TTS, firstMessage +
+// systemPrompt set server-side) and returns a Daily.co { roomUrl }. We join the
+// room, attach the avatar's video+audio, and toggle the local mic for PTT.
 
 type Status = "idle" | "connecting" | "ready" | "speaking" | "error";
 
 type Props = {
-  // Start immediately on mount vs. show a "Start" button first. Browsers block
-  // mic capture in nested iframes without a user gesture, so the button is the
-  // safer default for the 3DVista Web Frame embed.
   autoStart?: boolean;
 };
 
-// Minimal shape of the Daily call object we use (avoids importing SDK types at
-// module scope; the SDK is dynamically imported to keep it out of the bundle).
+// Minimal shape of the Daily call object we use.
 type DailyCallLike = {
   join: (opts: { url: string }) => Promise<unknown>;
   leave: () => Promise<void>;
   destroy: () => Promise<void>;
+  setLocalAudio: (enabled: boolean) => unknown;
+  localAudio: () => boolean;
   on: (event: string, cb: (e: unknown) => void) => unknown;
 };
 
-export default function SimliReceptionistPanel({ autoStart = false }: Props) {
-  const [active, setActive] = useState(autoStart);
+// Module-level lock. React Strict Mode (dev) mounts effects twice, and each
+// session start hits Simli's rate-limited endpoint. This ensures only ONE
+// session is ever starting/alive across remounts — the single biggest cause of
+// the 429s we hit while testing.
+let SESSION_ACTIVE = false;
+
+export default function SimliReceptionistPanel({ autoStart = true }: Props) {
   const [status, setStatus] = useState<Status>("idle");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [listening, setListening] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const callRef = useRef<DailyCallLike | null>(null);
+  const readyRef = useRef(false); // true once joined, so PTT can toggle the mic
 
-  const teardown = useCallback(async () => {
+  // Push-to-talk: enable the mic only while held.
+  const setMic = useCallback((on: boolean) => {
+    const call = callRef.current;
+    if (!call || !readyRef.current) return;
     try {
-      await callRef.current?.leave();
-    } catch {}
-    try {
-      await callRef.current?.destroy();
-    } catch {}
-    callRef.current = null;
-    if (videoRef.current) videoRef.current.srcObject = null;
-    if (audioRef.current) audioRef.current.srcObject = null;
-    setStatus("idle");
+      call.setLocalAudio(on);
+      setListening(on);
+      // Daily applies the change asynchronously — read the real state after a
+      // tick so the log isn't lying about the previous value.
+      setTimeout(() => {
+        console.log("[Simli] mic set ->", on, "| actual now:", call.localAudio?.());
+      }, 250);
+    } catch (e) {
+      console.warn("[Simli] setLocalAudio failed:", e);
+    }
   }, []);
 
   useEffect(() => {
-    if (!active) {
-      teardown();
-      return;
-    }
+    if (!autoStart) return;
 
     let cancelled = false;
     let localCall: DailyCallLike | null = null;
 
-    // Attach a remote track to its element via a one-track MediaStream — the
-    // portable way to render a raw MediaStreamTrack from Daily.
     const attachTrack = (el: HTMLMediaElement | null, track: MediaStreamTrack) => {
       if (!el) return;
       el.srcObject = new MediaStream([track]);
-      el.play().catch(() => {});
+      el.play().catch((e) => console.warn("[Simli] media play() blocked:", e));
     };
 
     const start = async () => {
+      // Don't start a second session if one is already alive (Strict Mode
+      // double-mount, fast remount). This is the main 429 guard.
+      if (SESSION_ACTIVE) {
+        console.log("[Simli] session already active, skipping duplicate start");
+        return;
+      }
+      SESSION_ACTIVE = true;
       setStatus("connecting");
       setErrorMsg(null);
       try {
@@ -84,54 +95,40 @@ export default function SimliReceptionistPanel({ autoStart = false }: Props) {
         const { roomUrl } = await res.json();
         if (cancelled) return;
         if (!roomUrl) throw new Error("No roomUrl returned");
+        console.log("[Simli] joining room:", roomUrl);
 
         const DailyIframe = (await import("@daily-co/daily-js")).default;
         if (cancelled) return;
 
-        // Mic on (so Simli's STT hears the user), camera off (we only render the
-        // avatar, the user isn't on screen).
         const call = DailyIframe.createCallObject({
           audioSource: true,
           videoSource: false,
         }) as unknown as DailyCallLike;
         localCall = call;
 
-        // Avatar tracks arrive as 'track-started'. participant.local === false
-        // means it's a remote (the avatar) track, not our own mic echo.
         call.on("track-started", (e: unknown) => {
           if (cancelled) return;
           const evt = e as {
             track?: MediaStreamTrack;
-            type?: string;
             participant?: { local?: boolean } | null;
           };
+          console.log("[Simli] track-started:", {
+            kind: evt.track?.kind,
+            local: evt.participant?.local,
+          });
           if (!evt.track || evt.participant?.local) return;
-          if (evt.type === "video") {
+          if (evt.track.kind === "video") {
             attachTrack(videoRef.current, evt.track);
-          } else if (evt.type === "audio") {
+            setStatus("ready");
+          } else if (evt.track.kind === "audio") {
             attachTrack(audioRef.current, evt.track);
-            setStatus("speaking");
           }
-        });
-
-        // Remote audio stopping is our cue the avatar finished a turn.
-        call.on("track-stopped", (e: unknown) => {
-          if (cancelled) return;
-          const evt = e as { type?: string; participant?: { local?: boolean } | null };
-          if (evt.participant?.local) return;
-          if (evt.type === "audio") setStatus("ready");
-        });
-
-        call.on("left-meeting", () => {
-          if (cancelled) return;
-          setStatus("idle");
         });
 
         call.on("error", (e: unknown) => {
           if (cancelled) return;
-          const msg = (e as { errorMsg?: string })?.errorMsg || "Call error";
-          console.error("[SimliReceptionist] daily error:", e);
-          setErrorMsg(msg);
+          console.error("[Simli] daily error:", e);
+          setErrorMsg((e as { errorMsg?: string })?.errorMsg || "Call error");
           setStatus("error");
         });
 
@@ -142,10 +139,21 @@ export default function SimliReceptionistPanel({ autoStart = false }: Props) {
           return;
         }
 
+        // Mute the mic immediately so the avatar speaks its First Message
+        // without listening. Push-to-talk turns it on only while held.
+        try {
+          call.setLocalAudio(false);
+          console.log("[Simli] joined, mic muted. localAudio:", call.localAudio?.());
+        } catch (e) {
+          console.warn("[Simli] initial mute failed:", e);
+        }
+
         callRef.current = call;
+        readyRef.current = true;
         setStatus("ready");
       } catch (err) {
-        console.error("[SimliReceptionist] start error:", err);
+        console.error("[Simli] start error:", err);
+        SESSION_ACTIVE = false; // release so a retry/remount can try again
         if (!cancelled) {
           setErrorMsg(err instanceof Error ? err.message : "Could not start avatar");
           setStatus("error");
@@ -153,10 +161,11 @@ export default function SimliReceptionistPanel({ autoStart = false }: Props) {
       }
     };
 
-    start();
+    // Defer one tick so Strict Mode's immediate double-mount cleanup runs before
+    // we ever hit the session endpoint — turning a wasteful double-start into a
+    // single start on the surviving mount.
+    const startTimer = window.setTimeout(start, 0);
 
-    // A tab close leaves the Simli session billing until its idle timeout —
-    // leave synchronously to release it (and the concurrency slot).
     const onUnload = () => {
       try {
         localCall?.leave();
@@ -167,123 +176,106 @@ export default function SimliReceptionistPanel({ autoStart = false }: Props) {
 
     return () => {
       cancelled = true;
+      readyRef.current = false;
+      window.clearTimeout(startTimer);
       window.removeEventListener("pagehide", onUnload);
       window.removeEventListener("beforeunload", onUnload);
       if (localCall) {
         localCall.leave().catch(() => {});
         localCall.destroy().catch(() => {});
       }
+      SESSION_ACTIVE = false; // release the lock when this session tears down
     };
-  }, [active, teardown]);
+  }, [autoStart]);
 
-  if (!active) {
-    return (
-      <div
-        style={{
-          width: "100%",
-          height: "100%",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          background: "rgba(0,0,0,0.35)",
-          backdropFilter: "blur(8px)",
-          fontFamily: "sans-serif",
-          color: "white",
-        }}
-      >
-        <button
-          onClick={() => setActive(true)}
-          style={{
-            padding: "14px 22px",
-            background: "rgba(0,112,243,0.9)",
-            border: "none",
-            borderRadius: 999,
-            color: "white",
-            fontSize: 16,
-            fontWeight: 600,
-            cursor: "pointer",
-            boxShadow: "0 8px 32px rgba(0,0,0,0.4)",
-          }}
-        >
-          🎙️ Talk to receptionist
-        </button>
-      </div>
-    );
-  }
+  const connecting = status !== "ready" && status !== "speaking";
 
   return (
     <div
+      // Push-to-talk: hold to listen, release to send.
+      onPointerDown={(e) => {
+        e.preventDefault();
+        setMic(true);
+      }}
+      onPointerUp={(e) => {
+        e.preventDefault();
+        setMic(false);
+      }}
+      onPointerLeave={() => {
+        if (listening) setMic(false);
+      }}
+      onPointerCancel={() => {
+        if (listening) setMic(false);
+      }}
       style={{
+        position: "relative",
         width: "100%",
         height: "100%",
-        background: "rgba(0, 0, 0, 0.45)",
-        backdropFilter: "blur(20px)",
-        border: "1px solid rgba(255,255,255,0.2)",
-        borderRadius: 20,
-        boxShadow: "0 25px 50px rgba(0,0,0,0.4)",
-        display: "flex",
-        flexDirection: "column",
+        background: "transparent",
         overflow: "hidden",
         fontFamily: "sans-serif",
         color: "white",
         boxSizing: "border-box",
+        cursor: status === "ready" ? "pointer" : "default",
+        touchAction: "none",
+        userSelect: "none",
+        WebkitUserSelect: "none",
       }}
     >
-      <div
-        style={{
-          position: "relative",
-          width: "100%",
-          flex: 1,
-          background: "rgba(0,0,0,0.4)",
-          overflow: "hidden",
-        }}
-      >
-        <video
-          ref={videoRef}
-          autoPlay
-          playsInline
-          style={{ width: "100%", height: "100%", objectFit: "cover" }}
-        />
-        {/* Simli's TTS audio plays through this element. */}
-        <audio ref={audioRef} autoPlay />
-        {status !== "ready" && status !== "speaking" && (
-          <div
-            style={{
-              position: "absolute",
-              inset: 0,
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              fontSize: 13,
-              color: "rgba(255,255,255,0.85)",
-              background: "rgba(0,0,0,0.5)",
-              textAlign: "center",
-              padding: 12,
-            }}
-          >
-            {status === "connecting" && "Connecting…"}
-            {status === "error" && (errorMsg ?? "Something went wrong")}
-            {status === "idle" && "Starting…"}
-          </div>
-        )}
-      </div>
+      <video
+        ref={videoRef}
+        autoPlay
+        playsInline
+        muted
+        style={{ width: "100%", height: "100%", objectFit: "contain", pointerEvents: "none" }}
+      />
+      {/* Simli's TTS audio plays through this element. */}
+      <audio ref={audioRef} autoPlay />
 
-      <div
-        style={{
-          padding: "10px 14px",
-          borderTop: "1px solid rgba(255,255,255,0.15)",
-          fontSize: 13,
-          textAlign: "center",
-          color: "rgba(255,255,255,0.75)",
-          flexShrink: 0,
-        }}
-      >
-        {status === "speaking"
-          ? "Speaking…"
-          : status === "ready"
-          ? "Listening — just talk."
-          : " "}
-      </div>
+      {connecting && (
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            fontSize: 14,
+            color: "rgba(255,255,255,0.95)",
+            textShadow: "0 2px 10px rgba(0,0,0,0.9)",
+            // No background panel — let the panorama show through while loading.
+            background: "transparent",
+            textAlign: "center",
+            padding: 16,
+            pointerEvents: "none",
+          }}
+        >
+          {status === "error" ? errorMsg ?? "Something went wrong" : "Connecting..."}
+        </div>
+      )}
+
+      {/* Push-to-talk hint / listening indicator. */}
+      {!connecting && (
+        <div
+          style={{
+            position: "absolute",
+            left: "50%",
+            bottom: 22,
+            transform: "translateX(-50%)",
+            padding: "8px 16px",
+            borderRadius: 999,
+            background: listening ? "rgba(239,68,68,0.9)" : "rgba(0,0,0,0.5)",
+            color: "white",
+            fontSize: 13,
+            fontWeight: 600,
+            textShadow: "0 2px 8px rgba(0,0,0,0.8)",
+            pointerEvents: "none",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {listening ? "● Listening…" : "🎙️ Hold to talk"}
+        </div>
+      )}
     </div>
   );
 }

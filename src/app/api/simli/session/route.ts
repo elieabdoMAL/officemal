@@ -34,14 +34,39 @@ const DEFAULT_FACE_ID =
 // as test-grade, not production. Fine for the trial; swap to a native /api/chat
 // proxy before going live.
 const DEFAULT_LLM_MODEL = process.env.SIMLI_LLM_MODEL?.trim() || "claude-haiku-4-5";
+
+// Simli calls {baseURL}/chat/completions and needs a STREAMING SSE response.
+// Anthropic's compat endpoint only streams with stream:true, which Simli does
+// not send — so we route through our own /api/llm proxy (it forces stream:true
+// and pipes the SSE back). This MUST be the public deployed origin; Simli
+// cannot reach localhost. Set SIMLI_LLM_BASE_URL to "https://<your-domain>/api/llm".
 const DEFAULT_LLM_BASE_URL =
-  process.env.SIMLI_LLM_BASE_URL?.trim() || "https://api.anthropic.com/v1";
+  process.env.SIMLI_LLM_BASE_URL?.trim() ||
+  (process.env.VERCEL_PROJECT_PRODUCTION_URL
+    ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}/api/llm`
+    : "https://officemal.mobileappslabs.ca/api/llm");
+
+// First thing the avatar says on its own when the session opens (no user input
+// needed). Override with SIMLI_FIRST_MESSAGE.
+const DEFAULT_FIRST_MESSAGE =
+  process.env.SIMLI_FIRST_MESSAGE?.trim() ||
+  "Hi there! Welcome to Mobile Apps Labs. How can I help you today?";
 
 const DEFAULT_SYSTEM_PROMPT =
   process.env.SIMLI_SYSTEM_PROMPT?.trim() ||
-  "You are the friendly virtual receptionist for OfficeMal. Greet visitors warmly, " +
-    "answer questions about the office and its services, and keep replies short and " +
-    "conversational — one or two sentences, since they are spoken aloud.";
+  [
+    "You are Mia, the virtual receptionist at Mobile Apps Labs, a software studio",
+    "based in Montréal that builds mobile apps, web platforms, and immersive 3D",
+    "experiences for clients in retail, finance, and hospitality. You speak from a",
+    "touchscreen kiosk in the office lobby. The visitor in front of you is either a",
+    "client, a candidate, or a guest dropping by.",
+    "",
+    "How to respond:",
+    "- Speak warmly and concisely. 1 to 3 short sentences. No bullet lists.",
+    "- Sound like a real person at a reception desk. Conversational, never robotic.",
+    "- If you don't know something, offer to take a message or point them to the",
+    "  right team rather than making things up.",
+  ].join(" ");
 
 // Env values can pick up a stray BOM or surrounding whitespace depending on how
 // they were set (some shells prepend ﻿ when piping). A BOM in an HTTP
@@ -69,25 +94,28 @@ export async function POST() {
     );
   }
 
-  // customLLMConfig is Simli's OpenAI-compatible hook — model + baseURL + key.
-  // Pointing it at Anthropic's /v1 routes Haiku as the conversation brain.
+  // Simli's LLM hook is `llmConfig`, NOT `customLLMConfig` (unknown fields are
+  // silently ignored, which produces a connected-but-silent avatar). For a
+  // custom endpoint like Anthropic's OpenAI-compatible API, provider must be
+  // 'User' (provider 'OpenAI' rejects non-OpenAI models and forbids a custom
+  // baseURL). Confirmed against Simli's 422 validation messages.
   const requestBody: Record<string, unknown> = {
     faceId: DEFAULT_FACE_ID,
-    customLLMConfig: {
+    llmConfig: {
       model: DEFAULT_LLM_MODEL,
+      provider: "User",
+      apiKey: anthropicKey,
       baseURL: DEFAULT_LLM_BASE_URL,
-      llmAPIKey: anthropicKey,
     },
+    ttsProvider: process.env.SIMLI_TTS_PROVIDER?.trim() || "Cartesia",
     systemPrompt: DEFAULT_SYSTEM_PROMPT,
+    firstMessage: DEFAULT_FIRST_MESSAGE,
     language: process.env.SIMLI_LANGUAGE?.trim() || "en",
     maxSessionLength: Number(process.env.SIMLI_MAX_SESSION_LENGTH) || 600,
     maxIdleTime: Number(process.env.SIMLI_MAX_IDLE_TIME) || 60,
   };
 
-  const firstMessage = process.env.SIMLI_FIRST_MESSAGE?.trim();
-  if (firstMessage) requestBody.firstMessage = firstMessage;
-
-  // TTS: default to Simli's bundled Cartesia (no extra key needed). Override
+  // Optional TTS overrides (ttsProvider defaults to Cartesia above). Override
   // ttsProvider/voiceId/ttsModel via env, and supply ttsAPIKey if you bring
   // your own ElevenLabs/PlayHT account.
   if (process.env.SIMLI_TTS_PROVIDER?.trim())
@@ -100,26 +128,42 @@ export async function POST() {
     requestBody.ttsAPIKey = process.env.SIMLI_TTS_API_KEY.trim();
 
   try {
-    const res = await fetch(SIMLI_URL, {
-      method: "POST",
-      headers: {
-        "x-simli-api-key": simliApiKey,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(requestBody),
-      cache: "no-store",
-    });
+    // Simli's start endpoint rate-limits rapid session creation (429). Retry a
+    // few times with backoff so a transient limit self-heals instead of
+    // surfacing as a dead avatar.
+    let res: Response | null = null;
+    let lastText = "";
+    const delays = [0, 1200, 2500, 4000];
+    for (let attempt = 0; attempt < delays.length; attempt++) {
+      if (delays[attempt]) await new Promise((r) => setTimeout(r, delays[attempt]));
+      res = await fetch(SIMLI_URL, {
+        method: "POST",
+        headers: {
+          "x-simli-api-key": simliApiKey,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(requestBody),
+        cache: "no-store",
+      });
+      if (res.status !== 429) break;
+      lastText = await res.text();
+      console.warn(`[simli/session] 429 rate-limited, retry ${attempt + 1}/${delays.length - 1}`);
+    }
 
-    if (!res.ok) {
-      const text = await res.text();
-      console.error("[simli/session] Provider error:", res.status, text);
-      return NextResponse.json(
-        { error: `Provider returned ${res.status}`, detail: text },
-        { status: 502 }
-      );
+    if (!res || !res.ok) {
+      const text = res?.status === 429 ? lastText : await (res?.text() ?? Promise.resolve(""));
+      const status = res?.status ?? 0;
+      console.error("[simli/session] Provider error:", status, text);
+      const friendly =
+        status === 429
+          ? "Simli is rate-limiting new sessions. Wait a moment and try again."
+          : `Provider returned ${status}`;
+      return NextResponse.json({ error: friendly, detail: text }, { status: 502 });
     }
 
     const body = await res.json();
+    console.log("[simli/session] sent config keys:", Object.keys(requestBody));
+    console.log("[simli/session] Simli response:", JSON.stringify(body));
     const roomUrl = body?.roomUrl;
     if (!roomUrl) {
       console.error("[simli/session] No roomUrl in response:", body);
