@@ -25,19 +25,59 @@ type Status = "idle" | "connecting" | "ready" | "speaking" | "error";
 
 type Props = {
   autoStart?: boolean;
+  // Chroma-key the avatar's pink studio background to transparent so she stands
+  // directly in the panorama. On by default; pass chromaKey={false} to show the
+  // raw video (pink square).
+  chromaKey?: boolean;
 };
+
+// Chroma-key tuning for the Simli "Madison" pink backdrop. The background is a
+// light, fairly saturated pink (hue near 345°). We key reddish-pink pixels whose
+// hue sits in the pink band AND that are pink-dominant (red & blue both clearly
+// above green). Skin is more orange (hue ~15-40°) and less blue, so it survives.
+const PINK_HUE_LOW = 320; // hue wheel degrees (pink/magenta band, wraps past 360)
+const PINK_HUE_HIGH = 360;
+const PINK_HUE_WRAP = 8; // also key 0..this (just past 360 / pure red side)
+const SAT_THRESHOLD = 0.18; // above this within the hue band -> fully transparent
+const EDGE_SAT_LOW = 0.07; // ramp alpha between this and SAT_THRESHOLD (soft edge)
+const VAL_THRESHOLD = 0.35; // ignore dark pixels (hair/shadows)
+const BLUE_OVER_GREEN = 6; // require b - g >= this so warm skin isn't keyed
+
+function rgbToHsv(r: number, g: number, b: number): [number, number, number] {
+  const rn = r / 255,
+    gn = g / 255,
+    bn = b / 255;
+  const max = Math.max(rn, gn, bn);
+  const min = Math.min(rn, gn, bn);
+  const d = max - min;
+  let h = 0;
+  if (d !== 0) {
+    if (max === rn) h = ((gn - bn) / d) % 6;
+    else if (max === gn) h = (bn - rn) / d + 2;
+    else h = (rn - gn) / d + 4;
+    h *= 60;
+    if (h < 0) h += 360;
+  }
+  const s = max === 0 ? 0 : d / max;
+  return [h, s, max];
+}
 
 // Module-level lock. React Strict Mode (dev) mounts effects twice; this ensures
 // only ONE room connection is ever starting/alive across remounts.
 let SESSION_ACTIVE = false;
 
-export default function SimliLiveKitPanel({ autoStart = true }: Props) {
+export default function SimliLiveKitPanel({
+  autoStart = true,
+  chromaKey = true,
+}: Props) {
   const [status, setStatus] = useState<Status>("idle");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [listening, setListening] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const rafRef = useRef<number | null>(null);
   const roomRef = useRef<Room | null>(null);
   const readyRef = useRef(false); // true once joined, so PTT can toggle the mic
 
@@ -53,6 +93,67 @@ export default function SimliLiveKitPanel({ autoStart = true }: Props) {
       })
       .catch((e) => console.warn("[SimliLK] setMicrophoneEnabled failed:", e));
   }, []);
+
+  // Chroma-key paint loop: draw the avatar video to a canvas every frame and
+  // knock out the pink studio backdrop so she stands directly in the panorama.
+  // Mirrors the green-screen approach in ImmersiveReceptionistPanel, retuned for
+  // pink. Skipped entirely when chromaKey is false (video shown directly).
+  useEffect(() => {
+    if (!chromaKey) return;
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    if (!video || !canvas) return;
+
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    if (!ctx) return;
+
+    const paint = () => {
+      if (video.readyState >= 2 && video.videoWidth > 0) {
+        if (canvas.width !== video.videoWidth) canvas.width = video.videoWidth;
+        if (canvas.height !== video.videoHeight) canvas.height = video.videoHeight;
+
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const data = frame.data;
+
+        for (let i = 0; i < data.length; i += 4) {
+          const r = data[i],
+            g = data[i + 1],
+            b = data[i + 2];
+          // Quick reject: pink is red-dominant with blue clearly above green.
+          // Warm skin has green >= blue, so this skips faces cheaply.
+          if (r <= g || b - g < BLUE_OVER_GREEN) continue;
+
+          const [h, s, v] = rgbToHsv(r, g, b);
+          if (v < VAL_THRESHOLD) continue;
+          const inPinkBand =
+            (h >= PINK_HUE_LOW && h <= PINK_HUE_HIGH) || h <= PINK_HUE_WRAP;
+          if (!inPinkBand) continue;
+
+          if (s >= SAT_THRESHOLD) {
+            data[i + 3] = 0;
+          } else if (s >= EDGE_SAT_LOW) {
+            // Edge: ramp alpha for a soft cutoff (kills hair fringing).
+            const t = (s - EDGE_SAT_LOW) / (SAT_THRESHOLD - EDGE_SAT_LOW);
+            data[i + 3] = Math.round(255 * (1 - t));
+            // Despill: pull the pink tint (red/blue excess) toward green so
+            // remaining edge pixels don't glow pink.
+            if (r > g) data[i] = Math.round(g + (r - g) * 0.4);
+            if (b > g) data[i + 2] = Math.round(g + (b - g) * 0.4);
+          }
+        }
+
+        ctx.putImageData(frame, 0, 0);
+      }
+      rafRef.current = requestAnimationFrame(paint);
+    };
+
+    rafRef.current = requestAnimationFrame(paint);
+    return () => {
+      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    };
+  }, [chromaKey]);
 
   useEffect(() => {
     if (!autoStart) return;
@@ -202,13 +303,36 @@ export default function SimliLiveKitPanel({ autoStart = true }: Props) {
         WebkitUserSelect: "none",
       }}
     >
+      {/* Source video. When chroma-keying, it's hidden (feeds the canvas);
+          otherwise it's the visible output. It stays muted either way — the
+          avatar's TTS audio plays through the <audio> element below. */}
       <video
         ref={videoRef}
         autoPlay
         playsInline
         muted
-        style={{ width: "100%", height: "100%", objectFit: "contain", pointerEvents: "none" }}
+        style={
+          chromaKey
+            ? { position: "absolute", width: 1, height: 1, opacity: 0, pointerEvents: "none" }
+            : { width: "100%", height: "100%", objectFit: "contain", pointerEvents: "none" }
+        }
       />
+
+      {/* Chroma-keyed output (pink backdrop removed). */}
+      {chromaKey && (
+        <canvas
+          ref={canvasRef}
+          style={{
+            position: "absolute",
+            inset: 0,
+            width: "100%",
+            height: "100%",
+            objectFit: "contain",
+            pointerEvents: "none",
+          }}
+        />
+      )}
+
       {/* The avatar's TTS audio plays through this element. */}
       <audio ref={audioRef} autoPlay />
 
