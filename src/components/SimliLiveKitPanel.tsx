@@ -31,36 +31,13 @@ type Props = {
   chromaKey?: boolean;
 };
 
-// Chroma-key tuning for the Simli "Madison" pink backdrop. The background is a
-// light, fairly saturated pink (hue near 345°). We key reddish-pink pixels whose
-// hue sits in the pink band AND that are pink-dominant (red & blue both clearly
-// above green). Skin is more orange (hue ~15-40°) and less blue, so it survives.
-const PINK_HUE_LOW = 320; // hue wheel degrees (pink/magenta band, wraps past 360)
-const PINK_HUE_HIGH = 360;
-const PINK_HUE_WRAP = 8; // also key 0..this (just past 360 / pure red side)
-const SAT_THRESHOLD = 0.18; // above this within the hue band -> fully transparent
-const EDGE_SAT_LOW = 0.07; // ramp alpha between this and SAT_THRESHOLD (soft edge)
-const VAL_THRESHOLD = 0.35; // ignore dark pixels (hair/shadows)
-const BLUE_OVER_GREEN = 6; // require b - g >= this so warm skin isn't keyed
-
-function rgbToHsv(r: number, g: number, b: number): [number, number, number] {
-  const rn = r / 255,
-    gn = g / 255,
-    bn = b / 255;
-  const max = Math.max(rn, gn, bn);
-  const min = Math.min(rn, gn, bn);
-  const d = max - min;
-  let h = 0;
-  if (d !== 0) {
-    if (max === rn) h = ((gn - bn) / d) % 6;
-    else if (max === gn) h = (bn - rn) / d + 2;
-    else h = (rn - gn) / d + 4;
-    h *= 60;
-    if (h < 0) h += 360;
-  }
-  const s = max === 0 ? 0 : d / max;
-  return [h, s, max];
-}
+// Chroma-key by sampling the actual backdrop color from the video corners each
+// frame, then knocking out pixels close to it. This auto-adapts to whatever pink
+// Simli renders (no hardcoded color), and keys by color distance so it's robust.
+// Pixels within KEY_DIST of the sampled backdrop -> transparent; a soft band up
+// to EDGE_DIST ramps alpha so edges/hair don't harden.
+const KEY_DIST = 60; // RGB euclidean distance: <= this -> fully transparent
+const EDGE_DIST = 100; // between KEY_DIST and this -> ramp alpha (soft edge)
 
 // Module-level lock. React Strict Mode (dev) mounts effects twice; this ensures
 // only ONE room connection is ever starting/alive across remounts.
@@ -109,37 +86,62 @@ export default function SimliLiveKitPanel({
 
     const paint = () => {
       if (video.readyState >= 2 && video.videoWidth > 0) {
-        if (canvas.width !== video.videoWidth) canvas.width = video.videoWidth;
-        if (canvas.height !== video.videoHeight) canvas.height = video.videoHeight;
+        const w = video.videoWidth;
+        const h = video.videoHeight;
+        if (canvas.width !== w) canvas.width = w;
+        if (canvas.height !== h) canvas.height = h;
 
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-        const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(video, 0, 0, w, h);
+        let frame: ImageData;
+        try {
+          frame = ctx.getImageData(0, 0, w, h);
+        } catch {
+          // Canvas tainted (cross-origin video) — can't read pixels. Bail out
+          // of keying so we don't spin; the raw video element still shows.
+          rafRef.current = requestAnimationFrame(paint);
+          return;
+        }
         const data = frame.data;
 
+        // Sample the backdrop color from the four corners (always background)
+        // and average them — adapts to whatever pink Simli outputs, and to
+        // lighting changes, every frame.
+        const idx = (x: number, y: number) => (y * w + x) * 4;
+        const corners = [
+          idx(2, 2),
+          idx(w - 3, 2),
+          idx(2, h - 3),
+          idx(w - 3, h - 3),
+        ];
+        let br = 0,
+          bg = 0,
+          bb = 0;
+        for (const c of corners) {
+          br += data[c];
+          bg += data[c + 1];
+          bb += data[c + 2];
+        }
+        br /= 4;
+        bg /= 4;
+        bb /= 4;
+
         for (let i = 0; i < data.length; i += 4) {
-          const r = data[i],
-            g = data[i + 1],
-            b = data[i + 2];
-          // Quick reject: pink is red-dominant with blue clearly above green.
-          // Warm skin has green >= blue, so this skips faces cheaply.
-          if (r <= g || b - g < BLUE_OVER_GREEN) continue;
+          const dr = data[i] - br;
+          const dg = data[i + 1] - bg;
+          const db = data[i + 2] - bb;
+          const dist = Math.sqrt(dr * dr + dg * dg + db * db);
 
-          const [h, s, v] = rgbToHsv(r, g, b);
-          if (v < VAL_THRESHOLD) continue;
-          const inPinkBand =
-            (h >= PINK_HUE_LOW && h <= PINK_HUE_HIGH) || h <= PINK_HUE_WRAP;
-          if (!inPinkBand) continue;
-
-          if (s >= SAT_THRESHOLD) {
-            data[i + 3] = 0;
-          } else if (s >= EDGE_SAT_LOW) {
-            // Edge: ramp alpha for a soft cutoff (kills hair fringing).
-            const t = (s - EDGE_SAT_LOW) / (SAT_THRESHOLD - EDGE_SAT_LOW);
-            data[i + 3] = Math.round(255 * (1 - t));
-            // Despill: pull the pink tint (red/blue excess) toward green so
-            // remaining edge pixels don't glow pink.
-            if (r > g) data[i] = Math.round(g + (r - g) * 0.4);
-            if (b > g) data[i + 2] = Math.round(g + (b - g) * 0.4);
+          if (dist <= KEY_DIST) {
+            data[i + 3] = 0; // close to backdrop -> transparent
+          } else if (dist < EDGE_DIST) {
+            // Soft edge: ramp alpha so hair/edges don't harden, and despill the
+            // pink tint that bleeds onto edge pixels.
+            const t = (dist - KEY_DIST) / (EDGE_DIST - KEY_DIST);
+            data[i + 3] = Math.round(255 * t);
+            const g = data[i + 1];
+            if (data[i] > g) data[i] = Math.round(g + (data[i] - g) * 0.5);
+            if (data[i + 2] > g)
+              data[i + 2] = Math.round(g + (data[i + 2] - g) * 0.5);
           }
         }
 
