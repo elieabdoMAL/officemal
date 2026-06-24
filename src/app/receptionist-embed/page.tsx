@@ -2,10 +2,14 @@
 
 import ImmersiveReceptionistPanel from "@/components/ImmersiveReceptionistPanel";
 import SimliReceptionistPanel from "@/components/SimliReceptionistPanel";
+import SimliLiveKitPanel from "@/components/SimliLiveKitPanel";
 
 // Switch the avatar backend without code changes:
-//   NEXT_PUBLIC_AVATAR_PROVIDER=simli      -> Simli + Haiku (Auto/E2E)
-//   anything else (default)                -> LiveAvatar (HeyGen) FULL mode
+//   NEXT_PUBLIC_AVATAR_PROVIDER=simli-livekit -> Simli Trinity face via a
+//        self-hosted LiveKit worker (agent-worker/); Gemini + Deepgram brain.
+//   NEXT_PUBLIC_AVATAR_PROVIDER=simli         -> Simli Auto + Haiku (Daily;
+//        Legacy faces only — kept for rollback)
+//   anything else (default)                   -> LiveAvatar (HeyGen) FULL mode
 const PROVIDER = process.env.NEXT_PUBLIC_AVATAR_PROVIDER;
 
 // Standalone embedded route rendered inside a 3DVista Web Frame hotspot.
@@ -22,7 +26,9 @@ export default function ReceptionistEmbedPage() {
         overflow: "hidden",
       }}
     >
-      {PROVIDER === "simli" ? (
+      {PROVIDER === "simli-livekit" ? (
+        <SimliLiveKitPanel />
+      ) : PROVIDER === "simli" ? (
         <SimliReceptionistPanel />
       ) : (
         <ImmersiveReceptionistPanel />

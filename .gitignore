@@ -1,5 +1,12 @@
 # See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
 
+# secrets — SSH/PuTTY private keys must NEVER be committed
+*.ppk
+*.pem
+/docs/eabdo.ppk
+id_rsa
+id_ed25519
+
 # dependencies
 /node_modules
 /.pnp
@@ -49,3 +56,9 @@ next-env.d.ts
 .vercel
 
 .vercel
+
+# python worker venv / caches
+agent-worker/.venv/
+__pycache__/
+*.pyc
+agent-worker/.env
