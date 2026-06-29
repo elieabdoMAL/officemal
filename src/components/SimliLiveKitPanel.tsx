@@ -37,9 +37,10 @@ type Props = {
 // Same tuning the HeyGen ImmersiveReceptionistPanel uses.
 const KEY_HUE_LOW = 80; // hue wheel degrees — pure green is 120
 const KEY_HUE_HIGH = 160;
-const SAT_THRESHOLD = 0.25; // above this -> fully transparent
-const EDGE_SAT_LOW = 0.1; // ramp alpha between this and SAT_THRESHOLD
+const SAT_THRESHOLD = 0.3; // above this -> fully transparent
+const EDGE_SAT_LOW = 0.08; // ramp alpha between this and SAT_THRESHOLD (wider = softer)
 const VAL_THRESHOLD = 0.2; // ignore very dark pixels (hair shadows)
+const FEATHER = true; // blur the alpha channel a touch to smooth jagged edges
 
 function rgbToHsv(r: number, g: number, b: number): [number, number, number] {
   const rn = r / 255,
@@ -145,6 +146,25 @@ export default function SimliLiveKitPanel({
             // edge pixels don't look fluorescent.
             const avgRB = (r + b) / 2;
             if (g > avgRB) data[i + 1] = Math.round(avgRB + (g - avgRB) * 0.4);
+          }
+        }
+
+        // Feather the alpha channel with a 3x3 box blur so the cutout edge
+        // fades smoothly instead of stepping pixel-by-pixel (kills the jagged
+        // staircase look on shoulders/jaw). Only the alpha is blurred; RGB is
+        // untouched, so the image stays sharp.
+        if (FEATHER) {
+          const alpha = new Uint8ClampedArray(w * h);
+          for (let p = 0, a = 0; p < data.length; p += 4, a++) alpha[a] = data[p + 3];
+          for (let y = 1; y < h - 1; y++) {
+            for (let x = 1; x < w - 1; x++) {
+              const a = y * w + x;
+              const sum =
+                alpha[a - w - 1] + alpha[a - w] + alpha[a - w + 1] +
+                alpha[a - 1] + alpha[a] + alpha[a + 1] +
+                alpha[a + w - 1] + alpha[a + w] + alpha[a + w + 1];
+              data[a * 4 + 3] = (sum / 9) | 0;
+            }
           }
         }
 
