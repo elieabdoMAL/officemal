@@ -31,13 +31,34 @@ type Props = {
   chromaKey?: boolean;
 };
 
-// Chroma-key by sampling the actual backdrop color from the video corners each
-// frame, then knocking out pixels close to it. This auto-adapts to whatever pink
-// Simli renders (no hardcoded color), and keys by color distance so it's robust.
-// Pixels within KEY_DIST of the sampled backdrop -> transparent; a soft band up
-// to EDGE_DIST ramps alpha so edges/hair don't harden.
-const KEY_DIST = 60; // RGB euclidean distance: <= this -> fully transparent
-const EDGE_DIST = 100; // between KEY_DIST and this -> ramp alpha (soft edge)
+// Chroma-key the green-screen backdrop (Simli face 4957476d renders on green).
+// Pure green keys to fully transparent; greens near it taper off so edges are
+// soft (kills hair fringing). Despill nudges remaining edge greens to neutral.
+// Same tuning the HeyGen ImmersiveReceptionistPanel uses.
+const KEY_HUE_LOW = 80; // hue wheel degrees — pure green is 120
+const KEY_HUE_HIGH = 160;
+const SAT_THRESHOLD = 0.25; // above this -> fully transparent
+const EDGE_SAT_LOW = 0.1; // ramp alpha between this and SAT_THRESHOLD
+const VAL_THRESHOLD = 0.2; // ignore very dark pixels (hair shadows)
+
+function rgbToHsv(r: number, g: number, b: number): [number, number, number] {
+  const rn = r / 255,
+    gn = g / 255,
+    bn = b / 255;
+  const max = Math.max(rn, gn, bn);
+  const min = Math.min(rn, gn, bn);
+  const d = max - min;
+  let h = 0;
+  if (d !== 0) {
+    if (max === rn) h = ((gn - bn) / d) % 6;
+    else if (max === gn) h = (bn - rn) / d + 2;
+    else h = (rn - gn) / d + 4;
+    h *= 60;
+    if (h < 0) h += 360;
+  }
+  const s = max === 0 ? 0 : d / max;
+  return [h, s, max];
+}
 
 // Module-level lock. React Strict Mode (dev) mounts effects twice; this ensures
 // only ONE room connection is ever starting/alive across remounts.
@@ -103,45 +124,27 @@ export default function SimliLiveKitPanel({
         }
         const data = frame.data;
 
-        // Sample the backdrop color from the four corners (always background)
-        // and average them — adapts to whatever pink Simli outputs, and to
-        // lighting changes, every frame.
-        const idx = (x: number, y: number) => (y * w + x) * 4;
-        const corners = [
-          idx(2, 2),
-          idx(w - 3, 2),
-          idx(2, h - 3),
-          idx(w - 3, h - 3),
-        ];
-        let br = 0,
-          bg = 0,
-          bb = 0;
-        for (const c of corners) {
-          br += data[c];
-          bg += data[c + 1];
-          bb += data[c + 2];
-        }
-        br /= 4;
-        bg /= 4;
-        bb /= 4;
-
         for (let i = 0; i < data.length; i += 4) {
-          const dr = data[i] - br;
-          const dg = data[i + 1] - bg;
-          const db = data[i + 2] - bb;
-          const dist = Math.sqrt(dr * dr + dg * dg + db * db);
+          const r = data[i],
+            g = data[i + 1],
+            b = data[i + 2];
+          // Quick reject: not green-dominant -> keep opaque.
+          if (g <= r || g <= b) continue;
 
-          if (dist <= KEY_DIST) {
-            data[i + 3] = 0; // close to backdrop -> transparent
-          } else if (dist < EDGE_DIST) {
-            // Soft edge: ramp alpha so hair/edges don't harden, and despill the
-            // pink tint that bleeds onto edge pixels.
-            const t = (dist - KEY_DIST) / (EDGE_DIST - KEY_DIST);
-            data[i + 3] = Math.round(255 * t);
-            const g = data[i + 1];
-            if (data[i] > g) data[i] = Math.round(g + (data[i] - g) * 0.5);
-            if (data[i + 2] > g)
-              data[i + 2] = Math.round(g + (data[i + 2] - g) * 0.5);
+          const [h, s, v] = rgbToHsv(r, g, b);
+          if (v < VAL_THRESHOLD) continue;
+          if (h < KEY_HUE_LOW || h > KEY_HUE_HIGH) continue;
+
+          if (s >= SAT_THRESHOLD) {
+            data[i + 3] = 0;
+          } else if (s >= EDGE_SAT_LOW) {
+            // Edge: ramp alpha for a soft cutoff.
+            const t = (s - EDGE_SAT_LOW) / (SAT_THRESHOLD - EDGE_SAT_LOW);
+            data[i + 3] = Math.round(255 * (1 - t));
+            // Despill: pull green down toward the avg of red+blue so remaining
+            // edge pixels don't look fluorescent.
+            const avgRB = (r + b) / 2;
+            if (g > avgRB) data[i + 1] = Math.round(avgRB + (g - avgRB) * 0.4);
           }
         }
 
