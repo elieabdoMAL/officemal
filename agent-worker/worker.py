@@ -216,6 +216,18 @@ async def entrypoint(ctx: JobContext) -> None:
         stt=deepgram.STT(model="nova-3", language="multi"),
         llm=google.LLM(model="gemini-2.5-flash"),
         tts=tts,
+        # The default endpointing (min 0.5s / max 3.0s of silence before she
+        # accepts the turn is over) reads as a long dead pause at a reception
+        # desk, where turns are short and the visitor expects a near-immediate
+        # reply. Tightened to 0.3/1.5.
+        #
+        # preemptive_tts starts synthesizing before the turn is formally closed,
+        # which removes most of the remaining gap — it costs a little wasted TTS
+        # when a guess is discarded, which is the right trade here.
+        turn_handling={
+            "endpointing": {"min_delay": 0.3, "max_delay": 1.5},
+            "preemptive_generation": {"preemptive_tts": True},
+        },
     )
 
     # Simli renders the Trinity face into the room, lip-synced to session audio.

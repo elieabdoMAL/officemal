@@ -5,6 +5,7 @@ import {
   Room,
   RoomEvent,
   Track,
+  type Participant,
   type RemoteTrack,
   type RemoteTrackPublication,
   type RemoteParticipant,
@@ -25,6 +26,22 @@ import {
 //     (hiding a Web Frame doesn't unload it).
 
 type Status = "idle" | "connecting" | "ready" | "speaking" | "error";
+
+// What the visitor is told is happening right now. Kept separate from Status
+// (which tracks the connection) because a visitor standing at a kiosk needs to
+// know whose turn it is, not whether a room is joined.
+type Turn =
+  | "waiting" // mic open, silence — her cue for "go ahead"
+  | "hearing" // the visitor is speaking into the open mic
+  | "thinking" // visitor stopped, reply not started yet
+  | "answering"; // she's talking
+
+const TURN_LABEL: Record<Turn, { text: string; bg: string }> = {
+  waiting: { text: "🎙️ Go ahead — I'm listening", bg: "rgba(0,0,0,0.55)" },
+  hearing: { text: "● Listening…", bg: "rgba(239,68,68,0.9)" },
+  thinking: { text: "… Thinking", bg: "rgba(234,179,8,0.9)" },
+  answering: { text: "🔊 Speaking", bg: "rgba(0,150,255,0.85)" },
+};
 
 type Props = {
   autoStart?: boolean;
@@ -51,6 +68,9 @@ const FEATHER = true; // blur the alpha channel a touch to smooth jagged edges
 // How long to keep the mic shut after joining so her own greeting doesn't land
 // in her ears. FIRST_MESSAGE is one short sentence; ~6s covers it.
 const GREETING_MS = 6000;
+
+// Longest we'll claim she's "thinking" before admitting we're back to waiting.
+const THINKING_TIMEOUT_MS = 8000;
 
 function rgbToHsv(r: number, g: number, b: number): [number, number, number] {
   const rn = r / 255,
@@ -83,6 +103,7 @@ export default function SimliLiveKitPanel({
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [listening, setListening] = useState(false);
   const [hidden, setHidden] = useState(false);
+  const [turn, setTurn] = useState<Turn>("waiting");
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -144,6 +165,15 @@ export default function SimliLiveKitPanel({
     if (audioRef.current) audioRef.current.muted = hidden;
     if (hidden) setMic(false);
   }, [hidden, setMic]);
+
+  // "Thinking" is inferred from silence, so nothing guarantees it ends — a
+  // rejected turn ("I didn't get that" never reaches the LLM) or a dropped
+  // reply would strand it. Fall back to waiting so the pill can't lie.
+  useEffect(() => {
+    if (turn !== "thinking") return;
+    const timer = window.setTimeout(() => setTurn("waiting"), THINKING_TIMEOUT_MS);
+    return () => window.clearTimeout(timer);
+  }, [turn]);
 
   // Chroma-key paint loop: draw the avatar video to a canvas every frame and
   // knock out the pink studio backdrop so she stands directly in the panorama.
@@ -292,6 +322,23 @@ export default function SimliLiveKitPanel({
           console.warn("[SimliLK] room disconnected");
         });
 
+        // Whose turn it is, derived from who's actually making sound. The
+        // avatar publishes as a remote participant, so anyone remote speaking
+        // is her; the local participant is the visitor.
+        room.on(RoomEvent.ActiveSpeakersChanged, (speakers: Participant[]) => {
+          if (cancelled) return;
+          const visitorTalking = speakers.some((s) => s.isLocal);
+          const avatarTalking = speakers.some((s) => !s.isLocal);
+
+          if (avatarTalking) setTurn("answering");
+          else if (visitorTalking) setTurn("hearing");
+          else {
+            // Silence right after the visitor spoke means she's working on a
+            // reply; silence otherwise means we're waiting on the visitor.
+            setTurn((prev) => (prev === "hearing" ? "thinking" : "waiting"));
+          }
+        });
+
         await room.connect(url, token);
         if (cancelled) {
           await room.disconnect().catch(() => {});
@@ -424,8 +471,8 @@ export default function SimliLiveKitPanel({
         </div>
       )}
 
-      {/* Passive listening indicator — shown only while the mic is actually
-          open, so the visitor knows she can just talk. */}
+      {/* Turn indicator. Shown only while the mic is genuinely open, so it
+          never promises she's listening when she isn't. */}
       {!connecting && !hidden && listening && (
         <div
           style={{
@@ -435,16 +482,17 @@ export default function SimliLiveKitPanel({
             transform: "translateX(-50%)",
             padding: "8px 16px",
             borderRadius: 999,
-            background: "rgba(239,68,68,0.9)",
+            background: TURN_LABEL[turn].bg,
             color: "white",
             fontSize: 13,
             fontWeight: 600,
             textShadow: "0 2px 8px rgba(0,0,0,0.8)",
             pointerEvents: "none",
             whiteSpace: "nowrap",
+            transition: "background 0.2s ease",
           }}
         >
-          ● Listening…
+          {TURN_LABEL[turn].text}
         </div>
       )}
     </div>
