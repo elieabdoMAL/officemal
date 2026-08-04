@@ -27,6 +27,7 @@ from livekit.agents import (
     Agent,
     AgentSession,
     JobContext,
+    StopResponse,
     WorkerOptions,
     cli,
 )
@@ -57,6 +58,69 @@ MIA_SYSTEM_PROMPT = " ".join(
 
 FIRST_MESSAGE = "Hi there! Welcome to Mobile Apps Labs. How can I help you today?"
 
+# She now listens continuously (the browser leaves the mic open), so the room's
+# background noise reaches Deepgram all day. Rather than let Gemini improvise on
+# a garbled transcript, bounce anything too weak to act on.
+DIDNT_GET_THAT = "I'm sorry, I didn't get that."
+
+# Deepgram's per-utterance confidence, 0..1. Below this we assume the audio was
+# noise or half a word. 0.6 is a starting point — watch the logged values in
+# `docker compose logs -f` and retune.
+MIN_STT_CONFIDENCE = 0.6
+
+# Sub-threshold transcripts are usually 1-2 stray characters or a lone filler.
+MIN_TRANSCRIPT_CHARS = 3
+FILLER_ONLY = {"uh", "um", "hmm", "mhm", "ah", "eh", "oh", "hm", "huh"}
+
+
+class MiaAgent(Agent):
+    """Mia, plus a gate that refuses to answer transcripts it can't trust.
+
+    Two signals, because neither alone is enough:
+      * STT confidence — captured in `stt_node`, the only place Deepgram's
+        per-alternative score is still attached to the event.
+      * The transcript itself — confidence can read high on a clean recording of
+        someone clearing their throat.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(instructions=MIA_SYSTEM_PROMPT)
+        self._last_confidence: float | None = None
+
+    async def stt_node(self, audio, model_settings):
+        async for event in super().stt_node(audio, model_settings):
+            alternatives = getattr(event, "alternatives", None)
+            if alternatives:
+                confidence = getattr(alternatives[0], "confidence", None)
+                if confidence is not None:
+                    self._last_confidence = confidence
+            yield event
+
+    async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
+        text = (new_message.text_content or "").strip()
+        confidence = self._last_confidence
+        self._last_confidence = None  # don't carry a stale score into next turn
+
+        stripped = text.lower().strip(".,!? ")
+        too_short = len(stripped) < MIN_TRANSCRIPT_CHARS
+        filler = stripped in FILLER_ONLY
+        unsure = confidence is not None and confidence < MIN_STT_CONFIDENCE
+
+        if text and not (too_short or filler or unsure):
+            logger.info("heard %r (confidence=%s)", text, confidence)
+            return
+
+        logger.info(
+            "rejected %r (confidence=%s, short=%s, filler=%s)",
+            text,
+            confidence,
+            too_short,
+            filler,
+        )
+        await self.session.say(DIDNT_GET_THAT)
+        # Skip the LLM entirely for this turn — she's already answered.
+        raise StopResponse()
+
 
 async def entrypoint(ctx: JobContext) -> None:
     await ctx.connect()
@@ -81,12 +145,12 @@ async def entrypoint(ctx: JobContext) -> None:
     await avatar.start(session, room=ctx.room)
 
     await session.start(
-        agent=Agent(instructions=MIA_SYSTEM_PROMPT),
+        agent=MiaAgent(),
         room=ctx.room,
     )
 
-    # Greet the visitor on her own; the browser keeps its mic muted until the
-    # user holds to talk, so she speaks first without listening.
+    # Greet the visitor on her own; the browser holds its mic shut for the first
+    # few seconds, so she speaks before she starts listening.
     await session.say(FIRST_MESSAGE)
 
 

@@ -18,20 +18,26 @@ import {
 //   - On load: get a token from /api/livekit/token, join the room, show the
 //     avatar, and let the worker speak its first message on its own. Mic starts
 //     MUTED so she greets without listening.
-//   - Push-to-talk: press & hold the frame -> mic on; release -> mic off -> she
-//     answers. The avatar is always visible.
+//   - Then the mic opens and STAYS open: she listens continuously and the
+//     worker's VAD decides when a turn ends. When the transcript is too weak to
+//     act on, the worker answers "I'm sorry, I didn't get that."
+//   - The parent panorama can hide this frame; we mute mic + audio while hidden
+//     (hiding a Web Frame doesn't unload it).
 
 type Status = "idle" | "connecting" | "ready" | "speaking" | "error";
 
 type Props = {
   autoStart?: boolean;
-  // Chroma-key the avatar's pink studio background to transparent so she stands
+  // Chroma-key the avatar's studio background to transparent so she stands
   // directly in the panorama. On by default; pass chromaKey={false} to show the
-  // raw video (pink square).
+  // raw video (backdrop square) — useful when checking a new face's backdrop.
   chromaKey?: boolean;
 };
 
-// Chroma-key the green-screen backdrop (Simli face 4957476d renders on green).
+// Chroma-key the green-screen backdrop. Tuned against the face that was live
+// when this was written; the current SIMLI_FACE_ID (5f911c8d) is set on the
+// worker's .env, so whenever it changes, re-check the backdrop — a face on a
+// different colour needs the hue window below retuned, or she shows up boxed.
 // Pure green keys to fully transparent; greens near it taper off so edges are
 // soft (kills hair fringing). Despill nudges remaining edge greens to neutral.
 // Same tuning the HeyGen ImmersiveReceptionistPanel uses.
@@ -41,6 +47,10 @@ const SAT_THRESHOLD = 0.3; // above this -> fully transparent
 const EDGE_SAT_LOW = 0.08; // ramp alpha between this and SAT_THRESHOLD (wider = softer)
 const VAL_THRESHOLD = 0.2; // ignore very dark pixels (hair shadows)
 const FEATHER = true; // blur the alpha channel a touch to smooth jagged edges
+
+// How long to keep the mic shut after joining so her own greeting doesn't land
+// in her ears. FIRST_MESSAGE is one short sentence; ~6s covers it.
+const GREETING_MS = 6000;
 
 function rgbToHsv(r: number, g: number, b: number): [number, number, number] {
   const rn = r / 255,
@@ -72,6 +82,7 @@ export default function SimliLiveKitPanel({
   const [status, setStatus] = useState<Status>("idle");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [listening, setListening] = useState(false);
+  const [hidden, setHidden] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -80,7 +91,6 @@ export default function SimliLiveKitPanel({
   const roomRef = useRef<Room | null>(null);
   const readyRef = useRef(false); // true once joined, so PTT can toggle the mic
 
-  // Push-to-talk: enable the mic only while held.
   const setMic = useCallback((on: boolean) => {
     const room = roomRef.current;
     if (!room || !readyRef.current) return;
@@ -92,6 +102,48 @@ export default function SimliLiveKitPanel({
       })
       .catch((e) => console.warn("[SimliLK] setMicrophoneEnabled failed:", e));
   }, []);
+
+  // She listens the whole time she's on screen: mic opens when shown, closes
+  // when hidden, and stays open in between (the worker's VAD decides when a
+  // turn ends). The only delay is GREETING_MS on the very first open, so her
+  // own greeting doesn't land in her ears — coming back from hidden is
+  // instant, since she's already said it. Browser echo cancellation covers the
+  // rest of the session.
+  const greetedRef = useRef(false);
+  useEffect(() => {
+    if (status !== "ready" || hidden) return;
+
+    if (greetedRef.current) {
+      setMic(true);
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      greetedRef.current = true;
+      setMic(true);
+    }, GREETING_MS);
+    return () => window.clearTimeout(timer);
+  }, [status, hidden, setMic]);
+
+  // The panorama can hide this Web Frame (AiToggle button / a 3DVista action).
+  // Hiding doesn't unload the iframe, so go quiet by hand: drop the mic and
+  // mute her audio, then pick both back up when shown again.
+  useEffect(() => {
+    const onMessage = (e: MessageEvent) => {
+      const data = e.data as { type?: string; visible?: boolean; muted?: boolean };
+      if (data?.type === "receptionist-visible" && typeof data.visible === "boolean") {
+        setHidden(!data.visible);
+      } else if (data?.type === "receptionist-mute" && typeof data.muted === "boolean") {
+        setHidden(data.muted);
+      }
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, []);
+
+  useEffect(() => {
+    if (audioRef.current) audioRef.current.muted = hidden;
+    if (hidden) setMic(false);
+  }, [hidden, setMic]);
 
   // Chroma-key paint loop: draw the avatar video to a canvas every frame and
   // knock out the pink studio backdrop so she stands directly in the panorama.
@@ -246,11 +298,11 @@ export default function SimliLiveKitPanel({
           return;
         }
 
-        // Mute the mic immediately so the avatar speaks its first message
-        // without listening. Push-to-talk turns it on only while held.
+        // Start muted so the greeting isn't interrupted by room noise; the
+        // effect below opens the mic for good once she's done speaking.
         try {
           await room.localParticipant.setMicrophoneEnabled(false);
-          console.log("[SimliLK] joined, mic muted");
+          console.log("[SimliLK] joined, mic muted for greeting");
         } catch (e) {
           console.warn("[SimliLK] initial mute failed:", e);
         }
@@ -298,21 +350,9 @@ export default function SimliLiveKitPanel({
 
   return (
     <div
-      // Push-to-talk: hold to listen, release to send.
-      onPointerDown={(e) => {
-        e.preventDefault();
-        setMic(true);
-      }}
-      onPointerUp={(e) => {
-        e.preventDefault();
-        setMic(false);
-      }}
-      onPointerLeave={() => {
-        if (listening) setMic(false);
-      }}
-      onPointerCancel={() => {
-        if (listening) setMic(false);
-      }}
+      // No press-to-talk: if she's on screen, she's hearing you. Visibility is
+      // the only thing that gates the mic (see the effect above), so there's
+      // nothing to click here.
       style={{
         position: "relative",
         width: "100%",
@@ -322,8 +362,9 @@ export default function SimliLiveKitPanel({
         fontFamily: "sans-serif",
         color: "white",
         boxSizing: "border-box",
-        cursor: status === "ready" ? "pointer" : "default",
-        touchAction: "none",
+        // Nothing here is interactive any more — let taps fall through to the
+        // panorama behind her instead of dying on this panel.
+        pointerEvents: "none",
         userSelect: "none",
         WebkitUserSelect: "none",
       }}
@@ -383,8 +424,9 @@ export default function SimliLiveKitPanel({
         </div>
       )}
 
-      {/* Push-to-talk hint / listening indicator. */}
-      {!connecting && (
+      {/* Passive listening indicator — shown only while the mic is actually
+          open, so the visitor knows she can just talk. */}
+      {!connecting && !hidden && listening && (
         <div
           style={{
             position: "absolute",
@@ -393,7 +435,7 @@ export default function SimliLiveKitPanel({
             transform: "translateX(-50%)",
             padding: "8px 16px",
             borderRadius: 999,
-            background: listening ? "rgba(239,68,68,0.9)" : "rgba(0,0,0,0.5)",
+            background: "rgba(239,68,68,0.9)",
             color: "white",
             fontSize: 13,
             fontWeight: 600,
@@ -402,7 +444,7 @@ export default function SimliLiveKitPanel({
             whiteSpace: "nowrap",
           }}
         >
-          {listening ? "● Listening…" : "🎙️ Hold to talk"}
+          ● Listening…
         </div>
       )}
     </div>

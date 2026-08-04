@@ -57,7 +57,8 @@ next-env.d.ts
 
 .vercel
 
-# python worker venv / caches
+# python worker venv / caches / local build+run logs
+agent-worker/*.log
 agent-worker/.venv/
 __pycache__/
 *.pyc
