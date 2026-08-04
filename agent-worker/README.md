@@ -7,6 +7,28 @@ self-hosted Python process that joins a LiveKit room and runs:
 Deepgram STT  →  Gemini 2.5 Flash  →  Deepgram TTS  →  Simli avatar (Trinity face 5f911c8d)
 ```
 
+## Bilingual (FR / EN)
+
+She greets with "Bonjour, hi!" and then answers in whichever language the
+visitor speaks, switching per turn. Three pieces make that work:
+
+- **STT** runs `nova-3` with `language="multi"` — required, since the nova-2
+  models are English-only. It reports the language of each utterance.
+- **TTS** swaps voices per turn via `update_options(model=…)`, because one Aura
+  voice speaks one language: `aura-2-agathe-fr` / `aura-2-andromeda-en`.
+- **The system prompt** tells her to match the visitor's language; without that
+  line Gemini replies in English no matter what it was given.
+
+> **Accent caveat:** Aura has no `fr-CA` voice, so her French is France French,
+> not Québécois. Changing that means a different TTS vendor (ElevenLabs,
+> Cartesia) — a new key and a `requirements.txt` change.
+
+`MIN_STT_CONFIDENCE` gates each turn; below it she answers "I'm sorry, I didn't
+get that" / "Désolée, je n'ai pas compris" instead of letting Gemini improvise
+on noise. Multilingual STT scores lower than English-only did, so it sits at
+0.5 — every turn logs its confidence and detected language, so retune from the
+real distribution in `docker compose logs -f`.
+
 **Why this exists:** Simli's hosted "Auto" API only renders *Legacy* faces. The
 face we want (Mia, `5f911c8d`) is a *Trinity* face, and Trinity faces can only be
 driven through a self-hosted LiveKit worker — this one. The browser
@@ -27,6 +49,8 @@ Fill these into `.env` (copy from `env.example`):
 |---|---|---|
 | `SIMLI_API_KEY` | Simli dashboard | already have it |
 | `SIMLI_FACE_ID` | — | pre-filled: `5f911c8d-7b81-40f6-bed0-de435f02e10d`. Changing the face is a `.env` edit + `docker compose up -d` on the server — no rebuild. Check the new face's backdrop colour against the chroma-key in `SimliLiveKitPanel.tsx`. |
+| `SIMLI_MAX_IDLE_TIME` | — | optional, default `180`s. Simli bills render time, so the avatar disconnects after this much silence. The plugin's own default is 30s, far too short for a kiosk. |
+| `SIMLI_MAX_SESSION_LENGTH` | — | optional, default `1800`s. Backstop so a wedged session can't bill overnight. |
 | `GOOGLE_API_KEY` | [aistudio.google.com](https://aistudio.google.com) → "Get API key" | **not** your Workspace/Gemini Pro sub — a separate AI Studio key |
 | `DEEPGRAM_API_KEY` | [console.deepgram.com](https://console.deepgram.com) | one key = STT **and** TTS; $200 free credit |
 | `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | [cloud.livekit.io](https://cloud.livekit.io) → project → Settings → Keys | free tier |
