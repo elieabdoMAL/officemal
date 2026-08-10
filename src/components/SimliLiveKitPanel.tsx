@@ -10,6 +10,7 @@ import {
   type RemoteTrackPublication,
   type RemoteParticipant,
 } from "livekit-client";
+import { applyChromaKey } from "@/lib/chromaKey";
 
 // Simli Trinity receptionist over LiveKit. Unlike SimliReceptionistPanel (which
 // used Simli Auto + Daily, a Legacy-only pipeline), this joins a LiveKit room
@@ -51,19 +52,10 @@ type Props = {
   chromaKey?: boolean;
 };
 
-// Chroma-key the green-screen backdrop. Tuned against the face that was live
-// when this was written; the current SIMLI_FACE_ID (5f911c8d) is set on the
-// worker's .env, so whenever it changes, re-check the backdrop — a face on a
-// different colour needs the hue window below retuned, or she shows up boxed.
-// Pure green keys to fully transparent; greens near it taper off so edges are
-// soft (kills hair fringing). Despill nudges remaining edge greens to neutral.
-// Same tuning the HeyGen ImmersiveReceptionistPanel uses.
-const KEY_HUE_LOW = 80; // hue wheel degrees — pure green is 120
-const KEY_HUE_HIGH = 160;
-const SAT_THRESHOLD = 0.3; // above this -> fully transparent
-const EDGE_SAT_LOW = 0.08; // ramp alpha between this and SAT_THRESHOLD (wider = softer)
-const VAL_THRESHOLD = 0.2; // ignore very dark pixels (hair shadows)
-const FEATHER = true; // blur the alpha channel a touch to smooth jagged edges
+// Backdrop removal lives in @/lib/chromaKey — see the note there on why this
+// keys by chroma distance rather than hue+saturation. Whenever SIMLI_FACE_ID
+// changes, re-check the backdrop colour: a face on a different colour needs
+// KEY_COLOR updated, or she shows up in a coloured box.
 
 // How long to keep the mic shut after joining so her own greeting doesn't land
 // in her ears. FIRST_MESSAGE is one short sentence; ~6s covers it.
@@ -71,25 +63,6 @@ const GREETING_MS = 6000;
 
 // Longest we'll claim she's "thinking" before admitting we're back to waiting.
 const THINKING_TIMEOUT_MS = 8000;
-
-function rgbToHsv(r: number, g: number, b: number): [number, number, number] {
-  const rn = r / 255,
-    gn = g / 255,
-    bn = b / 255;
-  const max = Math.max(rn, gn, bn);
-  const min = Math.min(rn, gn, bn);
-  const d = max - min;
-  let h = 0;
-  if (d !== 0) {
-    if (max === rn) h = ((gn - bn) / d) % 6;
-    else if (max === gn) h = (bn - rn) / d + 2;
-    else h = (rn - gn) / d + 4;
-    h *= 60;
-    if (h < 0) h += 360;
-  }
-  const s = max === 0 ? 0 : d / max;
-  return [h, s, max];
-}
 
 // Module-level lock. React Strict Mode (dev) mounts effects twice; this ensures
 // only ONE room connection is ever starting/alive across remounts.
@@ -176,9 +149,9 @@ export default function SimliLiveKitPanel({
   }, [turn]);
 
   // Chroma-key paint loop: draw the avatar video to a canvas every frame and
-  // knock out the pink studio backdrop so she stands directly in the panorama.
-  // Mirrors the green-screen approach in ImmersiveReceptionistPanel, retuned for
-  // pink. Skipped entirely when chromaKey is false (video shown directly).
+  // knock out the studio backdrop so she stands directly in the panorama.
+  // Skipped entirely when chromaKey is false (video shown directly) — useful
+  // for eyeballing a new face's backdrop colour.
   useEffect(() => {
     if (!chromaKey) return;
     const video = videoRef.current;
@@ -205,50 +178,7 @@ export default function SimliLiveKitPanel({
           rafRef.current = requestAnimationFrame(paint);
           return;
         }
-        const data = frame.data;
-
-        for (let i = 0; i < data.length; i += 4) {
-          const r = data[i],
-            g = data[i + 1],
-            b = data[i + 2];
-          // Quick reject: not green-dominant -> keep opaque.
-          if (g <= r || g <= b) continue;
-
-          const [h, s, v] = rgbToHsv(r, g, b);
-          if (v < VAL_THRESHOLD) continue;
-          if (h < KEY_HUE_LOW || h > KEY_HUE_HIGH) continue;
-
-          if (s >= SAT_THRESHOLD) {
-            data[i + 3] = 0;
-          } else if (s >= EDGE_SAT_LOW) {
-            // Edge: ramp alpha for a soft cutoff.
-            const t = (s - EDGE_SAT_LOW) / (SAT_THRESHOLD - EDGE_SAT_LOW);
-            data[i + 3] = Math.round(255 * (1 - t));
-            // Despill: pull green down toward the avg of red+blue so remaining
-            // edge pixels don't look fluorescent.
-            const avgRB = (r + b) / 2;
-            if (g > avgRB) data[i + 1] = Math.round(avgRB + (g - avgRB) * 0.4);
-          }
-        }
-
-        // Feather the alpha channel with a 3x3 box blur so the cutout edge
-        // fades smoothly instead of stepping pixel-by-pixel (kills the jagged
-        // staircase look on shoulders/jaw). Only the alpha is blurred; RGB is
-        // untouched, so the image stays sharp.
-        if (FEATHER) {
-          const alpha = new Uint8ClampedArray(w * h);
-          for (let p = 0, a = 0; p < data.length; p += 4, a++) alpha[a] = data[p + 3];
-          for (let y = 1; y < h - 1; y++) {
-            for (let x = 1; x < w - 1; x++) {
-              const a = y * w + x;
-              const sum =
-                alpha[a - w - 1] + alpha[a - w] + alpha[a - w + 1] +
-                alpha[a - 1] + alpha[a] + alpha[a + 1] +
-                alpha[a + w - 1] + alpha[a + w] + alpha[a + w + 1];
-              data[a * 4 + 3] = (sum / 9) | 0;
-            }
-          }
-        }
+        applyChromaKey(frame.data, w, h);
 
         ctx.putImageData(frame, 0, 0);
       }

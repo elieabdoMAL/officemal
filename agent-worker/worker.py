@@ -1,7 +1,7 @@
 """Simli Trinity receptionist — self-hosted LiveKit Agents worker.
 
 This is the conversation loop for the lobby kiosk avatar. Simli's hosted "Auto"
-API only drives Legacy faces; Trinity faces (like Mia / face 5fc23ea5) must be
+API only drives Legacy faces; Trinity faces (like Mia / face 3d1cf1cf) must be
 rendered through a self-hosted LiveKit worker — this file. It joins the same
 LiveKit room the browser joins and runs:
 

@@ -4,7 +4,7 @@ This is the **conversation brain** for the lobby kiosk avatar (Mia). It's a
 self-hosted Python process that joins a LiveKit room and runs:
 
 ```
-Deepgram STT  →  Gemini 2.5 Flash  →  Deepgram TTS  →  Simli avatar (Trinity face 5f911c8d)
+Deepgram STT  →  Gemini 2.5 Flash  →  Deepgram TTS  →  Simli avatar (Trinity face 3d1cf1cf)
 ```
 
 ## Bilingual (FR / EN)
@@ -30,7 +30,7 @@ on noise. Multilingual STT scores lower than English-only did, so it sits at
 real distribution in `docker compose logs -f`.
 
 **Why this exists:** Simli's hosted "Auto" API only renders *Legacy* faces. The
-face we want (Mia, `5f911c8d`) is a *Trinity* face, and Trinity faces can only be
+face we want (Mia, `3d1cf1cf`) is a *Trinity* face, and Trinity faces can only be
 driven through a self-hosted LiveKit worker — this one. The browser
 (`SimliLiveKitPanel.tsx` in the Next.js app) joins the same LiveKit room and
 plays the avatar video/audio this worker publishes.
@@ -48,7 +48,7 @@ Fill these into `.env` (copy from `env.example`):
 | Key | Where to get it | Notes |
 |---|---|---|
 | `SIMLI_API_KEY` | Simli dashboard | already have it |
-| `SIMLI_FACE_ID` | — | pre-filled: `5f911c8d-7b81-40f6-bed0-de435f02e10d`. Changing the face is a `.env` edit + `docker compose up -d` on the server — no rebuild. Check the new face's backdrop colour against the chroma-key in `SimliLiveKitPanel.tsx`. |
+| `SIMLI_FACE_ID` | — | pre-filled: `3d1cf1cf-2374-4cb8-861c-33528b45b309`. Changing the face is a `.env` edit + `docker compose up -d` on the server — no rebuild. Check the new face's backdrop colour against the chroma-key in `SimliLiveKitPanel.tsx`. |
 | `SIMLI_MAX_IDLE_TIME` | — | optional, default `180`s. Simli bills render time, so the avatar disconnects after this much silence. The plugin's own default is 30s, far too short for a kiosk. |
 | `SIMLI_MAX_SESSION_LENGTH` | — | optional, default `1800`s. Backstop so a wedged session can't bill overnight. |
 | `GOOGLE_API_KEY` | [aistudio.google.com](https://aistudio.google.com) → "Get API key" | **not** your Workspace/Gemini Pro sub — a separate AI Studio key |

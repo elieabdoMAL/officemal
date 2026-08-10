@@ -1,7 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "Bash(awk 'NR==225 { print length\\($0\\) }' \"c:/Users/user/Desktop/expo360/public/3dvista/script_general.js\")"
+      "Bash(awk 'NR==225 { print length\\($0\\) }' \"c:/Users/user/Desktop/expo360/public/3dvista/script_general.js\")",
+      "Bash(node -e ' *)",
+      "Bash(npm i *)",
+      "Bash(npx playwright *)",
+      "Bash(node -e \"console.log\\(require\\('./package.json'\\).devDependencies\\)\")"
     ]
   }
 }

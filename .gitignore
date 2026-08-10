@@ -57,6 +57,11 @@ next-env.d.ts
 
 .vercel
 
+# playwright
+/test-results/
+/playwright-report/
+/blob-report/
+
 # python worker venv / caches / local build+run logs
 agent-worker/*.log
 agent-worker/.venv/
