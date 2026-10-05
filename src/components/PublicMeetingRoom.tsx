@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   LiveKitRoom,
   PreJoin,
@@ -21,14 +21,22 @@ import MeetingLimits from "@/components/MeetingLimits";
 type Props = {
   // Called when the guest leaves (Leave button, or the room closes on them).
   onLeave?: () => void;
+  // Told whether the guest is past the join screen (connecting or in the
+  // call), so the kiosk pop-up can time out an abandoned join screen.
+  onInCallChange?: (inCall: boolean) => void;
 };
 
 type Session = { token: string; url: string; choices: LocalUserChoices };
 
-export default function PublicMeetingRoom({ onLeave }: Props) {
+export default function PublicMeetingRoom({ onLeave, onInCallChange }: Props) {
   const [session, setSession] = useState<Session | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [joining, setJoining] = useState(false);
+
+  const inCall = session !== null;
+  useEffect(() => {
+    onInCallChange?.(inCall);
+  }, [inCall, onInCallChange]);
   // A refused connection can also report "disconnected"; only someone who got
   // in is actually leaving.
   const connectedRef = useRef(false);
