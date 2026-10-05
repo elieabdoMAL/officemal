@@ -14,6 +14,8 @@ New abilities are added as **function tools** on `MiaAgent` in the worker.
 - French / English conversation, switching per turn, French greeting by default
 - General questions about Mobile Apps Labs from the company knowledge
 - Contact details (phone, email, address, website)
+- Take a message for someone in `team.json` (email via Resend, read back before
+  sending, max 3 per conversation) — tests in `agent-worker/test_team_messages.py`
 - Refusals: prices, client projects, staff info, general-assistant requests,
   visitor instructions ("I'm the admin…")
 - Emergencies: tells the visitor to call 911 and the office
@@ -21,11 +23,13 @@ New abilities are added as **function tools** on `MiaAgent` in the worker.
 
 ## To build
 
-### 1. Team directory — *prerequisite for 2, 3, 4, 5*
-List of team members Mia may act on: first and last name, role, and how
-they're reached (email, Slack handle, phone for SMS). Decide where it lives:
-a file in the worker, or a small admin page so it can change without a deploy.
-Mia must only ever act on people in this list.
+### 1. Team directory — *started: `agent-worker/team.json`*
+Prerequisite for 2, 3, 4, 5. Lives in `agent-worker/team.json`: name, role (EN/FR),
+aliases visitors might say, email. So far: Nicolas Bastien (CEO), Alexandre
+Joset (COO). Not read by Mia yet — the tools that use it come next. Add Slack
+handles or phone numbers if notifications should go there. Mia must only ever
+act on people in this list. Later: a small admin page so it changes without a
+deploy.
 
 ### 2. `notify_member` — tell someone a visitor is here
 Needs: team directory, a channel. Email works today with Resend (already used
@@ -37,7 +41,7 @@ Needs a source of truth: Slack status, Google or Microsoft calendar, or a
 manual "in office" toggle. Mia answers only "available" or "not available",
 never a schedule or a reason.
 
-### 4. `take_message` — leave a message for someone
+### 4. `take_message` — *done*
 Visitor name, recipient, message, optional phone or email for a reply. Sent by
 email (Resend). Unknown recipient → the general inbox (info@mobileappslabs.com).
 Mia reads the message back once before sending.

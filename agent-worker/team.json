@@ -1,0 +1,23 @@
+{
+  "_about": "Team directory for Mia, the reception avatar. She may only notify, check, or take messages for people listed here. 'aliases' are other ways visitors may refer to someone (spoken names, titles in French and English) so she can match them. Add one entry per person; the worker image must be rebuilt and pushed for changes to go live.",
+  "members": [
+    {
+      "id": "nbastien",
+      "first_name": "Nicolas",
+      "last_name": "Bastien",
+      "role_en": "CEO",
+      "role_fr": "Président-directeur général",
+      "aliases": ["Nicolas", "Bastien", "the CEO", "the boss", "le PDG", "le président", "le patron"],
+      "email": "nbastien@mobileappslabs.com"
+    },
+    {
+      "id": "ajoset",
+      "first_name": "Alexandre",
+      "last_name": "Joset",
+      "role_en": "COO",
+      "role_fr": "Directeur des opérations",
+      "aliases": ["Alexandre", "Alex", "Joset", "the COO", "operations", "le directeur des opérations", "les opérations"],
+      "email": "ajoset@mobileappslabs.com"
+    }
+  ]
+}

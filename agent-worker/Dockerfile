@@ -19,7 +19,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY worker.py mia_prompt.txt ./
+COPY worker.py team_messages.py mia_prompt.txt team.json ./
 
 # Keep STDOUT/STDERR unbuffered so `docker logs` is live.
 ENV PYTHONUNBUFFERED=1

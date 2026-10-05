@@ -2,7 +2,8 @@
 # Push the Simli + LiveKit keys from agent-worker/.env to everywhere they live:
 #   1. checks them against Simli and LiveKit first (nothing is changed if bad)
 #   2. Vercel (LIVEKIT_* only — the site never reads the Simli vars) + deploy
-#   3. the server's /var/www/officeMal/agent-worker/.env, then restarts simli-worker
+#   3. the server's /var/www/officeMal/agent-worker/.env (+ Resend, for messages),
+#      then restarts simli-worker
 #
 # Usage (from the repo root, in Git Bash):
 #   bash agent-worker/push-keys.sh                    # check + Vercel only
@@ -27,8 +28,10 @@ SIMLI_FACE_ID=$(get SIMLI_FACE_ID)
 LIVEKIT_URL=$(get LIVEKIT_URL)
 LIVEKIT_API_KEY=$(get LIVEKIT_API_KEY)
 LIVEKIT_API_SECRET=$(get LIVEKIT_API_SECRET)
+RESEND_API_KEY=$(get RESEND_API_KEY)
+RESEND_FROM_EMAIL=$(get RESEND_FROM_EMAIL)
 
-for v in SIMLI_API_KEY SIMLI_FACE_ID LIVEKIT_URL LIVEKIT_API_KEY LIVEKIT_API_SECRET; do
+for v in SIMLI_API_KEY SIMLI_FACE_ID LIVEKIT_URL LIVEKIT_API_KEY LIVEKIT_API_SECRET RESEND_API_KEY RESEND_FROM_EMAIL; do
   [ -n "${!v}" ] || { echo "✗ $v is empty in $ENV_FILE"; exit 1; }
 done
 
@@ -69,9 +72,9 @@ if [ -n "$SERVER" ]; then
   pushed=$(curl -s -m 20 "https://hub.docker.com/v2/repositories/elieabdomal/simli-worker/tags/latest" \
     | grep -oE '"tag_last_pushed": ?"[^"]+"' | cut -d'"' -f4)
   pushed_s=$(date -d "$pushed" +%s 2>/dev/null || echo 0)
-  newest=$(stat -c %Y agent-worker/worker.py agent-worker/mia_prompt.txt | sort -n | tail -1)
+  newest=$(stat -c %Y agent-worker/worker.py agent-worker/team_messages.py agent-worker/mia_prompt.txt agent-worker/team.json | sort -n | tail -1)
   if [ "$pushed_s" -lt "$newest" ]; then
-    echo "✗ Docker Hub's worker image (pushed ${pushed:-unknown}) is older than worker.py / mia_prompt.txt."
+    echo "✗ Docker Hub's worker image (pushed ${pushed:-unknown}) is older than the worker code, prompt or team.json."
     echo "  Run first:  cd agent-worker && bash build-and-push.sh"
     exit 1
   fi
@@ -102,7 +105,7 @@ KEY="${SSH_KEY:-$HOME/.ssh/eabdo.key}"
 # only these five lines, keeps a backup, and recreates the worker container.
 {
   echo "set -e; cd $REMOTE_DIR; cp .env .env.bak.\$(date +%s)"
-  for v in SIMLI_API_KEY SIMLI_FACE_ID LIVEKIT_URL LIVEKIT_API_KEY LIVEKIT_API_SECRET; do
+  for v in SIMLI_API_KEY SIMLI_FACE_ID LIVEKIT_URL LIVEKIT_API_KEY LIVEKIT_API_SECRET RESEND_API_KEY RESEND_FROM_EMAIL; do
     echo "grep -v '^$v=' .env > .env.tmp || true; echo '$v=${!v}' >> .env.tmp; mv .env.tmp .env"
   done
   echo "docker compose up -d --force-recreate simli-worker"
