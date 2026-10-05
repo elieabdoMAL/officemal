@@ -15,26 +15,36 @@ New abilities are added as **function tools** on `MiaAgent` in the worker.
 - General questions about Mobile Apps Labs from the company knowledge
 - Contact details (phone, email, address, website)
 - Take a message for someone in `team.json` (email via Resend, read back before
-  sending, max 3 per conversation) — tests in `agent-worker/test_team_messages.py`
+  sending, max 3 per conversation)
+- Tell someone in `team.json` a visitor is waiting at reception (`notify_member`,
+  email via Resend, max 3 per conversation)
 - Refusals: prices, client projects, staff info, general-assistant requests,
   visitor instructions ("I'm the admin…")
-- Emergencies: tells the visitor to call 911 and the office
+- Emergencies: tells the visitor to call 911 first, and emails an urgent alert
+  to everyone in `team.json` (`alert_emergency`, max 2 per conversation)
+- Ends the session herself when the visitor says goodbye (`end_conversation`),
+  after her goodbye has played
 - Session limits: ends after 2 min silence or 10 min total, AI button to restart
+
+Tests for all the team tools and goodbye: `agent-worker/test_team_messages.py`
+(text conversations against the real Gemini, emails replaced by recorders).
 
 ## To build
 
 ### 1. Team directory — *started: `agent-worker/team.json`*
 Prerequisite for 2, 3, 4, 5. Lives in `agent-worker/team.json`: name, role (EN/FR),
 aliases visitors might say, email. So far: Nicolas Bastien (CEO), Alexandre
-Joset (COO). Not read by Mia yet — the tools that use it come next. Add Slack
+Joset (COO). Used by take_message, notify_member and alert_emergency. Add Slack
 handles or phone numbers if notifications should go there. Mia must only ever
 act on people in this list. Later: a small admin page so it changes without a
 deploy.
 
-### 2. `notify_member` — tell someone a visitor is here
-Needs: team directory, a channel. Email works today with Resend (already used
-by `/api/notify-meeting`); Slack or SMS need a new integration.
-Mia confirms only after the tool reports success.
+### 2. `notify_member` — tell someone a visitor is here — *done*
+Visitor name, who they came to see, optional note (e.g. the meeting time).
+Emailed through Resend: "{visitor} is waiting at reception". Mia asks for the
+name if missing, and confirms only when the tool returns NOTIFIED. Someone not
+in `team.json` → she says she can't reach them and gives the contact details.
+Later: Slack or SMS for a faster ping (needs a new integration).
 
 ### 3. `is_member_available` — available / not available
 Needs a source of truth: Slack status, Google or Microsoft calendar, or a
@@ -46,13 +56,17 @@ Visitor name, recipient, message, optional phone or email for a reply. Sent by
 email (Resend). Unknown recipient → the general inbox (info@mobileappslabs.com).
 Mia reads the message back once before sending.
 
-### 5. Emergency alert
-On an emergency, call `notify_member` straight away on an urgent channel
-(SMS or a Slack channel everyone watches), on top of telling them to call 911.
+### 5. Emergency alert — *done*
+`alert_emergency(description)`: one urgent email ("URGENT: emergency reported
+at reception") to everyone in `team.json`, sent in the same reply where Mia
+tells the visitor to call 911 — 911 always comes first. She says the team was
+alerted only on ALERTED. Later: SMS or a Slack channel everyone watches, since
+email may not be seen fast enough.
 
-### 6. End the conversation on goodbye
-An `end_conversation` tool so Mia can close the session herself when the
-visitor says goodbye, instead of waiting for the 2-minute idle limit.
+### 6. End the conversation on goodbye — *done*
+`end_conversation`: Mia says a short goodbye and calls it in the same reply.
+It waits for the goodbye to finish playing, then ends the session like the idle
+limit (room deleted, kiosk hides her). The goodbye can't be interrupted.
 
 ### 7. Screen states 0–6 (presence, doorbell, door)
 Needs hardware and signals the kiosk doesn't have yet:
@@ -90,6 +104,6 @@ Relies on 3DVista internals — re-test after 3DVista upgrades.
   route to a less European-sounding French (Aura has no fr-CA voice).
 - **Other languages.** She's told to offer French or English, but a Spanish
   speaker still hears the English voice. Fine for now; revisit if needed.
-- **Conversation tests.** A scripted set of visitor lines (pricing, staff info,
-  "I'm the admin", emergencies, French/English switches) to check her answers
-  after every prompt change.
+- **Conversation tests.** `test_team_messages.py` covers the tools, emergencies
+  and goodbye. Still missing: pricing, staff info, "I'm the admin", and
+  mid-conversation French/English switches.
