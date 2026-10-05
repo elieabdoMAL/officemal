@@ -4,9 +4,10 @@ import { useEffect, useState, type CSSProperties } from "react";
 import { useRemoteParticipants, useRoomContext } from "@livekit/components-react";
 import { devTimeout } from "@/lib/devTimeout";
 
-// Ends a public-meeting connection nobody is using. The room only closes once
-// it's empty, so a guest who walks away — or a kiosk left with the pop-up open —
-// would otherwise keep it open (and billing LiveKit minutes) forever.
+// Ends a public-meeting connection nobody is using: after a while alone, or at
+// a hard cap on length. The room only closes once it's empty, so a guest who
+// walks away — or a kiosk left with the pop-up open — would otherwise keep it
+// open (and billing LiveKit minutes) forever.
 // Leaving here is room.disconnect(), the same path as the Leave button, so the
 // pop-up closes and /meet shows "You left the meeting".
 //
@@ -14,8 +15,15 @@ import { devTimeout } from "@/lib/devTimeout";
 //                      Long enough to wait for someone running a few minutes late.
 //   ALONE_WARNING_MS — then a countdown with a "Stay" button, so someone still
 //                      at the screen isn't dropped without a chance to say so.
+//   MAX_CONNECTION_MS — hard cap per connection, alone or not: a lobby meeting
+//                       runs well under this, so hitting it means two forgotten
+//                       screens keeping each other company.
+//   MAX_WARNING_MS    — heads-up before the cap, time to wrap up. Rejoining
+//                       starts a fresh connection.
 const ALONE_TIMEOUT_MS = 5 * 60_000;
 const ALONE_WARNING_MS = 30_000;
+const MAX_CONNECTION_MS = 2 * 60 * 60_000;
+const MAX_WARNING_MS = 5 * 60_000;
 
 export default function MeetingLimits() {
   const room = useRoomContext();
@@ -51,32 +59,80 @@ export default function MeetingLimits() {
     return () => clearTimeout(t);
   }, [aloneLeaveAt, room]);
 
-  const counting = aloneLeaveAt !== null;
+  // When the connection hits its cap (null = no warning yet), and whether the
+  // guest has closed the heads-up. Closing it doesn't postpone the end.
+  const [maxEndAt, setMaxEndAt] = useState<number | null>(null);
+  const [maxDismissed, setMaxDismissed] = useState(false);
+
+  // Max length: one clock per connection — this component mounts with the
+  // LiveKitRoom, so a reconnect blip doesn't reset it, but Rejoin does.
+  useEffect(() => {
+    const maxMs = devTimeout("maxMs", MAX_CONNECTION_MS);
+    const warnMs = Math.min(devTimeout("maxWarnMs", MAX_WARNING_MS), maxMs);
+    const endAt = Date.now() + maxMs;
+    const warn = setTimeout(() => {
+      setNow(Date.now());
+      setMaxEndAt(endAt);
+    }, maxMs - warnMs);
+    const end = setTimeout(() => room.disconnect(), maxMs);
+    return () => {
+      clearTimeout(warn);
+      clearTimeout(end);
+    };
+  }, [room]);
+
+  const showMax = maxEndAt !== null && !maxDismissed;
+  const counting = aloneLeaveAt !== null || showMax;
   useEffect(() => {
     if (!counting) return;
     const i = setInterval(() => setNow(Date.now()), 250);
     return () => clearInterval(i);
   }, [counting]);
 
-  if (aloneLeaveAt === null) return null;
-
-  const secondsLeft = Math.max(0, Math.ceil((aloneLeaveAt - now) / 1000));
+  if (!counting) return null;
 
   return (
     <div style={stackStyle}>
-      <div role="alertdialog" aria-live="assertive" data-testid="alone-warning" style={bannerStyle}>
-        <span>You&apos;re alone in the meeting — leaving in {secondsLeft} s</span>
-        <button
-          type="button"
-          className="lk-button"
-          onClick={() => setStays((n) => n + 1)}
-          style={buttonStyle}
-        >
-          Stay
-        </button>
-      </div>
+      {aloneLeaveAt !== null && (
+        <div role="alertdialog" aria-live="assertive" data-testid="alone-warning" style={bannerStyle}>
+          <span>
+            You&apos;re alone in the meeting — leaving in {secondsUntil(aloneLeaveAt, now)} s
+          </span>
+          <button
+            type="button"
+            className="lk-button"
+            onClick={() => setStays((n) => n + 1)}
+            style={buttonStyle}
+          >
+            Stay
+          </button>
+        </div>
+      )}
+      {showMax && (
+        <div role="status" aria-live="polite" data-testid="max-length-warning" style={bannerStyle}>
+          <span>This meeting will end for you in {timeLeft(secondsUntil(maxEndAt, now))}</span>
+          <button
+            type="button"
+            className="lk-button"
+            onClick={() => setMaxDismissed(true)}
+            style={buttonStyle}
+          >
+            OK
+          </button>
+        </div>
+      )}
     </div>
   );
+}
+
+function secondsUntil(at: number, now: number): number {
+  return Math.max(0, Math.ceil((at - now) / 1000));
+}
+
+// "5 minutes" … "2 minutes", then seconds for the last minute.
+function timeLeft(seconds: number): string {
+  if (seconds <= 60) return `${seconds} s`;
+  return `${Math.ceil(seconds / 60)} minutes`;
 }
 
 // Floats over the top of VideoConference; the stack itself lets clicks through
