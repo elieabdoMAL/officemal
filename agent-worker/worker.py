@@ -29,6 +29,7 @@ The LIVEKIT_* vars are read automatically by the agents framework.
 import asyncio
 import logging
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -44,7 +45,15 @@ from livekit.agents import (
 )
 from livekit.plugins import deepgram, google, simli
 
-from team_messages import find_member, load_team, send_message_email, team_prompt_section
+from team_messages import (
+    find_member,
+    is_real_name,
+    load_team,
+    send_emergency_email,
+    send_message_email,
+    send_visitor_waiting_email,
+    team_prompt_section,
+)
 
 logger = logging.getLogger("simli-receptionist")
 logger.setLevel(logging.INFO)
@@ -58,7 +67,7 @@ load_dotenv(override=True)
 # can't do yet are listed there under COMING SOON — see docs/mia-tasks.md.
 PROMPT_FILE = Path(__file__).with_name("mia_prompt.txt")
 # The TEAM section is generated from team.json, so the people she names and the
-# people take_message accepts can never drift apart.
+# people take_message / notify_member accept can never drift apart.
 TEAM = load_team()
 MIA_SYSTEM_PROMPT = (
     PROMPT_FILE.read_text(encoding="utf-8").strip() + "\n\n" + team_prompt_section(TEAM)
@@ -67,6 +76,11 @@ MIA_SYSTEM_PROMPT = (
 # Per conversation. A kiosk is open to anyone; this stops someone filling the
 # team's inboxes from it.
 MAX_MESSAGES_PER_SESSION = 3
+# One visitor sees one or two people; more than this is someone playing.
+MAX_NOTIFICATIONS_PER_SESSION = 3
+# Emails the whole team. A second alert allows for "it's getting worse"; past
+# that it's a prank or a loop, and the visitor has already been told 911.
+MAX_EMERGENCY_ALERTS_PER_SESSION = 2
 
 # One Aura voice speaks one language, so we swap the TTS model per turn to match
 # whatever Deepgram detected. andromeda-en is the plugin's own default — keeping
@@ -169,8 +183,9 @@ def _env_int(name: str, default: int) -> int:
 # SESSION_MAX_LENGTH: hard cap on one conversation, however lively. A lobby
 #   chat rarely passes a few minutes; this stops a wedged or looping session.
 #
-# Either way the worker deletes the room, which disconnects the kiosk; the
-# kiosk then hides her until the next visitor taps the AI button.
+# Either way — or when she ends it herself on goodbye (end_conversation) — the
+# worker deletes the room, which disconnects the kiosk; the kiosk then hides
+# her until the next visitor taps the AI button.
 SESSION_IDLE_TIMEOUT = _env_int("SESSION_IDLE_TIMEOUT", 120)
 SESSION_MAX_LENGTH = _env_int("SESSION_MAX_LENGTH", 600)
 
@@ -203,6 +218,15 @@ def _normalize_lang(code: str | None) -> str:
 LANGUAGE_NAMES = {"fr": "French", "en": "English"}
 
 
+def _assistant_lines(handle) -> int:
+    """How many things she has said so far in this turn (one per LLM step)."""
+    return sum(
+        1
+        for item in handle.chat_items
+        if getattr(item, "type", "") == "message" and item.role == "assistant" and item.text_content
+    )
+
+
 def _reply_language_note(code: str) -> str:
     """Per-turn instruction telling Gemini which language to answer in."""
     if code in LANGUAGE_NAMES:
@@ -231,8 +255,13 @@ class MiaAgent(Agent):
         an English voice.
     """
 
-    def __init__(self, tts) -> None:  # deepgram.TTS or elevenlabs.TTS, see make_tts
+    def __init__(self, tts, on_goodbye: Callable[[], None] | None = None) -> None:
+        # tts: deepgram.TTS or elevenlabs.TTS, see make_tts
         super().__init__(instructions=MIA_SYSTEM_PROMPT)
+        # Ends the session the way the idle limit does (entrypoint's
+        # end_session). end_conversation calls it once her goodbye has played.
+        self._on_goodbye = on_goodbye
+        self._ending = False
         self._tts = tts  # held directly so we can swap the voice per turn
         self._last_confidence: float | None = None
         self._last_language: str = DEFAULT_LANG
@@ -240,6 +269,8 @@ class MiaAgent(Agent):
         # still needs to reach Gemini, which offers French or English to them.
         self._last_raw_language: str = DEFAULT_LANG
         self._messages_sent = 0
+        self._notifications_sent = 0
+        self._emergency_alerts_sent = 0
 
     @property
     def language(self) -> str:
@@ -287,12 +318,108 @@ class MiaAgent(Agent):
                 f"NOT SENT: no single team member matches {recipient!r}. If it is unclear, ask who "
                 "they mean. Otherwise say you cannot reach that person from here and give the contact details."
             )
-        if not visitor_name.strip() or not message.strip():
-            return "NOT SENT: the visitor's name and the message are both required. Ask for what is missing."
+        if not is_real_name(visitor_name) or not message.strip():
+            return "NOT SENT: the visitor's real name and the message are both required. Ask for what is missing."
         if not await send_message_email(member, visitor_name, message, reply_contact):
             return "NOT SENT: the email could not be delivered. Say so plainly and give the contact details."
         self._messages_sent += 1
         return f"SENT to {member.full_name}."
+
+    @function_tool()
+    async def notify_member(
+        self,
+        context: RunContext,
+        visitor_name: str,
+        member: str,
+        note: str = "",
+    ) -> str:
+        """Tell a team member listed under TEAM, by email, that a visitor is waiting at reception.
+
+        Call this once you have the visitor's name and who they came to see.
+        Tell the visitor the person was notified only if this returns NOTIFIED.
+
+        Args:
+            visitor_name: The visitor's name, as they gave it.
+            member: Who they came to see, as the visitor said it: a name or a role such as "the CEO".
+            note: Why they came, only if the visitor said, for example "for a two o'clock meeting". Empty otherwise.
+        """
+        if self._notifications_sent >= MAX_NOTIFICATIONS_PER_SESSION:
+            return "NOT SENT: notification limit for this conversation reached. Give the contact details instead."
+        found = find_member(member, TEAM)
+        if found is None:
+            return (
+                f"NOT SENT: no single team member matches {member!r}. If it is unclear, ask who "
+                "they mean. Otherwise say you cannot reach that person from here and give the contact details."
+            )
+        if not is_real_name(visitor_name):
+            return "NOT SENT: you do not have the visitor's name yet. Ask for it, then call this again."
+        if not await send_visitor_waiting_email(found, visitor_name, note):
+            return "NOT SENT: the email could not be delivered. Say so plainly and give the contact details."
+        self._notifications_sent += 1
+        return f"NOTIFIED {found.full_name} by email."
+
+    @function_tool()
+    async def alert_emergency(self, context: RunContext, description: str) -> str:
+        """Email an urgent alert to the whole team that there is an emergency at reception.
+
+        Call this straight away when someone is hurt, unwell, or reports a fire,
+        smoke or any danger, in the same reply where you tell them to call 911.
+        Tell the visitor the team was alerted only if this returns ALERTED.
+
+        Args:
+            description: What the visitor reported, in a few words, for example "visitor says there is smoke in the hallway".
+        """
+        if self._emergency_alerts_sent >= MAX_EMERGENCY_ALERTS_PER_SESSION:
+            return "NOT SENT: the team was already alerted. Tell them to call nine one one and the office."
+        # No member lookup: an emergency goes to everyone in team.json.
+        if not await send_emergency_email(TEAM, description):
+            return (
+                "NOT SENT: the alert could not be delivered. Tell them to call nine one one, "
+                "ask anyone nearby for help, and call the office."
+            )
+        self._emergency_alerts_sent += 1
+        return "ALERTED: the whole team was emailed."
+
+    @function_tool()
+    async def end_conversation(self, context: RunContext) -> str | None:
+        """End the conversation and put the screen back to standby.
+
+        Call this only when the visitor has clearly finished: they said goodbye,
+        or thanked you and want nothing else. Call it in the same reply as your
+        short goodbye, after the goodbye words. Never call it while something is
+        still in progress, such as a message they just confirmed: finish that
+        with its own tool first, and end in a later reply.
+        """
+        if self._ending:
+            return None
+        # Once she's saying goodbye, let it finish: the mic stays open in a noisy
+        # lobby, and a stray sound cutting her off would leave the session
+        # running until the idle limit. A visitor who wasn't done taps AI again.
+        try:
+            context.disallow_interruptions()
+        except RuntimeError:
+            return None  # already talked over; they're still talking, keep going
+        self._ending = True
+
+        handle = context.speech_handle
+        spoken_before = _assistant_lines(handle)
+        # Gemini emits the call while her goodbye is still being spoken, and the
+        # tool runs at once. Wait for those words to finish playing.
+        await context.wait_for_playout()
+
+        def _on_done(_handle) -> None:
+            if self._on_goodbye is not None:
+                self._on_goodbye()
+
+        # Fires when this whole turn has played out, including any reply after
+        # the tool, so the room is deleted only after her last word.
+        handle.add_done_callback(_on_done)
+        if _assistant_lines(handle) > spoken_before:
+            logger.info("end_conversation: goodbye said, ending after playout")
+            return None  # None means no reply after the tool
+        # She called the tool without a word. Have her say it now, in this turn.
+        logger.info("end_conversation: no goodbye yet, asking for one")
+        return "Ending now. Say a short, warm goodbye in the visitor's language. Do not call any tool."
 
     def _speak_in(self, lang: str) -> None:
         """Point the TTS at `lang`'s voice before the next thing she says."""
@@ -394,8 +521,6 @@ async def entrypoint(ctx: JobContext) -> None:
     )
     await avatar.start(session, room=ctx.room)
 
-    agent = MiaAgent(tts=tts)
-
     ending = False
 
     async def end_session(reason: str, goodbye: bool = False) -> None:
@@ -427,6 +552,9 @@ async def entrypoint(ctx: JobContext) -> None:
         task = asyncio.create_task(coro)
         tasks.add(task)
         task.add_done_callback(tasks.discard)
+
+    # end_conversation's goodbye has already played, so no goodbye=True here.
+    agent = MiaAgent(tts=tts, on_goodbye=lambda: spawn(end_session("visitor said goodbye")))
 
     # Log what she says next to what she heard ("heard …" in MiaAgent), so her
     # answers can be checked in `docker compose logs` after a prompt change.

@@ -1,8 +1,8 @@
 """Team directory and visitor messages for Mia.
 
-team.json lists the only people Mia may take messages for. A visitor names
-someone however they like ("Nicolas", "the CEO", "le PDG"); find_member maps
-that to a directory entry, and send_message_email delivers the message through
+team.json lists the only people Mia may take messages for or notify. A visitor
+names someone however they like ("Nicolas", "the CEO", "le PDG"); find_member
+maps that to a directory entry, and the send_* functions email them through
 Resend (the same email service the website uses).
 
 Env: RESEND_API_KEY, RESEND_FROM_EMAIL.
@@ -87,11 +87,27 @@ def find_member(spoken: str, team: list[Member]) -> Member | None:
     return hits[0] if len(hits) == 1 else None
 
 
+# What the model writes when it calls a tool before the visitor has said their
+# name. Seen in testing with thinking off: "the visitor" went out in an email.
+_PLACEHOLDER_NAME_WORDS = {
+    "visitor", "visiteur", "visiteuse", "guest", "invite", "unknown", "inconnu",
+    "inconnue", "someone", "quelqu", "anonymous", "anonyme", "client", "n", "a",
+}
+
+
+def is_real_name(name: str) -> bool:
+    """False for an empty or placeholder visitor name ("the visitor", "unknown")."""
+    words = _norm(name).split()
+    meaningful = [w for w in words if w not in {"the", "a", "le", "la", "l", "un", "une"}]
+    return bool(meaningful) and not any(w in _PLACEHOLDER_NAME_WORDS for w in meaningful)
+
+
 def team_prompt_section(team: list[Member]) -> str:
     """The TEAM block appended to Mia's prompt — names and roles, never emails."""
     lines = [
         "TEAM",
-        "These are the only people you can take a message for. You may say their "
+        "These are the only people you can take a message for or tell that a visitor "
+        "is here. You may say their "
         "names and roles. Never give their email or any other contact detail of theirs.",
     ]
     for m in team:
@@ -99,17 +115,53 @@ def team_prompt_section(team: list[Member]) -> str:
     return "\n".join(lines)
 
 
+def _one_line(text: str, limit: int) -> str:
+    """Collapse whitespace and cap: visitor text that ends up in a subject line."""
+    return " ".join(text.split())[:limit]
+
+
+async def _send_email(what: str, to: list[str], subject: str, body: str, reply_to: str = "") -> bool:
+    """Send one email through Resend. True only if Resend accepted it.
+
+    `what` names the caller (the tool) in the logs.
+    """
+    api_key = os.environ.get("RESEND_API_KEY", "").strip()
+    sender = os.environ.get("RESEND_FROM_EMAIL", "").strip()
+    if not api_key or not sender:
+        logger.error("%s: RESEND_API_KEY / RESEND_FROM_EMAIL not set", what)
+        return False
+
+    payload: dict = {"from": sender, "to": to, "subject": subject, "html": body}
+    if EMAIL_RE.match(reply_to):
+        payload["reply_to"] = reply_to
+
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as http:
+            async with http.post(
+                RESEND_URL, json=payload, headers={"Authorization": f"Bearer {api_key}"}
+            ) as res:
+                if res.status >= 300:
+                    logger.error("%s: Resend %s %s", what, res.status, await res.text())
+                    return False
+                logger.info("%s: sent to %s (%s)", what, ", ".join(to), (await res.json()).get("id"))
+                return True
+    except Exception:
+        logger.exception("%s: Resend request failed", what)
+        return False
+
+
+# Under every email: the visitor's words reach us through speech recognition.
+_STT_FOOTER = (
+    "<p style='margin:16px 0 0;color:#999;font-size:12px'>Sent by Mia, the virtual receptionist. "
+    "The visitor's words were transcribed by speech recognition and may contain errors.</p>"
+)
+
+
 async def send_message_email(
     member: Member, visitor_name: str, message: str, reply_contact: str
 ) -> bool:
     """Email the visitor's message to `member`. True only if Resend accepted it."""
-    api_key = os.environ.get("RESEND_API_KEY", "").strip()
-    sender = os.environ.get("RESEND_FROM_EMAIL", "").strip()
-    if not api_key or not sender:
-        logger.error("take_message: RESEND_API_KEY / RESEND_FROM_EMAIL not set")
-        return False
-
-    visitor_name = visitor_name.strip()[:MAX_NAME_CHARS]
+    visitor_name = _one_line(visitor_name, MAX_NAME_CHARS)
     message = message.strip()[:MAX_MESSAGE_CHARS]
     reply_contact = reply_contact.strip()[:MAX_CONTACT_CHARS]
 
@@ -126,28 +178,59 @@ async def send_message_email(
         <p style="margin:0 0 8px;color:#333"><strong>From:</strong> {e(visitor_name)}</p>
         {contact_html}
         <blockquote style="margin:16px 0;padding:12px 16px;background:#fff;border-left:4px solid #0070f3;color:#1a1a1a;white-space:pre-wrap">{e(message)}</blockquote>
-        <p style="margin:16px 0 0;color:#999;font-size:12px">Taken by Mia, the virtual receptionist. The visitor's words were transcribed by speech recognition and may contain errors.</p>
+        {_STT_FOOTER}
       </div>
     """
-    payload: dict = {
-        "from": sender,
-        "to": [member.email],
-        "subject": f"Message from {visitor_name} (reception kiosk)",
-        "html": body,
-    }
-    if EMAIL_RE.match(reply_contact):
-        payload["reply_to"] = reply_contact
+    return await _send_email(
+        "take_message",
+        [member.email],
+        f"Message from {visitor_name} (reception kiosk)",
+        body,
+        reply_to=reply_contact,
+    )
 
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as http:
-            async with http.post(
-                RESEND_URL, json=payload, headers={"Authorization": f"Bearer {api_key}"}
-            ) as res:
-                if res.status >= 300:
-                    logger.error("take_message: Resend %s %s", res.status, await res.text())
-                    return False
-                logger.info("take_message: sent to %s (%s)", member.full_name, (await res.json()).get("id"))
-                return True
-    except Exception:
-        logger.exception("take_message: Resend request failed")
-        return False
+
+async def send_visitor_waiting_email(member: Member, visitor_name: str, note: str) -> bool:
+    """Tell `member` a visitor is waiting at reception. True only if Resend accepted it."""
+    visitor_name = _one_line(visitor_name, MAX_NAME_CHARS)
+    note = note.strip()[:MAX_MESSAGE_CHARS]
+
+    e = html.escape  # visitor-provided, like everything in take_message
+    note_html = (
+        f"<p style='margin:0 0 8px;color:#333'><strong>They said:</strong> {e(note)}</p>" if note else ""
+    )
+    body = f"""
+      <div style="font-family:sans-serif;max-width:520px;margin:0 auto;padding:24px;background:#f9f9f9;border-radius:12px">
+        <h2 style="margin:0 0 16px;color:#1a1a1a">A visitor is waiting at reception</h2>
+        <p style="margin:0 0 8px;color:#333"><strong>Visitor:</strong> {e(visitor_name)}</p>
+        <p style="margin:0 0 8px;color:#333"><strong>Here to see:</strong> {e(member.full_name)}</p>
+        {note_html}
+        {_STT_FOOTER}
+      </div>
+    """
+    return await _send_email(
+        "notify_member", [member.email], f"{visitor_name} is waiting at reception", body
+    )
+
+
+async def send_emergency_email(team: list[Member], description: str) -> bool:
+    """Alert every member at once. True only if Resend accepted it.
+
+    One email to everyone rather than one each: it either reaches the whole
+    team or Mia hears it failed, never a silent partial send.
+    """
+    description = description.strip()[:MAX_MESSAGE_CHARS] or "No details given."
+    body = f"""
+      <div style="font-family:sans-serif;max-width:520px;margin:0 auto;padding:24px;background:#fff4f4;border-radius:12px;border:2px solid #d00">
+        <h2 style="margin:0 0 16px;color:#b00">Emergency reported at reception</h2>
+        <p style="margin:0 0 8px;color:#1a1a1a">A visitor at the reception kiosk reported an emergency. Mia told them to call 911. Please check on the lobby now.</p>
+        <blockquote style="margin:16px 0;padding:12px 16px;background:#fff;border-left:4px solid #d00;color:#1a1a1a;white-space:pre-wrap">{html.escape(description)}</blockquote>
+        {_STT_FOOTER}
+      </div>
+    """
+    return await _send_email(
+        "alert_emergency",
+        [m.email for m in team],
+        "URGENT: emergency reported at reception",
+        body,
+    )
