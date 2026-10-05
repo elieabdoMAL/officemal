@@ -80,9 +80,13 @@ Relies on 3DVista internals — re-test after 3DVista upgrades.
 
 ## Improvements
 
-- **Faster replies.** Gemini 2.5 Flash "thinks" before answering (a 3-word reply
-  used ~540 thinking tokens in testing). Setting its thinking budget to 0 should
-  cut seconds off each reply.
+- **Faster replies — *done*.** Gemini 2.5 Flash "thinks" before answering when
+  it decides to. The worker now sets `thinking_config={"thinking_budget": 0}`.
+  Measured with Mia's prompt: ordinary answers already ran at 0 thinking tokens
+  (time to first token ~0.4s either way). Turns where she calls `take_message`
+  spent ~86 thinking tokens and took ~1.08s to the first token; with thinking
+  off, ~0.65s. A bare 3-word prompt with no system prompt used ~360 thinking
+  tokens (1.78s, down to 0.39s). Answers were just as good in both cases.
 - **ElevenLabs voice (Aria).** The voice picked in the Simli dashboard isn't used —
   Mia speaks through Deepgram Aura in the worker. Switching the worker to
   ElevenLabs (`livekit-agents[elevenlabs]`, an ELEVENLABS_API_KEY) gets Aria, and

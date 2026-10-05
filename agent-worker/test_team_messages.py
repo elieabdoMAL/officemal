@@ -67,7 +67,9 @@ async def test_conversation() -> None:
         agent = worker.MiaAgent(tts=None)
         agent._tts = None
         agent._speak_in = lambda _lang: None
-        async with AgentSession(llm=google.LLM(model="gemini-2.5-flash")) as session:
+        # Same LLM settings as worker.entrypoint (thinking off).
+        llm = google.LLM(model="gemini-2.5-flash", thinking_config={"thinking_budget": 0})
+        async with AgentSession(llm=llm) as session:
             await session.start(agent)
             for line in lines:
                 agent._last_raw_language = lang  # what Deepgram would report

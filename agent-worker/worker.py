@@ -301,7 +301,12 @@ async def entrypoint(ctx: JobContext) -> None:
         # nova-3; the older nova-2 models are English-only. It also makes
         # Deepgram report the language it heard, which picks the reply voice.
         stt=deepgram.STT(model="nova-3", language="multi"),
-        llm=google.LLM(model="gemini-2.5-flash"),
+        # Thinking off. Left on, 2.5 Flash decides per turn whether to think
+        # first: plain answers rarely do with this prompt, but tool calls
+        # (take_message) spent ~90 thinking tokens, about +0.45s before she
+        # speaks, and a bare 3-word reply ~360 tokens / +1.4s. Replies were
+        # just as good without it in testing (docs/mia-tasks.md).
+        llm=google.LLM(model="gemini-2.5-flash", thinking_config={"thinking_budget": 0}),
         tts=tts,
         # The default endpointing (min 0.5s / max 3.0s of silence before she
         # accepts the turn is over) reads as a long dead pause at a reception
