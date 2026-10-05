@@ -20,9 +20,10 @@ import { applyChromaKey } from "@/lib/chromaKey";
 //   - On load: get a token from /api/livekit/token, join the room, show the
 //     avatar, and let the worker speak its first message on its own. Mic starts
 //     MUTED so she greets without listening.
-//   - Then the mic opens and STAYS open: she listens continuously and the
-//     worker's VAD decides when a turn ends. When the transcript is too weak to
-//     act on, the worker answers "I'm sorry, I didn't get that."
+//   - Once her greeting has finished, the mic opens and STAYS open: she
+//     listens continuously and the worker's VAD decides when a turn ends. When
+//     the transcript is too weak to act on, the worker answers "I'm sorry, I
+//     didn't get that."
 //   - A session lives only while she's shown. Hiding the frame (AI button, a
 //     3DVista action) leaves the room, which ends the session server-side;
 //     showing it again starts a fresh one, greeting and all. Hiding a Web Frame
@@ -64,9 +65,24 @@ type Props = {
 // changes, re-check the backdrop colour: a face on a different colour needs
 // KEY_COLOR updated, or she shows up in a coloured box.
 
-// How long to keep the mic shut after joining so her own greeting doesn't land
-// in her ears. FIRST_MESSAGE is one short sentence; ~6s covers it.
-const GREETING_MS = 6000;
+// The mic stays shut until her greeting has finished, so her own voice doesn't
+// land in her ears and a visitor who speaks straight away doesn't talk over
+// it. A fixed delay (it was 6s) wasn't enough: the avatar often starts late,
+// the mic opened mid-greeting, the visitor's first words interrupted her, and
+// their question could be lost entirely. So we wait for the avatar to stop
+// speaking, which LiveKit reports through active-speaker events.
+//
+// "Stopped" means quiet for this long. Speaker events lag the audio (~0.5s
+// to report silence, ~1s to report speech again), and the greeting has a
+// ~0.7s pause between its two sentences: at 800ms the mic opened during the
+// second one in testing. 1.5s rides out that pause; the mic opens ~2s after
+// her last word.
+const GREETING_PAUSE_MS = 1500;
+// Fallback from joining in case speaker events never come (or she never
+// speaks), so the mic can't stay shut for good. In testing her greeting ended
+// 8-10s after joining (the avatar takes a few seconds to start) and was seen
+// as over ~2s later; 12s fired before that once, so this leaves room.
+const GREETING_FALLBACK_MS = 20000;
 
 // Longest we'll claim she's "thinking" before admitting we're back to waiting.
 const THINKING_TIMEOUT_MS = 8000;
@@ -114,24 +130,27 @@ export default function SimliLiveKitPanel({
 
   // She listens the whole time she's on screen: mic opens when shown, closes
   // when hidden, and stays open in between (the worker's VAD decides when a
-  // turn ends). The only delay is GREETING_MS on the very first open, so her
-  // own greeting doesn't land in her ears — coming back from hidden is
-  // instant, since she's already said it. Browser echo cancellation covers the
-  // rest of the session.
+  // turn ends). The only wait is for her greeting at the start of each session
+  // (greetingOver, set from the active-speaker events in the connection
+  // effect), with GREETING_FALLBACK_MS as a backstop. Browser echo
+  // cancellation covers the rest of the session.
   const greetedRef = useRef(false);
+  const [greetingOver, setGreetingOver] = useState(false);
   useEffect(() => {
     if (status !== "ready" || hidden) return;
 
-    if (greetedRef.current) {
+    if (greetedRef.current || greetingOver) {
+      greetedRef.current = true;
       setMic(true);
       return;
     }
     const timer = window.setTimeout(() => {
+      console.warn("[SimliLK] greeting end not seen, opening mic anyway");
       greetedRef.current = true;
       setMic(true);
-    }, GREETING_MS);
+    }, GREETING_FALLBACK_MS);
     return () => window.clearTimeout(timer);
-  }, [status, hidden, setMic]);
+  }, [status, hidden, greetingOver, setMic]);
 
   // The panorama can hide this Web Frame (AiToggle button / a 3DVista action).
   // Hiding doesn't unload the iframe, so `hidden` is what ends the session (see
@@ -216,7 +235,16 @@ export default function SimliLiveKitPanel({
     let localRoom: Room | null = null;
     // Each session opens with her greeting, so the mic waits for it again.
     greetedRef.current = false;
+    setGreetingOver(false);
     setTurn("waiting");
+    // Her greeting is over once she has spoken and then stayed quiet for
+    // GREETING_PAUSE_MS (see the ActiveSpeakersChanged handler below).
+    let avatarHasSpoken = false;
+    let greetingQuietTimer: number | null = null;
+    const clearGreetingQuietTimer = () => {
+      if (greetingQuietTimer !== null) window.clearTimeout(greetingQuietTimer);
+      greetingQuietTimer = null;
+    };
 
     const attachTrack = (
       el: HTMLMediaElement | null,
@@ -295,6 +323,24 @@ export default function SimliLiveKitPanel({
             // reply; silence otherwise means we're waiting on the visitor.
             setTurn((prev) => (prev === "hearing" ? "thinking" : "waiting"));
           }
+
+          // The first time she goes quiet after speaking, her greeting is
+          // done and the mic can open (the mic effect above). She has to have
+          // spoken first: before the greeting starts she is quiet too. Wait
+          // GREETING_PAUSE_MS so a pause between her sentences doesn't count,
+          // restarting the wait whenever she speaks again.
+          if (greetedRef.current) return;
+          if (avatarTalking) {
+            avatarHasSpoken = true;
+            clearGreetingQuietTimer();
+          } else if (avatarHasSpoken && greetingQuietTimer === null) {
+            greetingQuietTimer = window.setTimeout(() => {
+              greetingQuietTimer = null;
+              if (cancelled) return;
+              console.log("[SimliLK] greeting finished");
+              setGreetingOver(true);
+            }, GREETING_PAUSE_MS);
+          }
         });
 
         await room.connect(url, token);
@@ -304,7 +350,7 @@ export default function SimliLiveKitPanel({
         }
 
         // Start muted so the greeting isn't interrupted by room noise; the
-        // effect below opens the mic for good once she's done speaking.
+        // mic effect opens it for good once she's done speaking.
         try {
           await room.localParticipant.setMicrophoneEnabled(false);
           console.log("[SimliLK] joined, mic muted for greeting");
@@ -342,6 +388,7 @@ export default function SimliLiveKitPanel({
       cancelled = true;
       readyRef.current = false;
       window.clearTimeout(startTimer);
+      clearGreetingQuietTimer();
       window.removeEventListener("pagehide", onUnload);
       window.removeEventListener("beforeunload", onUnload);
       if (localRoom) {
