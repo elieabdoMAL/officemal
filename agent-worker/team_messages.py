@@ -196,3 +196,26 @@ async def send_visitor_waiting_email(member: Member, visitor_name: str, note: st
     return await _send_email(
         "notify_member", [member.email], f"{visitor_name} is waiting at reception", body
     )
+
+
+async def send_emergency_email(team: list[Member], description: str) -> bool:
+    """Alert every member at once. True only if Resend accepted it.
+
+    One email to everyone rather than one each: it either reaches the whole
+    team or Mia hears it failed, never a silent partial send.
+    """
+    description = description.strip()[:MAX_MESSAGE_CHARS] or "No details given."
+    body = f"""
+      <div style="font-family:sans-serif;max-width:520px;margin:0 auto;padding:24px;background:#fff4f4;border-radius:12px;border:2px solid #d00">
+        <h2 style="margin:0 0 16px;color:#b00">Emergency reported at reception</h2>
+        <p style="margin:0 0 8px;color:#1a1a1a">A visitor at the reception kiosk reported an emergency. Mia told them to call 911. Please check on the lobby now.</p>
+        <blockquote style="margin:16px 0;padding:12px 16px;background:#fff;border-left:4px solid #d00;color:#1a1a1a;white-space:pre-wrap">{html.escape(description)}</blockquote>
+        {_STT_FOOTER}
+      </div>
+    """
+    return await _send_email(
+        "alert_emergency",
+        [m.email for m in team],
+        "URGENT: emergency reported at reception",
+        body,
+    )

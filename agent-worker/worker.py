@@ -44,6 +44,7 @@ from livekit.plugins import deepgram, google, simli
 from team_messages import (
     find_member,
     load_team,
+    send_emergency_email,
     send_message_email,
     send_visitor_waiting_email,
     team_prompt_section,
@@ -72,6 +73,9 @@ MIA_SYSTEM_PROMPT = (
 MAX_MESSAGES_PER_SESSION = 3
 # One visitor sees one or two people; more than this is someone playing.
 MAX_NOTIFICATIONS_PER_SESSION = 3
+# Emails the whole team. A second alert allows for "it's getting worse"; past
+# that it's a prank or a loop, and the visitor has already been told 911.
+MAX_EMERGENCY_ALERTS_PER_SESSION = 2
 
 # One Aura voice speaks one language, so we swap the TTS model per turn to match
 # whatever Deepgram detected. andromeda-en is the plugin's own default — keeping
@@ -199,6 +203,7 @@ class MiaAgent(Agent):
         self._last_raw_language: str = DEFAULT_LANG
         self._messages_sent = 0
         self._notifications_sent = 0
+        self._emergency_alerts_sent = 0
 
     @property
     def language(self) -> str:
@@ -285,6 +290,28 @@ class MiaAgent(Agent):
             return "NOT SENT: the email could not be delivered. Say so plainly and give the contact details."
         self._notifications_sent += 1
         return f"NOTIFIED {found.full_name} by email."
+
+    @function_tool()
+    async def alert_emergency(self, context: RunContext, description: str) -> str:
+        """Email an urgent alert to the whole team that there is an emergency at reception.
+
+        Call this straight away when someone is hurt, unwell, or reports a fire,
+        smoke or any danger, in the same reply where you tell them to call 911.
+        Tell the visitor the team was alerted only if this returns ALERTED.
+
+        Args:
+            description: What the visitor reported, in a few words, for example "visitor says there is smoke in the hallway".
+        """
+        if self._emergency_alerts_sent >= MAX_EMERGENCY_ALERTS_PER_SESSION:
+            return "NOT SENT: the team was already alerted. Tell them to call nine one one and the office."
+        # No member lookup: an emergency goes to everyone in team.json.
+        if not await send_emergency_email(TEAM, description):
+            return (
+                "NOT SENT: the alert could not be delivered. Tell them to call nine one one, "
+                "ask anyone nearby for help, and call the office."
+            )
+        self._emergency_alerts_sent += 1
+        return "ALERTED: the whole team was emailed."
 
     def _speak_in(self, lang: str) -> None:
         """Point the TTS at `lang`'s voice before the next thing she says."""
