@@ -41,7 +41,13 @@ from livekit.agents import (
 )
 from livekit.plugins import deepgram, google, simli
 
-from team_messages import find_member, load_team, send_message_email, team_prompt_section
+from team_messages import (
+    find_member,
+    load_team,
+    send_message_email,
+    send_visitor_waiting_email,
+    team_prompt_section,
+)
 
 logger = logging.getLogger("simli-receptionist")
 logger.setLevel(logging.INFO)
@@ -55,7 +61,7 @@ load_dotenv(override=True)
 # can't do yet are listed there under COMING SOON — see docs/mia-tasks.md.
 PROMPT_FILE = Path(__file__).with_name("mia_prompt.txt")
 # The TEAM section is generated from team.json, so the people she names and the
-# people take_message accepts can never drift apart.
+# people take_message / notify_member accept can never drift apart.
 TEAM = load_team()
 MIA_SYSTEM_PROMPT = (
     PROMPT_FILE.read_text(encoding="utf-8").strip() + "\n\n" + team_prompt_section(TEAM)
@@ -64,6 +70,8 @@ MIA_SYSTEM_PROMPT = (
 # Per conversation. A kiosk is open to anyone; this stops someone filling the
 # team's inboxes from it.
 MAX_MESSAGES_PER_SESSION = 3
+# One visitor sees one or two people; more than this is someone playing.
+MAX_NOTIFICATIONS_PER_SESSION = 3
 
 # One Aura voice speaks one language, so we swap the TTS model per turn to match
 # whatever Deepgram detected. andromeda-en is the plugin's own default — keeping
@@ -190,6 +198,7 @@ class MiaAgent(Agent):
         # still needs to reach Gemini, which offers French or English to them.
         self._last_raw_language: str = DEFAULT_LANG
         self._messages_sent = 0
+        self._notifications_sent = 0
 
     @property
     def language(self) -> str:
@@ -243,6 +252,39 @@ class MiaAgent(Agent):
             return "NOT SENT: the email could not be delivered. Say so plainly and give the contact details."
         self._messages_sent += 1
         return f"SENT to {member.full_name}."
+
+    @function_tool()
+    async def notify_member(
+        self,
+        context: RunContext,
+        visitor_name: str,
+        member: str,
+        note: str = "",
+    ) -> str:
+        """Tell a team member listed under TEAM, by email, that a visitor is waiting at reception.
+
+        Call this once you have the visitor's name and who they came to see.
+        Tell the visitor the person was notified only if this returns NOTIFIED.
+
+        Args:
+            visitor_name: The visitor's name, as they gave it.
+            member: Who they came to see, as the visitor said it: a name or a role such as "the CEO".
+            note: Why they came, only if the visitor said, for example "for a two o'clock meeting". Empty otherwise.
+        """
+        if self._notifications_sent >= MAX_NOTIFICATIONS_PER_SESSION:
+            return "NOT SENT: notification limit for this conversation reached. Give the contact details instead."
+        found = find_member(member, TEAM)
+        if found is None:
+            return (
+                f"NOT SENT: no single team member matches {member!r}. If it is unclear, ask who "
+                "they mean. Otherwise say you cannot reach that person from here and give the contact details."
+            )
+        if not visitor_name.strip():
+            return "NOT SENT: the visitor's name is required. Ask for it."
+        if not await send_visitor_waiting_email(found, visitor_name, note):
+            return "NOT SENT: the email could not be delivered. Say so plainly and give the contact details."
+        self._notifications_sent += 1
+        return f"NOTIFIED {found.full_name} by email."
 
     def _speak_in(self, lang: str) -> None:
         """Point the TTS at `lang`'s voice before the next thing she says."""
