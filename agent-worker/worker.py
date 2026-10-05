@@ -26,6 +26,7 @@ The LIVEKIT_* vars are read automatically by the agents framework.
 import asyncio
 import logging
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -131,8 +132,9 @@ def _env_int(name: str, default: int) -> int:
 # SESSION_MAX_LENGTH: hard cap on one conversation, however lively. A lobby
 #   chat rarely passes a few minutes; this stops a wedged or looping session.
 #
-# Either way the worker deletes the room, which disconnects the kiosk; the
-# kiosk then hides her until the next visitor taps the AI button.
+# Either way — or when she ends it herself on goodbye (end_conversation) — the
+# worker deletes the room, which disconnects the kiosk; the kiosk then hides
+# her until the next visitor taps the AI button.
 SESSION_IDLE_TIMEOUT = _env_int("SESSION_IDLE_TIMEOUT", 120)
 SESSION_MAX_LENGTH = _env_int("SESSION_MAX_LENGTH", 600)
 
@@ -165,6 +167,15 @@ def _normalize_lang(code: str | None) -> str:
 LANGUAGE_NAMES = {"fr": "French", "en": "English"}
 
 
+def _assistant_lines(handle) -> int:
+    """How many things she has said so far in this turn (one per LLM step)."""
+    return sum(
+        1
+        for item in handle.chat_items
+        if getattr(item, "type", "") == "message" and item.role == "assistant" and item.text_content
+    )
+
+
 def _reply_language_note(code: str) -> str:
     """Per-turn instruction telling Gemini which language to answer in."""
     if code in LANGUAGE_NAMES:
@@ -193,8 +204,12 @@ class MiaAgent(Agent):
         an English voice.
     """
 
-    def __init__(self, tts: deepgram.TTS) -> None:
+    def __init__(self, tts: deepgram.TTS, on_goodbye: Callable[[], None] | None = None) -> None:
         super().__init__(instructions=MIA_SYSTEM_PROMPT)
+        # Ends the session the way the idle limit does (entrypoint's
+        # end_session). end_conversation calls it once her goodbye has played.
+        self._on_goodbye = on_goodbye
+        self._ending = False
         self._tts = tts  # held directly so we can swap the voice per turn
         self._last_confidence: float | None = None
         self._last_language: str = DEFAULT_LANG
@@ -313,6 +328,47 @@ class MiaAgent(Agent):
         self._emergency_alerts_sent += 1
         return "ALERTED: the whole team was emailed."
 
+    @function_tool()
+    async def end_conversation(self, context: RunContext) -> str | None:
+        """End the conversation and put the screen back to standby.
+
+        Call this only when the visitor has clearly finished: they said goodbye,
+        or thanked you and want nothing else. Call it in the same reply as your
+        short goodbye, after the goodbye words. Never call it while something is
+        still in progress, such as a message they just confirmed: finish that
+        with its own tool first, and end in a later reply.
+        """
+        if self._ending:
+            return None
+        # Once she's saying goodbye, let it finish: the mic stays open in a noisy
+        # lobby, and a stray sound cutting her off would leave the session
+        # running until the idle limit. A visitor who wasn't done taps AI again.
+        try:
+            context.disallow_interruptions()
+        except RuntimeError:
+            return None  # already talked over; they're still talking, keep going
+        self._ending = True
+
+        handle = context.speech_handle
+        spoken_before = _assistant_lines(handle)
+        # Gemini emits the call while her goodbye is still being spoken, and the
+        # tool runs at once. Wait for those words to finish playing.
+        await context.wait_for_playout()
+
+        def _on_done(_handle) -> None:
+            if self._on_goodbye is not None:
+                self._on_goodbye()
+
+        # Fires when this whole turn has played out, including any reply after
+        # the tool, so the room is deleted only after her last word.
+        handle.add_done_callback(_on_done)
+        if _assistant_lines(handle) > spoken_before:
+            logger.info("end_conversation: goodbye said, ending after playout")
+            return None  # None means no reply after the tool
+        # She called the tool without a word. Have her say it now, in this turn.
+        logger.info("end_conversation: no goodbye yet, asking for one")
+        return "Ending now. Say a short, warm goodbye in the visitor's language. Do not call any tool."
+
     def _speak_in(self, lang: str) -> None:
         """Point the TTS at `lang`'s voice before the next thing she says."""
         self._tts.update_options(model=VOICE_BY_LANG[lang])
@@ -402,8 +458,6 @@ async def entrypoint(ctx: JobContext) -> None:
     )
     await avatar.start(session, room=ctx.room)
 
-    agent = MiaAgent(tts=tts)
-
     ending = False
 
     async def end_session(reason: str, goodbye: bool = False) -> None:
@@ -435,6 +489,9 @@ async def entrypoint(ctx: JobContext) -> None:
         task = asyncio.create_task(coro)
         tasks.add(task)
         task.add_done_callback(tasks.discard)
+
+    # end_conversation's goodbye has already played, so no goodbye=True here.
+    agent = MiaAgent(tts=tts, on_goodbye=lambda: spawn(end_session("visitor said goodbye")))
 
     # Log what she says next to what she heard ("heard …" in MiaAgent), so her
     # answers can be checked in `docker compose logs` after a prompt change.
