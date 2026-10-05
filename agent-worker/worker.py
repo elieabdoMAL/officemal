@@ -200,6 +200,31 @@ GOODBYE = {
     "fr": "Je dois vous laisser. Touchez le bouton IA pour me reparler. Au revoir!",
 }
 
+# How long to keep the room open after her goodbye is reported "done", so the
+# kiosk actually hears it. With the Simli avatar, "done" is not "heard": her
+# audio goes to Simli, which plays it into the room itself, and the playout
+# count the framework waits on can be thrown off by an earlier interruption (a
+# clear-buffer whose playback-finished never came is marked done after 2 s, and
+# Simli's late event then "finishes" the next segment early). Deleting the room
+# at that point cut her goodbye off entirely in testing. So wait as long as the
+# goodbye takes to say, plus the avatar pipeline, measured from "done": too long
+# when "done" was right (she stands silent a moment), never too short when it
+# wasn't. Aura speaks ~14-15 characters a second; the clamp keeps a one-word
+# goodbye audible and a rambling one from holding the room open.
+GOODBYE_CHARS_PER_SEC = 14.0
+AVATAR_PIPELINE_S = 1.0
+GOODBYE_GRACE_MIN_S = 2.0
+GOODBYE_GRACE_MAX_S = 8.0
+# After the grace, if LiveKit still hears the avatar speaking (a goodbye longer
+# than the estimate), wait up to this much more for her to stop.
+GOODBYE_OVERRUN_MAX_S = 5.0
+
+
+def goodbye_grace(text: str) -> float:
+    """Seconds to hold the room open after a goodbye of `text` is reported done."""
+    estimate = len(text.strip()) / GOODBYE_CHARS_PER_SEC + AVATAR_PIPELINE_S
+    return min(max(estimate, GOODBYE_GRACE_MIN_S), GOODBYE_GRACE_MAX_S)
+
 # Explicit dispatch: the worker joins only rooms whose token asks for this agent
 # by name (see /api/livekit/token), never every room on the LiveKit project.
 # The project is shared with expo360, whose rooms she must stay out of.
@@ -218,13 +243,18 @@ def _normalize_lang(code: str | None) -> str:
 LANGUAGE_NAMES = {"fr": "French", "en": "English"}
 
 
-def _assistant_lines(handle) -> int:
-    """How many things she has said so far in this turn (one per LLM step)."""
-    return sum(
-        1
+def _assistant_texts(handle) -> list[str]:
+    """What she has said so far in this turn (one entry per LLM step)."""
+    return [
+        item.text_content
         for item in handle.chat_items
         if getattr(item, "type", "") == "message" and item.role == "assistant" and item.text_content
-    )
+    ]
+
+
+def _assistant_lines(handle) -> int:
+    """How many things she has said so far in this turn (one per LLM step)."""
+    return len(_assistant_texts(handle))
 
 
 def _reply_language_note(code: str) -> str:
@@ -255,11 +285,13 @@ class MiaAgent(Agent):
         an English voice.
     """
 
-    def __init__(self, tts, on_goodbye: Callable[[], None] | None = None) -> None:
+    def __init__(self, tts, on_goodbye: Callable[[str], None] | None = None) -> None:
         # tts: deepgram.TTS or elevenlabs.TTS, see make_tts
         super().__init__(instructions=MIA_SYSTEM_PROMPT)
         # Ends the session the way the idle limit does (entrypoint's
-        # end_session). end_conversation calls it once her goodbye has played.
+        # end_session). end_conversation calls it once her goodbye is reported
+        # played, with the words she said, so the room is held open long
+        # enough for them to actually reach the kiosk (see goodbye_grace).
         self._on_goodbye = on_goodbye
         self._ending = False
         self._tts = tts  # held directly so we can swap the voice per turn
@@ -407,12 +439,15 @@ class MiaAgent(Agent):
         # tool runs at once. Wait for those words to finish playing.
         await context.wait_for_playout()
 
-        def _on_done(_handle) -> None:
+        def _on_done(done_handle) -> None:
             if self._on_goodbye is not None:
-                self._on_goodbye()
+                # Everything she said this turn: if "done" came early, none of
+                # it may have played yet, so size the grace for all of it.
+                self._on_goodbye(" ".join(_assistant_texts(done_handle)))
 
-        # Fires when this whole turn has played out, including any reply after
-        # the tool, so the room is deleted only after her last word.
+        # Fires when this whole turn is reported played out, including any
+        # reply after the tool; end_session then waits out the goodbye grace,
+        # so the room is deleted only after her last word.
         handle.add_done_callback(_on_done)
         if _assistant_lines(handle) > spoken_before:
             logger.info("end_conversation: goodbye said, ending after playout")
@@ -521,24 +556,64 @@ async def entrypoint(ctx: JobContext) -> None:
     )
     await avatar.start(session, room=ctx.room)
 
+    # Whether the kiosk can still hear her, per LiveKit's active-speaker
+    # detection on the audio Simli publishes into the room. Used only to stretch
+    # the goodbye grace when she runs long, never to shorten it: speaker events
+    # are throttled and can drop out at a pause between sentences.
+    avatar_quiet = asyncio.Event()
+    avatar_quiet.set()
+
+    @ctx.room.on("active_speakers_changed")
+    def _on_speakers(speakers) -> None:
+        if any(p.identity == avatar.avatar_identity for p in speakers):
+            avatar_quiet.clear()
+        else:
+            avatar_quiet.set()
+
+    async def let_goodbye_play(text: str) -> None:
+        """Hold the room open until `text`, reported played, has been heard."""
+        grace = goodbye_grace(text)
+        logger.info("holding the room %.1fs for the goodbye to play out", grace)
+        await asyncio.sleep(grace)
+        if not avatar_quiet.is_set():
+            logger.info("avatar still speaking after the grace; waiting for it to stop")
+            try:
+                await asyncio.wait_for(avatar_quiet.wait(), GOODBYE_OVERRUN_MAX_S)
+            except asyncio.TimeoutError:
+                logger.warning("avatar still speaking %.0fs past the grace; ending anyway", GOODBYE_OVERRUN_MAX_S)
+
     ending = False
 
-    async def end_session(reason: str, goodbye: bool = False) -> None:
+    async def end_session(reason: str, goodbye: bool = False, said: str = "") -> None:
         """Close the room for everyone and release this job. Safe to call twice.
 
         Deleting the room is what stops the bill: it disconnects the kiosk and
         the Simli avatar at once, instead of each lingering until a timeout.
+
+        goodbye: say GOODBYE first (the hard cap ends her mid-conversation).
+        said: a goodbye she has already said (end_conversation). Either way the
+        room stays open until the goodbye has had time to reach the kiosk.
         """
         nonlocal ending
         if ending:
             return
         ending = True
         logger.info("ending session in %s: %s", ctx.room.name, reason)
-        if goodbye:
+        if goodbye or said:
+            # She's leaving: stop listening, so a sound in the lobby can't start
+            # a new reply that the room's deletion would cut off mid-sentence.
             try:
-                await session.say(GOODBYE[agent.language], allow_interruptions=False)
+                session.input.set_audio_enabled(False)
+            except Exception:
+                logger.exception("could not stop listening; ending anyway")
+        if goodbye:
+            said = GOODBYE[agent.language]
+            try:
+                await session.say(said, allow_interruptions=False)
             except Exception:
                 logger.exception("goodbye failed; ending anyway")
+        if said:
+            await let_goodbye_play(said)
         try:
             await ctx.delete_room()
         except Exception:
@@ -553,8 +628,12 @@ async def entrypoint(ctx: JobContext) -> None:
         tasks.add(task)
         task.add_done_callback(tasks.discard)
 
-    # end_conversation's goodbye has already played, so no goodbye=True here.
-    agent = MiaAgent(tts=tts, on_goodbye=lambda: spawn(end_session("visitor said goodbye")))
+    # end_conversation's goodbye has already been said, so no goodbye=True
+    # here; passing what she said still holds the room open while it plays.
+    agent = MiaAgent(
+        tts=tts,
+        on_goodbye=lambda said: spawn(end_session("visitor said goodbye", said=said)),
+    )
 
     # Log what she says next to what she heard ("heard …" in MiaAgent), so her
     # answers can be checked in `docker compose logs` after a prompt change.
@@ -582,8 +661,8 @@ async def entrypoint(ctx: JobContext) -> None:
     await session.start(agent=agent, room=ctx.room)
     spawn(cap_length())
 
-    # Greet the visitor on her own; the browser holds its mic shut for the first
-    # few seconds, so she speaks before she starts listening.
+    # Greet the visitor on her own; the browser holds its mic shut until she has
+    # finished (her avatar stops speaking), so she speaks before she listens.
     await session.say(FIRST_MESSAGE)
 
 

@@ -93,8 +93,13 @@ async def converse(lang: str, lines: list[str]) -> None:
 
     # Text only: no voice. MiaAgent keeps its TTS in Agent._tts (the base class
     # slot the session speaks through), so clear it and the swap. on_goodbye
-    # stands in for end_session, which in production deletes the room.
-    agent = worker.MiaAgent(tts=None, on_goodbye=lambda: calls.append(("end",)))
+    # stands in for end_session, which in production deletes the room once the
+    # goodbye it is handed has had time to play.
+    def on_goodbye(said: str) -> None:
+        assert said.strip(), "end_session must be handed the goodbye she said, to time its playout"
+        calls.append(("end",))
+
+    agent = worker.MiaAgent(tts=None, on_goodbye=on_goodbye)
     agent._tts = None
     agent._speak_in = lambda _lang: None
     # In production the greeting is spoken before the visitor talks and sits in
