@@ -19,11 +19,14 @@ Run:
 
 Env (see env.example): SIMLI_API_KEY, SIMLI_FACE_ID, GOOGLE_API_KEY,
 DEEPGRAM_API_KEY, LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET.
+Optional: SESSION_IDLE_TIMEOUT, SESSION_MAX_LENGTH, LIVEKIT_AGENT_NAME.
 The LIVEKIT_* vars are read automatically by the agents framework.
 """
 
+import asyncio
 import logging
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 from livekit.agents import (
@@ -41,26 +44,13 @@ logger.setLevel(logging.INFO)
 
 load_dotenv(override=True)
 
-# Copied verbatim from src/app/api/simli/session/route.ts so the LiveKit avatar
-# behaves identically to the old Simli Auto receptionist. Keep these in sync.
-MIA_SYSTEM_PROMPT = " ".join(
-    [
-        "You are Mia, the virtual receptionist at Mobile Apps Labs, a software studio",
-        "based in Montréal that builds mobile apps, web platforms, and immersive 3D",
-        "experiences for clients in retail, finance, and hospitality. You speak from a",
-        "touchscreen kiosk in the office lobby. The visitor in front of you is either a",
-        "client, a candidate, or a guest dropping by.",
-        "",
-        "How to respond:",
-        "- Answer in whichever language the visitor speaks. Montréal visitors",
-        "  open in French as often as English; if they switch, switch with them.",
-        "  Without this you would default to English no matter what you heard.",
-        "- Speak warmly and concisely. 1 to 3 short sentences. No bullet lists.",
-        "- Sound like a real person at a reception desk. Conversational, never robotic.",
-        "- If you don't know something, offer to take a message or point them to the",
-        "  right team rather than making things up.",
-    ]
-)
+# Mia's persona, rules and company knowledge. The worker is the only place her
+# prompt lives: Simli just renders the face, so a prompt saved in the Simli
+# dashboard is never used. Kept in its own file so it can be edited without
+# touching code (still needs an image rebuild + push to go live). Features she
+# can't do yet are listed there under COMING SOON — see docs/mia-tasks.md.
+PROMPT_FILE = Path(__file__).with_name("mia_prompt.txt")
+MIA_SYSTEM_PROMPT = PROMPT_FILE.read_text(encoding="utf-8").strip()
 
 # One Aura voice speaks one language, so we swap the TTS model per turn to match
 # whatever Deepgram detected. andromeda-en is the plugin's own default — keeping
@@ -68,14 +58,13 @@ MIA_SYSTEM_PROMPT = " ".join(
 # only; Aura has no fr-CA, so expect a France accent rather than a Québec one.
 VOICE_BY_LANG = {"fr": "aura-2-agathe-fr", "en": "aura-2-andromeda-en"}
 
-# Language she opens in, before anyone has spoken. "Bonjour, hi" is the standard
-# Montréal greeting and needs the French voice — "Bonjour" in an English voice
-# sounds worse than "hi" in a French one.
+# Language she opens in, before anyone has spoken: the prompt says greet in
+# French by default, and she switches as soon as the visitor speaks English.
 DEFAULT_LANG = "fr"
 
-FIRST_MESSAGE = (
-    "Bonjour, hi! Bienvenue chez Mobile Apps Labs. How can I help you today?"
-)
+# Must match the greeting quoted at the top of mia_prompt.txt, which tells her
+# it has already been said.
+FIRST_MESSAGE = "Bonjour, bienvenue chez Mobile Apps Labs. Que puis-je faire pour vous ?"
 
 # She now listens continuously (the browser leaves the mic open), so the room's
 # background noise reaches Deepgram all day. Rather than let Gemini improvise on
@@ -109,16 +98,35 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-# Simli bills for avatar render time, so the session should end when the lobby
-# empties — but not while a visitor is mid-thought. The plugin defaults (30s
-# idle / 600s total) are tuned for a demo, not a kiosk: 30s of silence is normal
-# when someone is reading the panorama, and losing her mid-visit looks broken.
+# Session limits. LiveKit, Simli, Deepgram and Gemini all bill while a session
+# is open, so every session must end on its own — the kiosk is never closed.
 #
-# 3 minutes idle keeps her through a pause without billing an empty lobby; the
-# 30 minute cap is a backstop so a wedged session can't bill all night. Both are
-# env-tunable so the numbers can move without an image rebuild.
-MAX_IDLE_TIME = _env_int("SIMLI_MAX_IDLE_TIME", 180)
-MAX_SESSION_LENGTH = _env_int("SIMLI_MAX_SESSION_LENGTH", 1800)
+# SESSION_IDLE_TIMEOUT: nobody has spoken (visitor or Mia) for this long, so the
+#   lobby is empty. 2 minutes keeps her through someone reading the panorama.
+# SESSION_MAX_LENGTH: hard cap on one conversation, however lively. A lobby
+#   chat rarely passes a few minutes; this stops a wedged or looping session.
+#
+# Either way the worker deletes the room, which disconnects the kiosk; the
+# kiosk then hides her until the next visitor taps the AI button.
+SESSION_IDLE_TIMEOUT = _env_int("SESSION_IDLE_TIMEOUT", 120)
+SESSION_MAX_LENGTH = _env_int("SESSION_MAX_LENGTH", 600)
+
+# Simli's own limits, kept 30s behind ours as a backstop: if this worker ever
+# fails to end a session, Simli still stops rendering (and billing) by itself.
+MAX_IDLE_TIME = _env_int("SIMLI_MAX_IDLE_TIME", SESSION_IDLE_TIMEOUT + 30)
+MAX_SESSION_LENGTH = _env_int("SIMLI_MAX_SESSION_LENGTH", SESSION_MAX_LENGTH + 30)
+
+# Said when the hard cap ends a conversation mid-flow, so she doesn't just vanish.
+GOODBYE = {
+    "en": "I have to go now. Tap the AI button any time to talk again. Goodbye!",
+    "fr": "Je dois vous laisser. Touchez le bouton IA pour me reparler. Au revoir!",
+}
+
+# Explicit dispatch: the worker joins only rooms whose token asks for this agent
+# by name (see /api/livekit/token), never every room on the LiveKit project.
+# The project is shared with expo360, whose rooms she must stay out of.
+# Must match LIVEKIT_AGENT_NAME on Vercel (same default on both sides).
+AGENT_NAME = os.environ.get("LIVEKIT_AGENT_NAME", "").strip() or "officemal-mia"
 
 
 def _normalize_lang(code: str | None) -> str:
@@ -127,6 +135,21 @@ def _normalize_lang(code: str | None) -> str:
         return DEFAULT_LANG
     short = code.split("-")[0].lower()
     return short if short in VOICE_BY_LANG else "en"
+
+
+LANGUAGE_NAMES = {"fr": "French", "en": "English"}
+
+
+def _reply_language_note(code: str) -> str:
+    """Per-turn instruction telling Gemini which language to answer in."""
+    if code in LANGUAGE_NAMES:
+        name = LANGUAGE_NAMES[code]
+        return f"The visitor just spoke {name}. Reply only in {name}."
+    return (
+        f"The visitor just spoke a language other than French or English "
+        f"(language code {code}). Follow the LANGUAGE rule: say in English that "
+        f"you can continue in French or English, and ask which they prefer."
+    )
 
 
 class MiaAgent(Agent):
@@ -138,7 +161,11 @@ class MiaAgent(Agent):
         confidence reads high on a clean recording of someone clearing their
         throat.
       * `language` — Deepgram returns this per utterance when the STT runs with
-        language="multi", and it picks the voice for the reply.
+        language="multi". It picks the voice for the reply, and is also handed
+        to Gemini each turn: the prompt alone can't hold her to the visitor's
+        language — after a French greeting she drifts into French replies to
+        English questions — and the voice would then speak French text with
+        an English voice.
     """
 
     def __init__(self, tts: deepgram.TTS) -> None:
@@ -146,6 +173,14 @@ class MiaAgent(Agent):
         self._tts = tts  # held directly so we can swap the voice per turn
         self._last_confidence: float | None = None
         self._last_language: str = DEFAULT_LANG
+        # Deepgram's code before _normalize_lang folds it to fr/en: "es" etc.
+        # still needs to reach Gemini, which offers French or English to them.
+        self._last_raw_language: str = DEFAULT_LANG
+
+    @property
+    def language(self) -> str:
+        """The language the visitor last spoke — the one to say goodbye in."""
+        return self._last_language
 
     async def stt_node(self, audio, model_settings):
         async for event in super().stt_node(audio, model_settings):
@@ -156,6 +191,7 @@ class MiaAgent(Agent):
                     self._last_confidence = confidence
                 language = getattr(alternatives[0], "language", None)
                 if language:
+                    self._last_raw_language = str(language).split("-")[0].lower()
                     self._last_language = _normalize_lang(str(language))
             yield event
 
@@ -180,6 +216,8 @@ class MiaAgent(Agent):
 
         if text and not (too_short or filler or unsure):
             logger.info("heard %r (lang=%s, confidence=%s)", text, lang, confidence)
+            # This turn only (turn_ctx isn't saved to the conversation history).
+            turn_ctx.add_message(role="system", content=_reply_language_note(self._last_raw_language))
             return
 
         logger.info(
@@ -228,6 +266,9 @@ async def entrypoint(ctx: JobContext) -> None:
             "endpointing": {"min_delay": 0.3, "max_delay": 1.5},
             "preemptive_generation": {"preemptive_tts": True},
         },
+        # Marks the visitor "away" once neither side has spoken for this long;
+        # that is the idle signal that ends the session below.
+        user_away_timeout=SESSION_IDLE_TIMEOUT,
     )
 
     # Simli renders the Trinity face into the room, lip-synced to session audio.
@@ -243,10 +284,65 @@ async def entrypoint(ctx: JobContext) -> None:
     )
     await avatar.start(session, room=ctx.room)
 
-    await session.start(
-        agent=MiaAgent(tts=tts),
-        room=ctx.room,
-    )
+    agent = MiaAgent(tts=tts)
+
+    ending = False
+
+    async def end_session(reason: str, goodbye: bool = False) -> None:
+        """Close the room for everyone and release this job. Safe to call twice.
+
+        Deleting the room is what stops the bill: it disconnects the kiosk and
+        the Simli avatar at once, instead of each lingering until a timeout.
+        """
+        nonlocal ending
+        if ending:
+            return
+        ending = True
+        logger.info("ending session in %s: %s", ctx.room.name, reason)
+        if goodbye:
+            try:
+                await session.say(GOODBYE[agent.language], allow_interruptions=False)
+            except Exception:
+                logger.exception("goodbye failed; ending anyway")
+        try:
+            await ctx.delete_room()
+        except Exception:
+            logger.exception("delete_room failed; LiveKit's departure timeout will close it")
+        ctx.shutdown(reason=reason)
+
+    # Event callbacks are sync; hold task references so they aren't collected.
+    tasks: set[asyncio.Task] = set()
+
+    def spawn(coro) -> None:
+        task = asyncio.create_task(coro)
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    # Log what she says next to what she heard ("heard …" in MiaAgent), so her
+    # answers can be checked in `docker compose logs` after a prompt change.
+    @session.on("conversation_item_added")
+    def _on_item(ev) -> None:
+        item = ev.item
+        if getattr(item, "role", None) == "assistant" and item.text_content:
+            logger.info("said %r", item.text_content)
+
+    @session.on("user_state_changed")
+    def _on_user_state(ev) -> None:
+        if ev.new_state == "away":
+            spawn(end_session(f"idle {SESSION_IDLE_TIMEOUT}s"))
+
+    # The visitor left (AI button turned off, page closed, network gone):
+    # close_on_disconnect has already stopped the session; clear up the room.
+    @session.on("close")
+    def _on_close(_ev) -> None:
+        spawn(end_session("session closed"))
+
+    async def cap_length() -> None:
+        await asyncio.sleep(SESSION_MAX_LENGTH)
+        await end_session(f"max length {SESSION_MAX_LENGTH}s", goodbye=True)
+
+    await session.start(agent=agent, room=ctx.room)
+    spawn(cap_length())
 
     # Greet the visitor on her own; the browser holds its mic shut for the first
     # few seconds, so she speaks before she starts listening.
@@ -254,7 +350,6 @@ async def entrypoint(ctx: JobContext) -> None:
 
 
 if __name__ == "__main__":
-    # Default WorkerType.ROOM = automatic dispatch: this worker joins every new
-    # room created on the LiveKit project, so the browser only needs a join
-    # token — it never has to request an agent explicitly.
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
+    # agent_name switches off automatic dispatch: the worker joins only rooms
+    # whose join token requests AGENT_NAME (the kiosk's token route does).
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, agent_name=AGENT_NAME))

@@ -1,6 +1,7 @@
 "use client";
 
 import MeetingModal from "@/components/MeetingModal";
+import PublicMeetingModal from "@/components/PublicMeetingModal";
 import PasscodeModal from "@/components/PasscodeModal";
 import InfiniViewModal from "@/components/InfiniViewModal";
 import MalModal from "@/components/MalModal";
@@ -24,6 +25,7 @@ export default function Page() {
         allow="vr; gyroscope; accelerometer; autoplay; microphone; camera"
       />
       <MeetingModal />
+      <PublicMeetingModal />
       <PasscodeModal />
       <InfiniViewModal />
       <MalModal />

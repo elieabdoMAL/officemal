@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { findByLabel, tourFrame, type TDVObject } from "@/lib/tour";
 
 // Name of the 3DVista Web Frame hotspot that hosts the AI receptionist.
 // Panorama overlays store the editor name under `data.label` (components on the
@@ -30,57 +31,13 @@ const FRAME_CLASSES = [
   "Container",
 ];
 
-type TDVObject = {
-  get: (key: string) => unknown;
-  set: (key: string, value: unknown) => void;
-};
-
 type BlazeIT = {
   triggerComponentByName?: (name: string, event: string) => boolean;
   triggerHotspotByName?: (name: string, event: string) => boolean;
 };
 
-function tourFrame(): HTMLIFrameElement | null {
-  return document.querySelector('iframe[src*="3dvista"]');
-}
-
-// `var tour` is a global inside the published tour (script.js line 5); the
-// player hangs off it once TDV.Tour has initialized.
-function getPlayer(): { getByClassName?: (cls: string) => TDVObject[] } | null {
-  try {
-    const win = tourFrame()?.contentWindow as unknown as {
-      tour?: { player?: unknown; _player?: unknown };
-      rootPlayer?: unknown;
-    } | null;
-    if (!win) return null;
-    return (win.tour?.player ?? win.tour?._player ?? win.rootPlayer ?? null) as ReturnType<
-      typeof getPlayer
-    >;
-  } catch {
-    return null; // cross-origin — caller falls back to the containers
-  }
-}
-
-// 3DVista generates opaque ids (overlay_A9B5493B_...), so the editor name is the
-// only handle worth coding against. It lives on the object's `data` bag — as
-// `label` for panorama overlays, `name` for skin components.
 function findAiFrame(): TDVObject | null {
-  const player = getPlayer();
-  if (!player?.getByClassName) return null;
-
-  for (const cls of FRAME_CLASSES) {
-    let items: TDVObject[] = [];
-    try {
-      items = player.getByClassName(cls) || [];
-    } catch {
-      continue;
-    }
-    for (const item of items) {
-      const data = item.get?.("data") as { name?: string; label?: string } | undefined;
-      if (data?.label === AI_FRAME_NAME || data?.name === AI_FRAME_NAME) return item;
-    }
-  }
-  return null;
+  return findByLabel(FRAME_CLASSES, AI_FRAME_NAME);
 }
 
 // A panorama overlay has no `visible` property — 3DVista shows/hides it with
@@ -169,11 +126,16 @@ export default function AiToggle({ initiallyVisible = false }: { initiallyVisibl
   const [shown, setShown] = useState(initiallyVisible);
 
   // Adopt the tour's real state once it has loaded, so the icon doesn't lie —
-  // AIWEB is published hidden (enabled:false).
+  // AIWEB is published hidden (enabled:false). Tell the embed too: it may have
+  // loaded inside the hidden frame and opened a session nobody can see.
   useEffect(() => {
     const timer = window.setTimeout(() => {
       const obj = findAiFrame();
-      if (obj) setShown(readShown(obj));
+      if (obj) {
+        const isShown = readShown(obj);
+        setShown(isShown);
+        broadcastVisibility(isShown);
+      }
     }, 2500);
     return () => window.clearTimeout(timer);
   }, []);
@@ -220,7 +182,20 @@ export default function AiToggle({ initiallyVisible = false }: { initiallyVisibl
       },
     };
     Object.assign(window, api);
+
+    // The receptionist ended her session on her own (idle or max length) and
+    // has already left the room. Switch off to match, so the frame isn't left
+    // showing an empty panel and the next visitor's tap starts a fresh session.
+    const onMessage = (e: MessageEvent) => {
+      if (e.origin !== window.location.origin) return;
+      if ((e.data as { type?: string })?.type === "receptionist-ended") {
+        api.setAIVisible(false);
+      }
+    };
+    window.addEventListener("message", onMessage);
+
     return () => {
+      window.removeEventListener("message", onMessage);
       delete (window as unknown as Record<string, unknown>).toggleAI;
       delete (window as unknown as Record<string, unknown>).setAIVisible;
     };

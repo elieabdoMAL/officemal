@@ -23,8 +23,13 @@ import { applyChromaKey } from "@/lib/chromaKey";
 //   - Then the mic opens and STAYS open: she listens continuously and the
 //     worker's VAD decides when a turn ends. When the transcript is too weak to
 //     act on, the worker answers "I'm sorry, I didn't get that."
-//   - The parent panorama can hide this frame; we mute mic + audio while hidden
-//     (hiding a Web Frame doesn't unload it).
+//   - A session lives only while she's shown. Hiding the frame (AI button, a
+//     3DVista action) leaves the room, which ends the session server-side;
+//     showing it again starts a fresh one, greeting and all. Hiding a Web Frame
+//     doesn't unload it, so this is done by hand rather than by unmounting.
+//   - The worker ends sessions on its own (2 min idle / 10 min max) by deleting
+//     the room. When that happens we tell the top page, whose AI button hides
+//     the frame, so the next visitor brings her back with one tap.
 
 type Status = "idle" | "connecting" | "ready" | "speaking" | "error";
 
@@ -43,6 +48,8 @@ const TURN_LABEL: Record<Turn, { text: string; bg: string }> = {
   thinking: { text: "… Thinking", bg: "rgba(234,179,8,0.9)" },
   answering: { text: "🔊 Speaking", bg: "rgba(0,150,255,0.85)" },
 };
+
+const TURNS = Object.keys(TURN_LABEL) as Turn[];
 
 type Props = {
   autoStart?: boolean;
@@ -63,6 +70,14 @@ const GREETING_MS = 6000;
 
 // Longest we'll claim she's "thinking" before admitting we're back to waiting.
 const THINKING_TIMEOUT_MS = 8000;
+
+// How much to enlarge her within the Web Frame. Simli renders her small inside
+// a 16:9 feed and objectFit "contain" letterboxes that, so she reads as a
+// distant figure at kiosk distance. Scaling here rather than resizing the
+// hotspot in 3DVista keeps her anchored to the same spot in the panorama.
+// Above ~1.5 the crop starts cutting her shoulders — raise the Web Frame's
+// height in 3DVista instead if she needs to be bigger than that.
+const AVATAR_SCALE = 1.05;
 
 // Module-level lock. React Strict Mode (dev) mounts effects twice; this ensures
 // only ONE room connection is ever starting/alive across remounts.
@@ -119,8 +134,8 @@ export default function SimliLiveKitPanel({
   }, [status, hidden, setMic]);
 
   // The panorama can hide this Web Frame (AiToggle button / a 3DVista action).
-  // Hiding doesn't unload the iframe, so go quiet by hand: drop the mic and
-  // mute her audio, then pick both back up when shown again.
+  // Hiding doesn't unload the iframe, so `hidden` is what ends the session (see
+  // the connection effect) and starts a new one when she's shown again.
   useEffect(() => {
     const onMessage = (e: MessageEvent) => {
       const data = e.data as { type?: string; visible?: boolean; muted?: boolean };
@@ -192,11 +207,16 @@ export default function SimliLiveKitPanel({
     };
   }, [chromaKey]);
 
+  // One session per showing: runs while shown, torn down (room left) when
+  // hidden. The worker sees the visitor leave and deletes the room.
   useEffect(() => {
-    if (!autoStart) return;
+    if (!autoStart || hidden) return;
 
     let cancelled = false;
     let localRoom: Room | null = null;
+    // Each session opens with her greeting, so the mic waits for it again.
+    greetedRef.current = false;
+    setTurn("waiting");
 
     const attachTrack = (
       el: HTMLMediaElement | null,
@@ -247,9 +267,17 @@ export default function SimliLiveKitPanel({
           }
         );
 
-        room.on(RoomEvent.Disconnected, () => {
+        // Fires only when the room ends without us leaving it: the worker hit
+        // its idle/max limit and deleted the room, or the network gave out past
+        // what livekit-client's own reconnect can recover. Either way she's
+        // gone, so stand down and ask the top page to switch the AI button off.
+        room.on(RoomEvent.Disconnected, (reason) => {
           if (cancelled) return;
-          console.warn("[SimliLK] room disconnected");
+          console.warn("[SimliLK] room ended:", reason);
+          try {
+            window.top?.postMessage({ type: "receptionist-ended" }, window.location.origin);
+          } catch {}
+          setHidden(true);
         });
 
         // Whose turn it is, derived from who's actually making sound. The
@@ -319,9 +347,14 @@ export default function SimliLiveKitPanel({
       if (localRoom) {
         localRoom.disconnect().catch(() => {});
       }
+      roomRef.current = null;
       SESSION_ACTIVE = false; // release the lock when this session tears down
+      // Drop the last frame so the next showing doesn't flash the old session.
+      if (videoRef.current) videoRef.current.srcObject = null;
+      setListening(false);
+      setStatus("idle");
     };
-  }, [autoStart]);
+  }, [autoStart, hidden]);
 
   const connecting = status !== "ready" && status !== "speaking";
 
@@ -357,11 +390,22 @@ export default function SimliLiveKitPanel({
         style={
           chromaKey
             ? { position: "absolute", width: 1, height: 1, opacity: 0, pointerEvents: "none" }
-            : { width: "100%", height: "100%", objectFit: "contain", pointerEvents: "none" }
+            : {
+                width: "100%",
+                height: "100%",
+                objectFit: "contain",
+                transform: `scale(${AVATAR_SCALE})`,
+                transformOrigin: "bottom center",
+                pointerEvents: "none",
+              }
         }
       />
 
-      {/* Chroma-keyed output (pink backdrop removed). */}
+      {/* Chroma-keyed output (backdrop removed). Scaled from the bottom edge:
+          objectFit "contain" letterboxes her inside the Web Frame, so there is
+          headroom to enlarge her without touching the 3DVista hotspot. Growing
+          from "bottom center" keeps her feet planted where they are and pushes
+          the extra size upward, rather than sinking her into the floor. */}
       {chromaKey && (
         <canvas
           ref={canvasRef}
@@ -371,6 +415,8 @@ export default function SimliLiveKitPanel({
             width: "100%",
             height: "100%",
             objectFit: "contain",
+            transform: `scale(${AVATAR_SCALE})`,
+            transformOrigin: "bottom center",
             pointerEvents: "none",
           }}
         />
@@ -379,7 +425,7 @@ export default function SimliLiveKitPanel({
       {/* The avatar's TTS audio plays through this element. */}
       <audio ref={audioRef} autoPlay />
 
-      {connecting && (
+      {connecting && !hidden && (
         <div
           style={{
             position: "absolute",
@@ -401,28 +447,49 @@ export default function SimliLiveKitPanel({
         </div>
       )}
 
-      {/* Turn indicator. Shown only while the mic is genuinely open, so it
-          never promises she's listening when she isn't. */}
+      {/* Turn indicator, resting on the bottom edge of the frame. Kept a full
+          rounded pill: squaring the bottom corners to sit flush made it read
+          as clipped rather than deliberate. Shown only while the mic is
+          genuinely open, so it never promises she's listening when she isn't.
+
+          Every state is stacked in one grid cell, with the inactive ones kept
+          in the layout but invisible. That sizes the pill to the *longest*
+          label ("Go ahead — I'm listening") permanently, so it doesn't resize
+          as the state changes — and it stays correct if the wording changes,
+          unlike a hardcoded width. */}
       {!connecting && !hidden && listening && (
         <div
           style={{
             position: "absolute",
             left: "50%",
-            bottom: 22,
+            bottom: 0,
             transform: "translateX(-50%)",
-            padding: "8px 16px",
+            display: "grid",
+            padding: "9px 18px",
+            lineHeight: 1.25,
             borderRadius: 999,
             background: TURN_LABEL[turn].bg,
             color: "white",
             fontSize: 13,
             fontWeight: 600,
+            textAlign: "center",
             textShadow: "0 2px 8px rgba(0,0,0,0.8)",
             pointerEvents: "none",
             whiteSpace: "nowrap",
             transition: "background 0.2s ease",
           }}
         >
-          {TURN_LABEL[turn].text}
+          {TURNS.map((t) => (
+            <span
+              key={t}
+              style={{
+                gridArea: "1 / 1",
+                visibility: t === turn ? "visible" : "hidden",
+              }}
+            >
+              {TURN_LABEL[t].text}
+            </span>
+          ))}
         </div>
       )}
     </div>

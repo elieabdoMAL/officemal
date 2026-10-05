@@ -68,3 +68,6 @@ agent-worker/.venv/
 __pycache__/
 *.pyc
 agent-worker/.env
+
+.vercel
+.env*
