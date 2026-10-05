@@ -8,13 +8,15 @@ import {
   type LocalUserChoices,
 } from "@livekit/components-react";
 import "@livekit/components-styles";
+import MeetingLimits from "@/components/MeetingLimits";
 
 // The public meeting room, shared by the 3D tour's pop-up (PublicMeetingModal)
 // and the standalone /meet page. Two steps:
 //   1. PreJoin — camera preview, mic/camera toggles, and a name field.
 //   2. VideoConference — LiveKit's stock meeting UI: participant grid, mic,
 //      camera, screen share, chat and a Leave button.
-// The room itself and its limits live in /api/meeting/token.
+// The room itself and its limits live in /api/meeting/token; MeetingLimits
+// ends a connection nobody is using.
 
 type Props = {
   // Called when the guest leaves (Leave button, or the room closes on them).
@@ -117,9 +119,11 @@ export default function PublicMeetingRoom({ onLeave }: Props) {
         setSession(null);
         setError(/full/i.test(e.message) ? "The meeting room is full right now." : e.message);
       }}
-      style={{ height: "100%" }}
+      // relative: MeetingLimits' warnings float over the call.
+      style={{ height: "100%", position: "relative" }}
     >
       <VideoConference />
+      <MeetingLimits />
     </LiveKitRoom>
   );
 }
