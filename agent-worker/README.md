@@ -20,8 +20,9 @@ visitor speaks, switching per turn. Three pieces make that work:
   line Gemini replies in English no matter what it was given.
 
 > **Accent caveat:** Aura has no `fr-CA` voice, so her French is France French,
-> not Québécois. Changing that means a different TTS vendor (ElevenLabs,
-> Cartesia) — a new key and a `requirements.txt` change.
+> not Québécois. ElevenLabs is wired in as an option: `TTS_PROVIDER=elevenlabs`
+> plus `ELEVENLABS_API_KEY` switches to one multilingual voice for both
+> languages (see `env.example`).
 
 `MIN_STT_CONFIDENCE` gates each turn; below it she answers "I'm sorry, I didn't
 get that" / "Désolée, je n'ai pas compris" instead of letting Gemini improvise

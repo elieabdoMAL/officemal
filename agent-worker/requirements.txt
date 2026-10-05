@@ -1,6 +1,7 @@
 # LiveKit Agents worker for the Simli Trinity receptionist.
-# Plugins: google (Gemini LLM), deepgram (STT + TTS), silero (VAD), simli (avatar).
+# Plugins: google (Gemini LLM), deepgram (STT + TTS), simli (avatar),
+# elevenlabs (optional TTS, used when TTS_PROVIDER=elevenlabs).
 # Pin exact versions after the first successful `pip install` — the LiveKit
 # agents ecosystem ships frequent breaking releases.
-livekit-agents[google,deepgram,simli]~=1.6
+livekit-agents[google,deepgram,simli,elevenlabs]~=1.6
 python-dotenv

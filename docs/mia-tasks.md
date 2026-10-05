@@ -87,11 +87,27 @@ Relies on 3DVista internals — re-test after 3DVista upgrades.
   spent ~86 thinking tokens and took ~1.08s to the first token; with thinking
   off, ~0.65s. A bare 3-word prompt with no system prompt used ~360 thinking
   tokens (1.78s, down to 0.39s). Answers were just as good in both cases.
-- **ElevenLabs voice (Aria).** The voice picked in the Simli dashboard isn't used —
-  Mia speaks through Deepgram Aura in the worker. Switching the worker to
-  ElevenLabs (`livekit-agents[elevenlabs]`, an ELEVENLABS_API_KEY) gets Aria, and
-  one multilingual voice for both languages instead of swapping two. Also the
-  route to a less European-sounding French (Aura has no fr-CA voice).
+- **ElevenLabs voice (Aria) — *built, off until there's a key*.** The voice
+  picked in the Simli dashboard isn't used: Mia speaks through the worker's
+  TTS, Deepgram Aura by default (two voices, swapped per language). The worker
+  now also supports ElevenLabs, one multilingual voice for both languages, and
+  the route to a less European-sounding French (Aura has no fr-CA voice).
+  To turn it on, add to the server's `agent-worker/.env` (by hand, since
+  `push-keys.sh` doesn't sync these), rebuild the image and restart:
+  - `TTS_PROVIDER=elevenlabs`
+  - `ELEVENLABS_API_KEY=` (a paid plan: library voices return 402 on free)
+  - `ELEVENLABS_VOICE_ID=` optional, defaults to Aria `9BWtsMINqrJLrRacOk9x`.
+    Aria is reported to be a legacy voice that ElevenLabs may now serve as
+    "Zoe", so listen before going live and pick another id if needed.
+  - `ELEVENLABS_MODEL=` optional, defaults to `eleven_flash_v2_5` (lowest
+    latency; the worker sends it the visitor's language each turn).
+    `eleven_multilingual_v2` also works but is slower and takes no language hint.
+
+  Without the key (or with any other `TTS_PROVIDER`) she stays on Deepgram,
+  with an error in the logs. Not yet heard for real: no ElevenLabs key was
+  available, so only setup and the request to ElevenLabs (rejected with 401 on
+  a fake key) were tested. Check the voice, French accent and lip sync on the
+  kiosk.
 - **Other languages.** She's told to offer French or English, but a Spanish
   speaker still hears the English voice. Fine for now; revisit if needed.
 - **Conversation tests.** A scripted set of visitor lines (pricing, staff info,

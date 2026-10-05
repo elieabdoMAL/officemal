@@ -7,11 +7,13 @@ LiveKit room the browser joins and runs:
 
     Deepgram STT  ->  Gemini 2.5 Flash (LLM)  ->  Deepgram TTS  ->  Simli avatar
 
-The Simli plugin renders the Trinity face lip-synced to the TTS audio and
-publishes the video+audio into the room; the browser subscribes to it.
+(or ElevenLabs TTS, with TTS_PROVIDER=elevenlabs). The Simli plugin renders the
+Trinity face lip-synced to the TTS audio and publishes the video+audio into the
+room; the browser subscribes to it.
 
 She is bilingual (FR/EN): the STT runs multilingual and reports the language of
-each utterance, and the Aura voice is swapped to match before she replies.
+each utterance, and the Aura voice is swapped to match before she replies
+(ElevenLabs keeps one multilingual voice for both).
 
 Run:
     python worker.py dev      # local dev + hot reload (test via LiveKit Sandbox)
@@ -19,7 +21,8 @@ Run:
 
 Env (see env.example): SIMLI_API_KEY, SIMLI_FACE_ID, GOOGLE_API_KEY,
 DEEPGRAM_API_KEY, LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET.
-Optional: SESSION_IDLE_TIMEOUT, SESSION_MAX_LENGTH, LIVEKIT_AGENT_NAME.
+Optional: SESSION_IDLE_TIMEOUT, SESSION_MAX_LENGTH, LIVEKIT_AGENT_NAME,
+TTS_PROVIDER, ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID, ELEVENLABS_MODEL.
 The LIVEKIT_* vars are read automatically by the agents framework.
 """
 
@@ -74,6 +77,53 @@ VOICE_BY_LANG = {"fr": "aura-2-agathe-fr", "en": "aura-2-andromeda-en"}
 # Language she opens in, before anyone has spoken: the prompt says greet in
 # French by default, and she switches as soon as the visitor speaks English.
 DEFAULT_LANG = "fr"
+
+# Optional ElevenLabs voice instead of Aura: TTS_PROVIDER=elevenlabs plus an
+# ELEVENLABS_API_KEY. One multilingual ElevenLabs voice speaks both languages,
+# so there is no voice swap; with the v2.5 models we only tell it which language
+# is coming. Anything else (unset, unknown, no key) keeps Deepgram as before.
+ARIA_VOICE_ID = "9BWtsMINqrJLrRacOk9x"  # ElevenLabs' premade "Aria"
+ELEVENLABS_API_KEY = (
+    os.environ.get("ELEVENLABS_API_KEY", "").strip() or os.environ.get("ELEVEN_API_KEY", "").strip()
+)
+ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "").strip() or ARIA_VOICE_ID
+# flash_v2_5: ElevenLabs' lowest-latency multilingual model (French included).
+ELEVENLABS_MODEL = os.environ.get("ELEVENLABS_MODEL", "").strip() or "eleven_flash_v2_5"
+# Models that take a language_code; ElevenLabs doesn't support it on multilingual_v2.
+ELEVENLABS_LANGUAGE_MODELS = {"eleven_flash_v2_5", "eleven_turbo_v2_5"}
+
+
+def _tts_provider() -> str:
+    wanted = os.environ.get("TTS_PROVIDER", "").strip().lower() or "deepgram"
+    if wanted == "elevenlabs":
+        if ELEVENLABS_API_KEY:
+            return "elevenlabs"
+        logger.error("TTS_PROVIDER=elevenlabs but ELEVENLABS_API_KEY is not set: using Deepgram Aura")
+    elif wanted != "deepgram":
+        logger.warning("TTS_PROVIDER=%r is not deepgram or elevenlabs: using Deepgram Aura", wanted)
+    return "deepgram"
+
+
+TTS_PROVIDER = _tts_provider()
+if TTS_PROVIDER == "elevenlabs":
+    # Imported here, not with the other plugins, so the Deepgram path never
+    # needs it. LiveKit plugins must be imported on the main thread, at load.
+    from livekit.plugins import elevenlabs
+
+
+def make_tts():
+    """The TTS for one session, set up for DEFAULT_LANG (the greeting)."""
+    if TTS_PROVIDER != "elevenlabs":
+        return deepgram.TTS(model=VOICE_BY_LANG[DEFAULT_LANG])
+    logger.info("TTS: ElevenLabs %s, voice %s", ELEVENLABS_MODEL, ELEVENLABS_VOICE_ID)
+    extra = {"language": DEFAULT_LANG} if ELEVENLABS_MODEL in ELEVENLABS_LANGUAGE_MODELS else {}
+    return elevenlabs.TTS(
+        api_key=ELEVENLABS_API_KEY,
+        voice_id=ELEVENLABS_VOICE_ID,
+        model=ELEVENLABS_MODEL,
+        **extra,
+    )
+
 
 # Must match the greeting quoted at the top of mia_prompt.txt, which tells her
 # it has already been said.
@@ -181,7 +231,7 @@ class MiaAgent(Agent):
         an English voice.
     """
 
-    def __init__(self, tts: deepgram.TTS) -> None:
+    def __init__(self, tts) -> None:  # deepgram.TTS or elevenlabs.TTS, see make_tts
         super().__init__(instructions=MIA_SYSTEM_PROMPT)
         self._tts = tts  # held directly so we can swap the voice per turn
         self._last_confidence: float | None = None
@@ -246,6 +296,11 @@ class MiaAgent(Agent):
 
     def _speak_in(self, lang: str) -> None:
         """Point the TTS at `lang`'s voice before the next thing she says."""
+        if TTS_PROVIDER == "elevenlabs":
+            # Same voice for both languages. Only reconnects when it changes.
+            if ELEVENLABS_MODEL in ELEVENLABS_LANGUAGE_MODELS:
+                self._tts.update_options(language=lang)
+            return
         self._tts.update_options(model=VOICE_BY_LANG[lang])
 
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
@@ -292,7 +347,8 @@ async def entrypoint(ctx: JobContext) -> None:
     #
     # The TTS is held as a local so MiaAgent gets the same instance the session
     # speaks through — that's what lets it swap the voice per turn.
-    tts = deepgram.TTS(model=VOICE_BY_LANG[DEFAULT_LANG])
+    # Deepgram Aura unless TTS_PROVIDER=elevenlabs (see make_tts).
+    tts = make_tts()
 
     session = AgentSession(
         # language="multi" instead of the default en-US: this is a Montréal
