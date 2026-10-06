@@ -529,21 +529,22 @@ async def entrypoint(ctx: JobContext) -> None:
         # The default endpointing (min 0.5s / max 3.0s of silence before she
         # accepts the turn is over) reads as a long dead pause at a reception
         # desk, where turns are short and the visitor expects a near-immediate
-        # reply, so max is tightened to 1.5. min stays at 0.5: the turn closes
-        # when Deepgram's final transcript of a phrase arrives (~0.4s after
-        # the phrase ends) if min_delay has passed since the phrase ended, even
-        # if the visitor has started the next one. At 0.3 the half-second
-        # pauses between short sentences each closed a turn ("Great. Thanks.
-        # That's all. Goodbye." became four, each reply cut off by the next,
-        # and "transcript arrives after turn has been committed"). Reply
-        # latency didn't measurably change at 0.5: that ~0.4s transcript lag
-        # was already most of the wait.
+        # reply, so max is tightened to 1.5. min is 0.7: the turn closes when
+        # Deepgram's final transcript of a phrase arrives (~0.4s after the
+        # phrase ends) if min_delay has passed since the phrase ended, even if
+        # the visitor has started the next one. At 0.3 the half-second pauses
+        # between short sentences each closed a turn ("Great. Thanks. That's
+        # all. Goodbye." became four, each reply cut off by the next, and
+        # "transcript arrives after turn has been committed"); 0.5 still split
+        # it in two or three; 0.7 kept it one turn in 3 of 3 voice tests.
+        # Reply latency didn't measurably change (~3.3s end of speech to first
+        # audio at 0.3, 0.5 and 0.7): the ~0.4s transcript lag dominates.
         #
         # preemptive_tts starts synthesizing before the turn is formally closed,
         # which removes most of the remaining gap — it costs a little wasted TTS
         # when a guess is discarded, which is the right trade here.
         turn_handling={
-            "endpointing": {"min_delay": 0.5, "max_delay": 1.5},
+            "endpointing": {"min_delay": 0.7, "max_delay": 1.5},
             "preemptive_generation": {"preemptive_tts": True},
         },
         # Marks the visitor "away" once neither side has spoken for this long;
