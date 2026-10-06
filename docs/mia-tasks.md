@@ -53,7 +53,8 @@ never a schedule or a reason.
 
 ### 4. `take_message` — *done*
 Visitor name, recipient, message, optional phone or email for a reply. Sent by
-email (Resend). Unknown recipient → the general inbox (info@mobileappslabs.com).
+email (Resend). Someone not in `team.json` → nothing is sent; she says she
+can't reach them and gives the contact details.
 Mia reads the message back once before sending.
 
 ### 5. Emergency alert — *done*
