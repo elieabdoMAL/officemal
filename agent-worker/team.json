@@ -7,7 +7,17 @@
       "last_name": "Bastien",
       "role_en": "CEO",
       "role_fr": "Président-directeur général",
-      "aliases": ["Nicolas", "Bastien", "the CEO", "the boss", "le PDG", "le président", "le patron"],
+      "aliases": [
+        "Nicolas",
+        "Nic",
+        "Nick",
+        "Bastien",
+        "the CEO",
+        "the boss",
+        "le PDG",
+        "le président",
+        "le patron"
+      ],
       "email": "nbastien@mobileappslabs.com"
     },
     {
@@ -16,7 +26,15 @@
       "last_name": "Joset",
       "role_en": "COO",
       "role_fr": "Directeur des opérations",
-      "aliases": ["Alexandre", "Alex", "Joset", "the COO", "operations", "le directeur des opérations", "les opérations"],
+      "aliases": [
+        "Alexandre",
+        "Alex",
+        "Joset",
+        "the COO",
+        "operations",
+        "le directeur des opérations",
+        "les opérations"
+      ],
       "email": "ajoset@mobileappslabs.com"
     }
   ]
