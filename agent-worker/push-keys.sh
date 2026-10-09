@@ -72,7 +72,7 @@ if [ -n "$SERVER" ]; then
   pushed=$(curl -s -m 20 "https://hub.docker.com/v2/repositories/elieabdomal/simli-worker/tags/latest" \
     | grep -oE '"tag_last_pushed": ?"[^"]+"' | cut -d'"' -f4)
   pushed_s=$(date -d "$pushed" +%s 2>/dev/null || echo 0)
-  newest=$(stat -c %Y agent-worker/worker.py agent-worker/team_messages.py agent-worker/mia_prompt.txt agent-worker/team.json | sort -n | tail -1)
+  newest=$(stat -c %Y agent-worker/{worker,conversation_control,team_messages,leads,screen_cards}.py agent-worker/mia_prompt.txt agent-worker/team.json | sort -n | tail -1)
   if [ "$pushed_s" -lt "$newest" ]; then
     echo "✗ Docker Hub's worker image (pushed ${pushed:-unknown}) is older than the worker code, prompt or team.json."
     echo "  Run first:  cd agent-worker && bash build-and-push.sh"

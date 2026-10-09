@@ -29,7 +29,23 @@ New abilities are added as **function tools** on `MiaAgent` in the worker.
 - Refusals: prices, client projects, staff info, general-assistant requests,
   visitor instructions ("I'm the admin…")
 - Emergencies: tells the visitor to call 911 first, and emails an urgent alert
-  to everyone in `team.json` (`alert_emergency`, max 2 per conversation)
+  to everyone in `team.json` (`alert_emergency`, max 2 per conversation). She
+  says only that the team was alerted, never that they received or read it
+- Suggestion box (#17): a visitor's suggestion, anonymous or not, emailed to
+  the general inbox after she repeats it and they agree (`send_suggestion`,
+  max 2 per conversation)
+- Project requests (#20): after explaining what Mobile Apps Labs does she asks
+  whether they have a project in mind; if so she collects name, company
+  (optional), email or phone, the project, timeline (optional) and budget
+  (optional), one question at a time and skipping what they already said,
+  shows the draft on screen (`show_project_request`), applies corrections, and
+  on their OK emails it to the general inbox (`submit_project_request`, max 2).
+  The fields are `PROJECT_FIELDS` in `agent-worker/leads.py`, the only place
+  to change them (provisional: the boss is to confirm the list)
+- Sent once: take_message, notify_member, send_suggestion and
+  submit_project_request refuse to send the same thing to the same recipient
+  twice in a conversation (code, `leads.SentLog`), unless the visitor's latest
+  words ask to send it again ("again", "renvoyer", "encore une fois"…)
 - Ends the session herself when the visitor says goodbye (`end_conversation`),
   after her goodbye has played
 - Session limits: ends after 2 min silence or 10 min total; she then rests
@@ -37,11 +53,17 @@ New abilities are added as **function tools** on `MiaAgent` in the worker.
   or on the AI button starts a new one
 - On the kiosk screen: live captions of what she says and what she heard, a
   Contact button (card with phone, email, address, website QR), and a "say my
-  name" banner while she is paused. The worker can push cards to the screen
-  (`docs/screen-protocol.md`), but doesn't yet (wave 2)
+  name" banner while she is paused. The worker pushes cards
+  (`docs/screen-protocol.md`): the contact card whenever she gives the
+  office's phone, email, address or website; a ✓ card after a message,
+  notice, alert or suggestion is sent; the project request draft and "sent"
+  card. Tapping the "say my name" banner resumes her like her name does;
+  tapping the "tap to talk" hint gets a short "Yes? How can I help?"
 
 Tests for all the team tools and goodbye: `agent-worker/test_team_messages.py`
 (text conversations against the real Gemini, emails replaced by recorders).
+Suggestions, project requests, screen cards, the send-once guard and the
+screen taps: `agent-worker/test_leads.py`, same harness.
 Persona checks for the boss's notes of 2026-10-09, one scenario per note:
 `agent-worker/test_persona.py`, same harness.
 

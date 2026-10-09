@@ -2,7 +2,9 @@
 
 How the worker (`agent-worker/worker.py`) and the kiosk panel
 (`src/components/SimliLiveKitPanel.tsx`) talk about what is on screen. Screen
-side: `src/lib/screenProtocol.ts`. Change both sides together.
+side: `src/lib/screenProtocol.ts`; worker side: `agent-worker/screen_cards.py`
+(message builders, topics, when the contact card comes up). Change both sides
+together.
 
 Everything goes through the LiveKit room the kiosk joins for each session.
 Participants in that room: the visitor (the kiosk browser), the worker
@@ -59,7 +61,9 @@ Keep the session's transcription output on (it is by default).
 
 ## 3. Screen cards: `mia.screen` (worker → screen)
 
-One text stream per message, body is JSON with a `type`:
+**The worker sends all of these (wave 2, Chat L)**, one at a time and in
+order; a failed send is logged and never interrupts the conversation. One text
+stream per message, body is JSON with a `type`:
 
 ```python
 await ctx.room.local_participant.send_text(
@@ -68,36 +72,55 @@ await ctx.room.local_participant.send_text(
 )
 ```
 
-| `type` | Fields | Screen | Send when (wave 2) |
+| `type` | Fields | Screen | The worker sends it |
 |---|---|---|---|
-| `contact_card` | `lang?` | Card on the right of the frame: phone, email, address, website, QR code to the website. Closes after 45 s or on ×. Same card as the panel's Contact button. | The visitor asks for contact details / the phone number (#6, #18). |
-| `message_sent` | `kind?`, `to?`, `lang?` | Green ✓ card, closes after 10 s. Text by `kind`: `message` "Message sent to {to}", `notify` "{to} has been told you're here", `alert` "The team has been alerted", `suggestion` "Suggestion sent — thank you!", `project_request` "Project request sent". Without `to`: "Message sent" / "The team has been told you're here". | After the tool succeeded (`take_message` → SENT, `notify_member` → NOTIFIED, `alert_emergency` → ALERTED, the suggestion and project-request tools), in the same turn she says so (#3). |
-| `dismiss` | – | Closes the current card. | The conversation moved on. |
+| `contact_card` | `lang?` | Card on the right of the frame: phone, email, address, website, QR code to the website. Closes after 45 s or on ×. Same card as the panel's Contact button. | When her words give the office's phone, email, address or website (`gives_contact_details`, checked in `transcription_node`, so only for speech that is actually played; once per reply). The visitor's own 514 number or email read back doesn't count. Skipped while another card of hers is up (a `message_sent` for 10 s, a draft `project_request` for 180 s), so "you can also call us at…" never replaces them. |
+| `message_sent` | `kind?`, `to?`, `lang?` | Green ✓ card, closes after 10 s. Text by `kind`: `message` "Message sent to {to}", `notify` "{to} has been told you're here", `alert` "The team has been alerted", `suggestion` "Suggestion sent — thank you!", `project_request` "Project request sent". Without `to`: "Message sent" / "The team has been told you're here". | When the tool succeeds, before she says so (#3): `take_message` → SENT (`kind` `message`, `to` the person's name, or the general inbox's name in her language: "the general inbox" / "la boîte de réception générale"), `notify_member` → NOTIFIED (`notify`, `to` the person), `alert_emergency` → ALERTED (`alert`, no `to`), `send_suggestion` → SENT (`suggestion`). Again when a tool refuses a repeat send ("already sent"), since it is. A project request uses its own card (below), not `kind: project_request`. |
+| `project_request` | `status`, `fields`, `lang?` | The project request form (#20), see below. | `show_project_request` (`draft`) and `submit_project_request` (`sent`). |
+| `dismiss` | – | Closes the current card. | Not used yet. |
 
-`lang` (`fr`/`en`) overrides `mia.language` for that card. `to` is shown as
-given (keep it to a display name: "Nicolas Bastien", not an email address).
+`lang` (`fr`/`en`) overrides `mia.language` for that card. The worker always
+sets it to the session language once the visitor has chosen one, and leaves it
+out before. `to` is shown as given (keep it to a display name: "Nicolas
+Bastien", not an email address).
 One card at a time: a new one replaces the current one. Unknown types and bad
 JSON are ignored (logged in the browser console), so the worker can start
 sending a new type before the screen draws it.
 
-Planned, not drawn yet (wave 2, #20):
+### The project request card (#20)
 
 ```json
-{"type": "project_request", "status": "draft" | "sent",
- "fields": {"name": "", "company": "", "email": "", "phone": "", "description": "", "budget": "", "timeline": ""}}
+{"type": "project_request", "status": "draft",
+ "fields": {"name": "Ana Silva", "company": "Pain Doré", "email": "ana@paindore.ca", "phone": "",
+            "description": "A loyalty app for my bakery", "timeline": "Within three months", "budget": ""},
+ "lang": "en"}
 ```
 
-`draft`: show the form she filled in, for the visitor to check before she
-sends it; `sent`: show it as sent. Field list to be confirmed with the boss.
+- `draft`: "Your project request" with every field (blank ones as "—") and
+  "Please check it and tell {name} what to change", amber top edge. Stays up
+  180 s (each update restarts that) while the visitor reads it and she applies
+  corrections; she sends a new draft after each correction.
+- `sent`: green ✓ "Project request sent", only the filled fields, "The team
+  will get back to you". Closes after 15 s.
+- `fields` is drawn in the order received. The field list lives in one place,
+  `PROJECT_FIELDS` in `agent-worker/leads.py` (provisional until the boss
+  confirms it); the screen has labels for the seven above and shows any other
+  key under its own name (`extra_field` → "extra field") until it gets one in
+  `PROJECT_LABEL` (`src/components/MiaScreenCards.tsx`). Values are capped at
+  600 characters; the description is clamped to 4 lines, other values to 2.
+- Any card, and so a draft holding the visitor's name, email and phone, is
+  cleared when the session ends: it never waits for the next visitor.
 
 ## 4. Taps: `mia.control` (screen → worker)
 
-The screen sends one text stream per tap, JSON with a `type`, to the room:
+The screen sends one text stream per tap, JSON with a `type`, to the room.
+**The worker handles both (wave 2, Chat L)**, in `MiaAgent.resume_by_tap` and
+`wake_by_tap`:
 
-| `type` | When | Worker should |
+| `type` | When | Worker does |
 |---|---|---|
-| `resume` | Visitor tapped the "say my name" banner while `paused`. | Do what hearing her name does: set `mia.state` back to `listening` and answer. |
-| `wake` | Visitor tapped the "Say {name} or tap to talk" hint (in session, listening, nobody spoke for 12 s). | Optional: a short "Yes? How can I help?". The mic is already open, so ignoring it is fine. |
+| `resume` | Visitor tapped the "say my name" banner while `paused`. | What hearing her name alone does: `mia.state` back to `listening` (which cancels the pause timeout), then Gemini says in a few words that she's listening, in the session language. Ignored when she isn't paused. |
+| `wake` | Visitor tapped the "Say {name} or tap to talk" hint (in session, listening, nobody spoke for 12 s). | Says "Yes? How can I help?" / "Oui ? Comment puis-je vous aider ?" in the session language ("Oui? Yes? Français ou English?" before one is chosen), only if she is listening and idle: ignored while paused, speaking, thinking or while the visitor is talking. |
 
 ```python
 def on_control(reader, participant_identity):
@@ -109,8 +132,7 @@ def on_control(reader, participant_identity):
 ctx.room.register_text_stream_handler("mia.control", on_control)
 ```
 
-Without a handler the worker just ignores these: until it handles `resume`,
-the banner stays up after a tap and the visitor has to say her name.
+Unknown types and bad JSON are logged and ignored.
 
 ## 5. Kiosk page ↔ embed (window messages)
 
