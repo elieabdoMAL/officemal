@@ -1,0 +1,98 @@
+{
+  "_about": "Voice scenarios for tests/voice/run.mjs. lines: [text, seconds of silence after it, optional voice] (voices in make-wavs.mjs: en, fr, en2 = a second English speaker, fr2). The WAV starts when the kiosk opens the mic, after her greeting. groups: run a whole group by name (e.g. `wave1`). expect: say / notSay = what the recording of her audio must / must not contain (Deepgram transcript; a string is a phrase, \"/re/\" a regex, an array means any one of them; digit words are also matched as digits, so \"/5 1 4/\" matches 'five one four' and '514'); said / notSaid = the same against the text the worker logged for her (before TTS); tools / notTools = take_message, notify_member, alert_emergency, end_conversation, pause, wake, switch; logs / notLogs = regexes on worker log messages; lang = every line she said after the greeting is in this language; ended = the session ended by itself. Goodbye scenarios also require her goodbye in the recording: the room must not close before it plays.",
+
+  "lang_fr": {
+    "groups": ["wave1"],
+    "about": "Language choice: 'Français' locks French (STT fr-CA, French voice), she stays French and ends on goodbye.",
+    "voice": "fr",
+    "lines": [["Français.",11], ["Bonjour, qu'est-ce que vous faites chez Mobile Apps Labs ?",16], ["Et où sont vos bureaux ?",16], ["Merci beaucoup, au revoir !",20]],
+    "expect": {"logs": ["language locked: fr"], "lang": "fr", "say": [["/sainte|turgeon|virtuel/"], ["/au revoir|bonne journee/"]], "tools": ["end_conversation"], "notTools": ["switch"], "ended": true}
+  },
+  "lang_en": {
+    "groups": ["wave1"],
+    "about": "Language choice: 'English, please' locks English, she stays English and ends on goodbye.",
+    "voice": "en",
+    "lines": [["English, please.",11], ["What does Mobile Apps Labs do?",16], ["Okay. And where is the office?",16], ["Thanks, that's all. Bye!",20]],
+    "expect": {"logs": ["language locked: en"], "lang": "en", "say": [["/sainte|turgeon|virtual/"], ["/bye/"]], "tools": ["end_conversation"], "notTools": ["switch"], "ended": true}
+  },
+  "pause_wake": {
+    "groups": ["wave1"],
+    "about": "Pause (#24/#25): 'Stop talking' while she answers stops her and she says how to call her back; two lines from someone else are ignored; her name wakes her and she answers the question.",
+    "voice": "en",
+    "lines": [["English.",11], ["What does Mobile Apps Labs do? Tell me everything.",4], ["Stop talking.",8], ["So anyway, the meeting moved to three o'clock.",5, "en2"], ["Did you bring the contract? I'll call Nicolas about it tomorrow.",7, "en2"], ["Mia, what's your phone number?",16]],
+    "expect": {"tools": ["pause", "wake"], "logs": ["paused, ignored"], "say": [["stop talking"], ["/say my name|mia/"], ["/5 1 4 5 7 3 2 3 2 4/"]], "notSay": ["contract", "three o'clock"], "notTools": ["take_message", "notify_member"], "ended": false}
+  },
+  "phone_en": {
+    "groups": ["wave1"],
+    "about": "Phone number (#6), then slowly: digits in groups, then one by one; never 'five hundred fourteen'.",
+    "voice": "en",
+    "lines": [["English.",11], ["What's your phone number?",14], ["Sorry, can you say it again slowly?",22]],
+    "expect": {"say": [["/5 1 4 5 7 3 2 3 2 4 .*5 1 4 5 7 3 2 3 2 4/"]], "notSay": ["/hundred|thousand|fourteen|seventy|thirty|twenty/"], "said": ["/one, five, one, four, five/"], "ended": false}
+  },
+  "phone_fr": {
+    "groups": ["wave1"],
+    "about": "Numéro de téléphone (#6), puis lentement : chiffres groupés, puis un par un ; jamais « cinq cent quatorze ».",
+    "voice": "fr",
+    "lines": [["Français.",11], ["Quel est votre numéro de téléphone ?",14], ["Pouvez-vous le répéter lentement, s'il vous plaît ?",22]],
+    "expect": {"lang": "fr", "say": [["/5 1 4 5 7 3 2 3 2 4 .*5 1 4 5 7 3 2 3 2 4/"]], "notSay": ["/cent|mille|quatorze|soixante|vingt|trente/"], "said": ["/un, cinq, un, quatre, cinq/"], "ended": false}
+  },
+  "talk_someone": {
+    "groups": ["wave1"],
+    "about": "Talk to someone (#10): asks the name, notifies the visitor contact (Nicolas), says so and offers a message; ends on goodbye.",
+    "voice": "en",
+    "lines": [["English.",11], ["Hi, I'd like to talk to someone, please.",10], ["My name is Paul Lavoie.",16], ["No, that's fine. Thanks, goodbye!",20]],
+    "expect": {"tools": ["notify_member", "end_conversation"], "notTools": ["take_message"], "say": [["/nich?olas|nicola/"], ["message"], ["/bye/"]], "ended": true}
+  },
+  "infiniview": {
+    "groups": ["wave1"],
+    "about": "Infini-View (#7/#8): yes she is in Infini-View, touch and pan to move, demo reel web address, the door for a live demo.",
+    "voice": "en",
+    "lines": [["English.",11], ["Are you in Infini-View?",14], ["How do I move around in here?",14], ["Where can I see a demo?",16]],
+    "expect": {"say": [["/infini|infinity/"], ["/touch|pan|slid|swip|drag/"], ["door"]], "said": ["/infini dash view/"], "ended": false}
+  },
+  "virtual_office": {
+    "groups": ["wave1"],
+    "about": "Virtual office (#5): where is the office -> virtual office + 74 Turgeon Street; 'I'm already at your door' -> she is virtual, offers to let someone know.",
+    "voice": "en",
+    "lines": [["English.",11], ["Where is your office exactly?",14], ["I'm already here, I'm at your door right now.",16]],
+    "expect": {"say": [["virtual"], ["/turgeon|sainte/"]], "notTools": ["notify_member"], "ended": false}
+  },
+  "qa_en": {
+    "groups": ["core"],
+    "voice": "en",
+    "lines": [["English.",11], ["Hi! What does Mobile Apps Labs do?",16], ["Where is your office?",16]],
+    "expect": {"lang": "en", "say": [["/turgeon|sainte/"]], "ended": false}
+  },
+  "message_fr": {
+    "groups": ["core"],
+    "voice": "fr",
+    "lines": [["Français.",11], ["Bonjour, je voudrais laisser un message pour le PDG.",12], ["Je m'appelle Julie Tremblay.",12], ["Dites-lui que je passerai demain matin pour signer le contrat.",16], ["Oui, c'est bien ça. Pas besoin de me rappeler.",14]],
+    "expect": {"lang": "fr", "tools": ["take_message"], "say": ["/envoye/"], "ended": false}
+  },
+  "notify_en": {
+    "groups": ["core"],
+    "voice": "en",
+    "lines": [["English.",11], ["Hi, I'm here to see Alex, I have a meeting with him at two.",12], ["My name is David Chen.",16]],
+    "expect": {"tools": ["notify_member"], "say": [["/alex/"]], "ended": false}
+  },
+  "emergency": {
+    "groups": ["core"],
+    "about": "911 first, in the same reply as the alert.",
+    "voice": "en",
+    "lines": [["English.",11], ["Help! There's smoke coming from the hallway!",18]],
+    "expect": {"tools": ["alert_emergency"], "say": ["/9 1 1/"], "said": ["/\\| [^.!?|]*nine one one/"], "ended": false}
+  },
+  "goodbye": {
+    "groups": ["core"],
+    "voice": "en",
+    "lines": [["English.",11], ["What's your phone number?",14], ["Great, thanks. That's all, goodbye!",20]],
+    "expect": {"tools": ["end_conversation"], "ended": true, "say": [["/bye/"]]}
+  },
+  "idle": {
+    "groups": ["slow"],
+    "about": "Silence after the language choice: the session ends by itself at SESSION_IDLE_TIMEOUT (120s).",
+    "voice": "en",
+    "lines": [["English.",140]],
+    "expect": {"logs": ["/ending session in \\S+: idle/"], "ended": true}
+  }
+}
