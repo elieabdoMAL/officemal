@@ -11,9 +11,12 @@ LiveKit room the browser joins and runs:
 Trinity face lip-synced to the TTS audio and publishes the video+audio into the
 room; the browser subscribes to it.
 
-She is bilingual (FR/EN): the STT runs multilingual and reports the language of
-each utterance, and the Aura voice is swapped to match before she replies
-(ElevenLabs keeps one multilingual voice for both).
+She is bilingual (FR/EN): she greets in both and asks which one, then locks the
+conversation to the visitor's choice — the STT listens in that language only,
+the Aura voice matches it (ElevenLabs keeps one multilingual voice for both),
+and Gemini is told every turn to reply in it — until the visitor explicitly
+asks to switch. "Stop talking" pauses her until her name is said. What the
+visitor's words mean for this is decided in conversation_control.py.
 
 Run:
     python worker.py dev      # local dev + hot reload (test via LiveKit Sandbox)
@@ -21,15 +24,18 @@ Run:
 
 Env (see env.example): SIMLI_API_KEY, SIMLI_FACE_ID, GOOGLE_API_KEY,
 DEEPGRAM_API_KEY, LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET.
-Optional: SESSION_IDLE_TIMEOUT, SESSION_MAX_LENGTH, LIVEKIT_AGENT_NAME,
-TTS_PROVIDER, ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID, ELEVENLABS_MODEL.
+Optional: ASSISTANT_NAME, SESSION_IDLE_TIMEOUT, SESSION_MAX_LENGTH,
+PAUSE_TIMEOUT, LIVEKIT_AGENT_NAME, TTS_PROVIDER, ELEVENLABS_API_KEY,
+ELEVENLABS_VOICE_ID, ELEVENLABS_MODEL.
 The LIVEKIT_* vars are read automatically by the agents framework.
 """
 
 import asyncio
 import logging
 import os
+import re
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -43,8 +49,17 @@ from livekit.agents import (
     cli,
     function_tool,
 )
+from livekit.agents.stt import SpeechEventType
 from livekit.plugins import deepgram, google, simli
 
+from conversation_control import (
+    language_choice,
+    language_switch,
+    only_name,
+    says_name,
+    speak_digits_stream,
+    wants_pause,
+)
 from team_messages import (
     find_member,
     is_real_name,
@@ -60,6 +75,16 @@ logger.setLevel(logging.INFO)
 
 load_dotenv(override=True)
 
+# Her name, in one place: the prompt's {ASSISTANT_NAME}, the "say my name" line
+# when she pauses, the name that wakes her, and the screen (mia.name). The boss
+# may rename her (e.g. ASSISTANT_NAME=Linda); nothing else needs to change.
+ASSISTANT_NAME = os.environ.get("ASSISTANT_NAME", "").strip() or "Mia"
+
+# She opens in both languages and asks which one; the visitor's answer locks
+# the conversation to it (MiaAgent._language_note). The prompt quotes this line
+# as {FIRST_MESSAGE}, so it knows the question has been asked.
+FIRST_MESSAGE = "Bonjour, hello! Français ou English?"
+
 # Mia's persona, rules and company knowledge. The worker is the only place her
 # prompt lives: Simli just renders the face, so a prompt saved in the Simli
 # dashboard is never used. Kept in its own file so it can be edited without
@@ -69,9 +94,16 @@ PROMPT_FILE = Path(__file__).with_name("mia_prompt.txt")
 # The TEAM section is generated from team.json, so the people she names and the
 # people take_message / notify_member accept can never drift apart.
 TEAM = load_team()
-MIA_SYSTEM_PROMPT = (
-    PROMPT_FILE.read_text(encoding="utf-8").strip() + "\n\n" + team_prompt_section(TEAM)
-)
+
+
+def load_prompt() -> str:
+    """mia_prompt.txt with its placeholders filled. str.replace, not format():
+    the prompt may contain braces of its own."""
+    text = PROMPT_FILE.read_text(encoding="utf-8").strip()
+    return text.replace("{ASSISTANT_NAME}", ASSISTANT_NAME).replace("{FIRST_MESSAGE}", FIRST_MESSAGE)
+
+
+MIA_SYSTEM_PROMPT = load_prompt() + "\n\n" + team_prompt_section(TEAM)
 
 # Per conversation. A kiosk is open to anyone; this stops someone filling the
 # team's inboxes from it.
@@ -87,10 +119,35 @@ MAX_EMERGENCY_ALERTS_PER_SESSION = 2
 # it means her English is unchanged by all this. The French voices are fr-FR
 # only; Aura has no fr-CA, so expect a France accent rather than a Québec one.
 VOICE_BY_LANG = {"fr": "aura-2-agathe-fr", "en": "aura-2-andromeda-en"}
+# Words the French Aura voice can't say, respelled for it (audio only).
+FRENCH_VOICE_RESPELL = re.compile(r"\bEnglish\b")
 
-# Language she opens in, before anyone has spoken: the prompt says greet in
-# French by default, and she switches as soon as the visitor speaks English.
+# Voice for the bilingual greeting and anything said before the visitor has
+# chosen: the French voice says "hello" well enough (and "English" respelled,
+# FRENCH_VOICE_RESPELL); the English one mangles "Français".
 DEFAULT_LANG = "fr"
+
+# Deepgram language once the visitor has chosen. A single-language model is
+# more accurate than "multi" (which also misreads English as French now and
+# then, the "she mixes English" complaint), and can't flip the conversation.
+# fr-CA: this is a Québec lobby.
+STT_LANGUAGE = {"fr": "fr-CA", "en": "en"}
+STT_MULTI = "multi"
+
+# Words Deepgram should expect (keyterm prompting, nova-3). Without them, in
+# testing, "Mia, vous êtes là?" came back as "Vous êtes là?" and "Tais-toi" as
+# "Qu'est-toi". The language names let a locked STT still catch "French
+# please" said in English, and the reverse.
+STT_KEYTERMS = [ASSISTANT_NAME, "assistante", "tais-toi", "English", "anglais", "French", "français"]
+
+# A French-locked STT still writes out English, roughly; an English-locked one
+# returns nothing at all for French. So when speech produces no transcript this
+# many times in a row, she goes back to listening in both languages (her reply
+# language stays locked) until a turn is understood — enough for a French
+# visitor to be heard asking "en français, s'il vous plaît".
+UNHEARD_BEFORE_WIDENING = 2
+# How long after the visitor stops speaking a transcript may still arrive.
+UNHEARD_AFTER_S = 2.5
 
 # Optional ElevenLabs voice instead of Aura: TTS_PROVIDER=elevenlabs plus an
 # ELEVENLABS_API_KEY. One multilingual ElevenLabs voice speaks both languages,
@@ -139,10 +196,6 @@ def make_tts():
     )
 
 
-# Must match the greeting quoted at the top of mia_prompt.txt, which tells her
-# it has already been said.
-FIRST_MESSAGE = "Bonjour, bienvenue chez Mobile Apps Labs. Que puis-je faire pour vous ?"
-
 # She now listens continuously (the browser leaves the mic open), so the room's
 # background noise reaches Deepgram all day. Rather than let Gemini improvise on
 # a garbled transcript, bounce anything too weak to act on — in the language she
@@ -161,6 +214,19 @@ MIN_STT_CONFIDENCE = 0.5
 # Sub-threshold transcripts are usually 1-2 stray characters or a lone filler.
 MIN_TRANSCRIPT_CHARS = 3
 FILLER_ONLY = {"uh", "um", "hmm", "mhm", "ah", "eh", "oh", "hm", "huh"}
+
+# Before the visitor has chosen a language, "I didn't get that" would have to
+# guess one, so she asks the question again instead. Also said, once, when
+# speech gives no transcript at all: Deepgram's live stream can return nothing
+# for a lone "Français.", the likeliest answer to her greeting.
+ASK_LANGUAGE_AGAIN = "Pardon? Français ou English?"
+
+# Said once, by the worker, when the visitor asks her to stop talking (#24,
+# #25). Then she ignores everything until her name is said.
+PAUSE_LINE = {
+    "en": f"No problem, I'll stop talking. If you want to talk to me, just say my name, {ASSISTANT_NAME}.",
+    "fr": f"Pas de problème, j'arrête de parler. Si vous voulez me parler, dites simplement mon nom, {ASSISTANT_NAME}.",
+}
 
 
 def _env_int(name: str, default: int) -> int:
@@ -188,6 +254,11 @@ def _env_int(name: str, default: int) -> int:
 # her until the next visitor taps the AI button.
 SESSION_IDLE_TIMEOUT = _env_int("SESSION_IDLE_TIMEOUT", 120)
 SESSION_MAX_LENGTH = _env_int("SESSION_MAX_LENGTH", 600)
+# PAUSE_TIMEOUT: paused ("stop talking") and not called back by name for this
+#   long, the session ends, quietly — she said she'd stop talking. Speech she
+#   ignores while paused doesn't count as activity: two people chatting next to
+#   her would otherwise keep a paused session (and its bill) open to the cap.
+PAUSE_TIMEOUT = _env_int("PAUSE_TIMEOUT", SESSION_IDLE_TIMEOUT)
 
 # Simli's own limits, kept 30s behind ours as a backstop: if this worker ever
 # fails to end a session, Simli still stops rendering (and billing) by itself.
@@ -242,6 +313,33 @@ def _normalize_lang(code: str | None) -> str:
 
 LANGUAGE_NAMES = {"fr": "French", "en": "English"}
 
+# Per-turn instructions to Gemini (added to that turn only, never saved). The
+# prompt's LANGUAGE and PAUSING sections describe them.
+CHOSEN_NOTE = (
+    "The visitor chose {name} for this conversation. Reply only in {name} from now on. "
+    "If they only named the language, say in a few words that you will continue in {name} "
+    "and ask how you can help."
+)
+LOCKED_NOTE = (
+    "The conversation language is {name}. Reply only in {name}, even if the visitor's words "
+    "look like another language. It changes only when the system tells you the visitor asked."
+)
+SWITCHED_NOTE = (
+    "The visitor asked to switch to {name}. Reply only in {name} from now on: confirm the "
+    "switch in a few words, then answer anything else they asked."
+)
+# After a pause, by whether the visitor only called her ("Mia?") or called her
+# with a request ("Mia, what's your number?"): Gemini, told "if they only said
+# your name", answered the request with "I'm listening" in testing.
+WOKEN_NOTE = (
+    "You were paused and the visitor just called you back by name; you heard nothing in "
+    "between. Say in a few words that you are listening and ask how you can help."
+)
+WOKEN_ASKING_NOTE = (
+    "You were paused and the visitor just called you back by name; you heard nothing in "
+    "between. Answer what they are asking now, directly: do not say that you are listening."
+)
+
 
 def _assistant_texts(handle) -> list[str]:
     """What she has said so far in this turn (one entry per LLM step)."""
@@ -260,8 +358,7 @@ def _assistant_lines(handle) -> int:
 def _reply_language_note(code: str) -> str:
     """Per-turn instruction telling Gemini which language to answer in."""
     if code in LANGUAGE_NAMES:
-        name = LANGUAGE_NAMES[code]
-        return f"The visitor just spoke {name}. Reply only in {name}."
+        return LOCKED_NOTE.format(name=LANGUAGE_NAMES[code])
     return (
         f"The visitor just spoke a language other than French or English "
         f"(language code {code}). Follow the LANGUAGE rule: say in English that "
@@ -269,45 +366,151 @@ def _reply_language_note(code: str) -> str:
     )
 
 
-class MiaAgent(Agent):
-    """Mia: bilingual, and unwilling to answer transcripts she can't trust.
+@dataclass
+class TurnPlan:
+    """What to do with one visitor turn (MiaAgent._plan_turn).
 
-    Both behaviours hang off `stt_node`, the one place Deepgram's per-alternative
-    metadata is still attached to the event:
-      * `confidence` — gates the turn. The transcript is checked too, because
-        confidence reads high on a clean recording of someone clearing their
-        throat.
-      * `language` — Deepgram returns this per utterance when the STT runs with
-        language="multi". It picks the voice for the reply, and is also handed
-        to Gemini each turn: the prompt alone can't hold her to the visitor's
-        language — after a French greeting she drifts into French replies to
-        English questions — and the voice would then speak French text with
-        an English voice.
+    note: reply through Gemini, with this system note for the turn.
+    say: say this line instead, without Gemini.
+    Neither: ignore the turn (she is paused).
     """
 
-    def __init__(self, tts, on_goodbye: Callable[[str], None] | None = None) -> None:
+    note: str = ""
+    say: str = ""
+
+
+class MiaAgent(Agent):
+    """Mia: bilingual, pausable, and unwilling to answer transcripts she can't trust.
+
+    Every visitor turn goes through `_plan_turn`, in code, before Gemini sees it:
+      * paused: ignored entirely (no reply, no LLM call) unless it has her name.
+      * "stop talking" and friends: she pauses and says PAUSE_LINE.
+      * low confidence or too short: "sorry, I didn't get that", no LLM call.
+      * otherwise Gemini replies, told which language to use (`_language_note`).
+
+    Language: the first real answer to her "Français ou English?" locks the
+    conversation, STT and voice included; after that only an explicit request
+    ("can we speak French") switches it. Per-turn auto-switching on Deepgram's
+    language guess is gone: it misfired on short or accented English.
+
+    `stt_node` is the one place Deepgram's per-alternative metadata is still
+    attached to the event: `confidence` gates the turn (the transcript is
+    checked too, because confidence reads high on a clean recording of someone
+    clearing their throat) and `language` is what Deepgram heard while the STT
+    still runs "multi" (before the choice, or widened, see UNHEARD_*).
+    """
+
+    def __init__(
+        self,
+        tts,
+        stt=None,
+        on_goodbye: Callable[[str], None] | None = None,
+        on_status: Callable[[], None] | None = None,
+    ) -> None:
         # tts: deepgram.TTS or elevenlabs.TTS, see make_tts
+        # stt: the session's deepgram.STT, so the language lock can retune it
         super().__init__(instructions=MIA_SYSTEM_PROMPT)
         # Ends the session the way the idle limit does (entrypoint's
         # end_session). end_conversation calls it once her goodbye is reported
         # played, with the words she said, so the room is held open long
         # enough for them to actually reach the kiosk (see goodbye_grace).
         self._on_goodbye = on_goodbye
+        # Called whenever `paused` or `chosen_language` changes (screen
+        # attributes, pause timeout: see entrypoint).
+        self._on_status = on_status
         self._ending = False
         self._tts = tts  # held directly so we can swap the voice per turn
+        self._stt_ctl = stt  # not _stt: that is the base class slot
+        self._stt_language = STT_MULTI
         self._last_confidence: float | None = None
         self._last_language: str = DEFAULT_LANG
         # Deepgram's code before _normalize_lang folds it to fr/en: "es" etc.
         # still needs to reach Gemini, which offers French or English to them.
         self._last_raw_language: str = DEFAULT_LANG
+        self._chosen_language: str | None = None
+        self._voice_language = DEFAULT_LANG  # the voice _speak_in last picked
+        self._asked_again = False  # ASK_LANGUAGE_AGAIN said for unheard speech
+        self._paused = False
+        # Visitor speech (VAD) counted, vs. the last one that gave a transcript.
+        self._speech_id = 0
+        self._heard_speech_id = 0
+        self._unheard = 0
         self._messages_sent = 0
         self._notifications_sent = 0
         self._emergency_alerts_sent = 0
 
     @property
     def language(self) -> str:
-        """The language the visitor last spoke — the one to say goodbye in."""
-        return self._last_language
+        """The language she speaks now: the visitor's choice, or before they've
+        made one, what they last spoke."""
+        return self._chosen_language or self._last_language
+
+    @property
+    def chosen_language(self) -> str | None:
+        return self._chosen_language
+
+    @property
+    def paused(self) -> bool:
+        return self._paused
+
+    def _status_changed(self) -> None:
+        if self._on_status is not None:
+            self._on_status()
+
+    def _set_paused(self, paused: bool) -> None:
+        if paused != self._paused:
+            self._paused = paused
+            logger.info("paused" if paused else "resumed")
+            self._status_changed()
+
+    def _listen_in(self, lang: str | None) -> None:
+        """Point the STT at `lang`, or at both languages (None)."""
+        wanted = STT_LANGUAGE[lang] if lang else STT_MULTI
+        if self._stt_ctl is None or wanted == self._stt_language:
+            return
+        logger.info("STT language %s -> %s", self._stt_language, wanted)
+        self._stt_ctl.update_options(language=wanted)  # reconnects Deepgram's stream
+        self._stt_language = wanted
+
+    def _choose_language(self, lang: str) -> None:
+        self._unheard = 0
+        self._listen_in(lang)
+        if lang != self._chosen_language:
+            logger.info("language locked: %s", lang)
+            self._chosen_language = lang
+            self._status_changed()
+
+    def _stop_speaking(self) -> None:
+        """Cut her current reply off now (and any reply being prepared)."""
+        try:
+            self.session.interrupt()
+        except RuntimeError:
+            pass  # her goodbye or the pause line: those always finish
+
+    def user_started_speaking(self) -> None:
+        self._speech_id += 1
+
+    async def check_heard(self) -> None:
+        """After the visitor stops speaking: did the STT make anything of it?"""
+        speech = self._speech_id
+        await asyncio.sleep(UNHEARD_AFTER_S)
+        if self._heard_speech_id >= speech or self._speech_id != speech:
+            return
+        self._unheard += 1
+        if self._unheard >= UNHEARD_BEFORE_WIDENING and self._stt_language != STT_MULTI:
+            logger.info("%d utterances without a transcript: listening in both languages", self._unheard)
+            self._listen_in(None)
+        elif (
+            self._chosen_language is None
+            and not self._asked_again
+            and not self._paused
+            and self.session.agent_state == "listening"
+        ):
+            # Once only: in an empty lobby, noise would have her asking forever.
+            logger.info("speech without a transcript before a language was chosen: asking again")
+            self._asked_again = True
+            self._speak_in(DEFAULT_LANG)
+            self.session.say(ASK_LANGUAGE_AGAIN)
 
     async def stt_node(self, audio, model_settings):
         async for event in super().stt_node(audio, model_settings):
@@ -320,7 +523,51 @@ class MiaAgent(Agent):
                 if language:
                     self._last_raw_language = str(language).split("-")[0].lower()
                     self._last_language = _normalize_lang(str(language))
+                text = alternatives[0].text or ""
+                kind = getattr(event, "type", None)
+                if text.strip() and kind == SpeechEventType.FINAL_TRANSCRIPT:
+                    self._heard_speech_id = self._speech_id
+                    self._unheard = 0
+                # "Stop talking" cuts her off on the first interim transcript
+                # that has it, not when the turn ends ~1s later. (Any speech
+                # over half a second interrupts her anyway; a short "Stop!"
+                # may not.) The pause itself happens in _plan_turn.
+                if (
+                    not self._paused
+                    and kind in (SpeechEventType.INTERIM_TRANSCRIPT, SpeechEventType.FINAL_TRANSCRIPT)
+                    and self.session.agent_state in ("speaking", "thinking")
+                    and wants_pause(text, ASSISTANT_NAME)
+                ):
+                    logger.info("stop request heard while speaking: %r", text)
+                    self._stop_speaking()
             yield event
+
+    async def llm_node(self, chat_ctx, tools, model_settings):
+        # Paused means no LLM calls at all. Turns are already dropped in
+        # _plan_turn, but preemptive generation starts Gemini on the transcript
+        # before the turn is even complete.
+        if self._paused:
+            return
+        async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
+            yield chunk
+
+    async def tts_node(self, text, model_settings):
+        # Phone numbers and long digit runs are spoken digit by digit (#6):
+        # Gemini writes "573 2324" or "5732324" however the prompt asks, and
+        # the TTS would say "five million ...". Only the audio changes: the
+        # transcript (and on-screen captions) keep the digits.
+        spoken = speak_digits_stream(text, lambda: self._voice_language)
+        if TTS_PROVIDER == "deepgram":
+            spoken = self._french_voice_respell(spoken)
+        async for frame in Agent.default.tts_node(self, spoken, model_settings):
+            yield frame
+
+    async def _french_voice_respell(self, text):
+        # Aura's French voice reads "English" the French way: in her greeting
+        # ("Français ou English?") the kiosk recording was transcribed as
+        # "ambiche". Spelled "Inglish" it comes out as English.
+        async for chunk in text:
+            yield FRENCH_VOICE_RESPELL.sub("Inglish", chunk) if self._voice_language == "fr" else chunk
 
     @function_tool()
     async def take_message(
@@ -456,8 +703,88 @@ class MiaAgent(Agent):
         logger.info("end_conversation: no goodbye yet, asking for one")
         return "Ending now. Say a short, warm goodbye in the visitor's language. Do not call any tool."
 
+    @function_tool()
+    async def pause_conversation(self, context: RunContext) -> None:
+        """Stop talking and listening until the visitor says your name.
+
+        Call this, without saying anything yourself, when the visitor asks you
+        to stop talking, be quiet or wait while they talk to someone else, in
+        whatever words. It tells them how to call you back. Never call it for
+        a goodbye: that is end_conversation.
+        """
+        # The usual phrasings never reach Gemini (_plan_turn pauses on them
+        # first); this catches the rest. The line is said here, not by Gemini:
+        # once paused, llm_node makes no more calls, and the wording must be
+        # the same every time.
+        logger.info("pause_conversation called")
+        self._set_paused(True)
+        self.session.say(PAUSE_LINE[self.language], allow_interruptions=False)
+        return None  # no reply after the tool
+
+    def _language_note(self, text: str) -> str:
+        """Lock, keep or switch the conversation language; the note for Gemini."""
+        if self._chosen_language is None:
+            # The answer to "Français ou English?": a language named, or else
+            # the language they answered in.
+            heard = self._last_raw_language if self._last_raw_language in LANGUAGE_NAMES else None
+            choice = language_choice(text) or heard
+            if choice is None:
+                return _reply_language_note(self._last_raw_language)  # offer FR/EN
+            self._choose_language(choice)
+            return CHOSEN_NOTE.format(name=LANGUAGE_NAMES[choice])
+        switch = language_switch(text, self._chosen_language)
+        if switch is not None:
+            logger.info("visitor asked to switch to %s", switch)
+            self._choose_language(switch)
+            return SWITCHED_NOTE.format(name=LANGUAGE_NAMES[switch])
+        self._listen_in(self._chosen_language)  # back from "both", if widened
+        return _reply_language_note(self._chosen_language)
+
+    def _plan_turn(self, text: str, confidence: float | None) -> TurnPlan:
+        """Decide what one visitor turn gets. Updates pause and language state."""
+        woken = False
+        if self._paused:
+            if wants_pause(text, ASSISTANT_NAME) or not says_name(text, ASSISTANT_NAME):
+                logger.info("paused, ignored %r", text)
+                return TurnPlan()
+            logger.info("called back by name: %r", text)
+            self._set_paused(False)
+            woken = True
+        elif wants_pause(text, ASSISTANT_NAME):
+            logger.info("pause requested: %r", text)
+            self._set_paused(True)
+            return TurnPlan(say=PAUSE_LINE[self.language])
+
+        stripped = text.lower().strip(".,!? ")
+        too_short = len(stripped) < MIN_TRANSCRIPT_CHARS
+        filler = stripped in FILLER_ONLY
+        unsure = confidence is not None and confidence < MIN_STT_CONFIDENCE
+        # Her name alone ("Mia?") is short and often scored low; it's still
+        # the visitor calling her back. So is a lone "English" mangled into
+        # "Engösch" (confidence 0.40 in testing).
+        choosing = self._chosen_language is None and language_choice(text) is not None
+        if not (woken or choosing) and (not text or too_short or filler or unsure):
+            logger.info(
+                "rejected %r (lang=%s, confidence=%s, short=%s, filler=%s)",
+                text,
+                self._last_language,
+                confidence,
+                too_short,
+                filler,
+            )
+            if self._chosen_language is None:
+                return TurnPlan(say=ASK_LANGUAGE_AGAIN)
+            return TurnPlan(say=DIDNT_GET_THAT[self.language])
+
+        note = self._language_note(text)
+        if woken:
+            note += " " + (WOKEN_NOTE if only_name(text, ASSISTANT_NAME) else WOKEN_ASKING_NOTE)
+        logger.info("heard %r (lang=%s, confidence=%s)", text, self._last_language, confidence)
+        return TurnPlan(note=note)
+
     def _speak_in(self, lang: str) -> None:
         """Point the TTS at `lang`'s voice before the next thing she says."""
+        self._voice_language = lang  # what tts_node rewrites for
         if TTS_PROVIDER == "elevenlabs":
             # Same voice for both languages. Only reconnects when it changes.
             if ELEVENLABS_MODEL in ELEVENLABS_LANGUAGE_MODELS:
@@ -468,34 +795,29 @@ class MiaAgent(Agent):
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
         text = (new_message.text_content or "").strip()
         confidence = self._last_confidence
-        lang = self._last_language
         self._last_confidence = None  # don't carry a stale score into next turn
 
-        stripped = text.lower().strip(".,!? ")
-        too_short = len(stripped) < MIN_TRANSCRIPT_CHARS
-        filler = stripped in FILLER_ONLY
-        unsure = confidence is not None and confidence < MIN_STT_CONFIDENCE
+        plan = self._plan_turn(text, confidence)
 
         # Set the voice before returning: the LLM reply is synthesized after
         # this hook, so this is what decides how the answer sounds.
-        self._speak_in(lang)
+        self._speak_in(DEFAULT_LANG if plan.say == ASK_LANGUAGE_AGAIN else self.language)
 
-        if text and not (too_short or filler or unsure):
-            logger.info("heard %r (lang=%s, confidence=%s)", text, lang, confidence)
+        if plan.note:
             # This turn only (turn_ctx isn't saved to the conversation history).
-            turn_ctx.add_message(role="system", content=_reply_language_note(self._last_raw_language))
+            turn_ctx.add_message(role="system", content=plan.note)
             return
-
-        logger.info(
-            "rejected %r (lang=%s, confidence=%s, short=%s, filler=%s)",
-            text,
-            lang,
-            confidence,
-            too_short,
-            filler,
-        )
-        await self.session.say(DIDNT_GET_THAT[lang])
-        # Skip the LLM entirely for this turn — she's already answered.
+        if plan.say:
+            if self._paused:
+                # Drop the reply Gemini may have started on "stop talking"
+                # (preemptive generation), then say the pause line in full:
+                # it's how the visitor learns to call her back.
+                self._stop_speaking()
+                self.session.say(plan.say, allow_interruptions=False)
+            else:
+                await self.session.say(plan.say)
+        # Skip the LLM entirely for this turn — she's already answered, or
+        # she's paused. The turn isn't saved to the conversation either.
         raise StopResponse()
 
 
@@ -512,13 +834,14 @@ async def entrypoint(ctx: JobContext) -> None:
     # Deepgram Aura unless TTS_PROVIDER=elevenlabs (see make_tts).
     tts = make_tts()
 
+    # language="multi" until the visitor picks French or English: it hears
+    # either, and reports which one it heard (a visitor who just starts talking
+    # has chosen that way). Then MiaAgent narrows it to the chosen language
+    # (STT_LANGUAGE). Multilingual and keyterms both need nova-3.
+    stt = deepgram.STT(model="nova-3", language=STT_MULTI, keyterm=STT_KEYTERMS)
+
     session = AgentSession(
-        # language="multi" instead of the default en-US: this is a Montréal
-        # lobby, so visitors open in French as often as English — and often
-        # switch mid-sentence, which pinning fr-CA would break. Requires
-        # nova-3; the older nova-2 models are English-only. It also makes
-        # Deepgram report the language it heard, which picks the reply voice.
-        stt=deepgram.STT(model="nova-3", language="multi"),
+        stt=stt,
         # Thinking off. Left on, 2.5 Flash decides per turn whether to think
         # first: plain answers rarely do with this prompt, but tool calls
         # (take_message) spent ~90 thinking tokens, about +0.45s before she
@@ -632,16 +955,66 @@ async def entrypoint(ctx: JobContext) -> None:
     # Event callbacks are sync; hold task references so they aren't collected.
     tasks: set[asyncio.Task] = set()
 
-    def spawn(coro) -> None:
+    def spawn(coro) -> asyncio.Task:
         task = asyncio.create_task(coro)
         tasks.add(task)
         task.add_done_callback(tasks.discard)
+        return task
+
+    # What the kiosk screen shows about her, as attributes on this (the
+    # agent's) participant. The contract is docs/screen-protocol.md.
+    published: dict[str, str] = {}
+    publishing = asyncio.Lock()
+
+    def screen_attributes() -> dict[str, str]:
+        if agent.paused:
+            state = "paused"
+        elif session.agent_state == "speaking":
+            state = "speaking"
+        else:
+            state = "listening"  # also while she's working out a reply
+        attributes = {"mia.state": state, "mia.name": ASSISTANT_NAME}
+        if agent.chosen_language:
+            attributes["mia.language"] = agent.chosen_language
+        return attributes
+
+    async def publish_screen_state() -> None:
+        # One update at a time, always the latest state, only what changed.
+        async with publishing:
+            changed = {k: v for k, v in screen_attributes().items() if published.get(k) != v}
+            if not changed:
+                return
+            try:
+                await ctx.room.local_participant.set_attributes(changed)
+            except Exception:
+                logger.exception("could not update the screen attributes %s", changed)
+                return
+            published.update(changed)
+            logger.info("screen: %s", changed)
+
+    pause_timer: asyncio.Task | None = None
+
+    async def end_if_still_paused() -> None:
+        await asyncio.sleep(PAUSE_TIMEOUT)
+        # No goodbye: she said she'd stop talking.
+        await end_session(f"paused {PAUSE_TIMEOUT}s without being called back")
+
+    def on_status() -> None:
+        nonlocal pause_timer
+        spawn(publish_screen_state())
+        if agent.paused and pause_timer is None:
+            pause_timer = spawn(end_if_still_paused())
+        elif not agent.paused and pause_timer is not None:
+            pause_timer.cancel()
+            pause_timer = None
 
     # end_conversation's goodbye has already been said, so no goodbye=True
     # here; passing what she said still holds the room open while it plays.
     agent = MiaAgent(
         tts=tts,
+        stt=stt,
         on_goodbye=lambda said: spawn(end_session("visitor said goodbye", said=said)),
+        on_status=on_status,
     )
 
     # Log what she says next to what she heard ("heard …" in MiaAgent), so her
@@ -656,6 +1029,14 @@ async def entrypoint(ctx: JobContext) -> None:
     def _on_user_state(ev) -> None:
         if ev.new_state == "away":
             spawn(end_session(f"idle {SESSION_IDLE_TIMEOUT}s"))
+        elif ev.new_state == "speaking":
+            agent.user_started_speaking()
+        elif ev.old_state == "speaking":
+            spawn(agent.check_heard())
+
+    @session.on("agent_state_changed")
+    def _on_agent_state(_ev) -> None:
+        spawn(publish_screen_state())
 
     # The visitor left (AI button turned off, page closed, network gone):
     # close_on_disconnect has already stopped the session; clear up the room.
@@ -669,6 +1050,7 @@ async def entrypoint(ctx: JobContext) -> None:
 
     await session.start(agent=agent, room=ctx.room)
     spawn(cap_length())
+    spawn(publish_screen_state())
 
     # Greet the visitor on her own; the browser holds its mic shut until she has
     # finished (her avatar stops speaking), so she speaks before she listens.
