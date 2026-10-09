@@ -21,8 +21,9 @@ New abilities are added as **function tools** on `MiaAgent` in the worker.
 - Her name is one setting, `ASSISTANT_NAME` (default Mia)
 - General questions about Mobile Apps Labs from the company knowledge
 - Contact details (phone, email, address, website)
-- Take a message for someone in `team.json` (email via Resend, read back before
-  sending, max 3 per conversation)
+- Take a message for someone in `team.json`, or for the general inbox (info@,
+  `general_inbox` in `team.json`) (email via Resend, read back before sending,
+  max 3 per conversation)
 - Tell someone in `team.json` a visitor is waiting at reception (`notify_member`,
   email via Resend, max 3 per conversation)
 - Refusals: prices, client projects, staff info, general-assistant requests,
@@ -41,6 +42,8 @@ New abilities are added as **function tools** on `MiaAgent` in the worker.
 
 Tests for all the team tools and goodbye: `agent-worker/test_team_messages.py`
 (text conversations against the real Gemini, emails replaced by recorders).
+Persona checks for the boss's notes of 2026-10-09, one scenario per note:
+`agent-worker/test_persona.py`, same harness.
 
 ## To build
 
@@ -66,8 +69,9 @@ never a schedule or a reason.
 
 ### 4. `take_message` — *done*
 Visitor name, recipient, message, optional phone or email for a reply. Sent by
-email (Resend). Someone not in `team.json` → nothing is sent; she says she
-can't reach them and gives the contact details.
+email (Resend). Also takes messages for the general inbox (info@, from
+`general_inbox` in `team.json`). Someone not in `team.json` → nothing is sent
+to them; she says she can't reach them and offers the general inbox instead.
 Mia reads the message back once before sending.
 
 ### 5. Emergency alert — *done*

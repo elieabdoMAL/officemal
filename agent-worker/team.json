@@ -1,5 +1,29 @@
 {
-  "_about": "Team directory for Mia, the reception avatar. She may only notify, check, or take messages for people listed here. 'aliases' are other ways visitors may refer to someone (spoken names, titles in French and English) so she can match them. Add one entry per person; the worker image must be rebuilt and pushed for changes to go live.",
+  "_about": "Team directory for the reception avatar. She may only notify, check, or take messages for people listed here. 'aliases' are other ways visitors may refer to someone (spoken names, titles in French and English, and spellings speech recognition produces, like Alexander for Alexandre) so she can match them. 'bio_en' / 'bio_fr' are optional: one or two short, friendly spoken sentences she may share when asked about the team; leave them empty until approved, never put private details there. 'visitor_contact' is the member she notifies when a visitor wants to talk to someone but names nobody. 'general_inbox' is the team's shared address: she can take messages for it (a named member always wins over it) and it gets emergency alerts too. Add one entry per person; the worker image must be rebuilt and pushed for changes to go live.",
+  "visitor_contact": "nbastien",
+  "general_inbox": {
+    "name_en": "the general inbox",
+    "name_fr": "la boîte de réception générale",
+    "aliases": [
+      "info",
+      "inbox",
+      "the team",
+      "your team",
+      "the whole team",
+      "everyone",
+      "Mobile Apps Labs",
+      "the company",
+      "l'équipe",
+      "votre équipe",
+      "toute l'équipe",
+      "tout le monde",
+      "boîte générale",
+      "boîte de réception",
+      "l'entreprise",
+      "la compagnie"
+    ],
+    "email": "info@mobileappslabs.com"
+  },
   "members": [
     {
       "id": "nbastien",
@@ -9,15 +33,22 @@
       "role_fr": "Président-directeur général",
       "aliases": [
         "Nicolas",
+        "Nicholas",
+        "Nicola",
+        "Nico",
         "Nic",
         "Nick",
         "Bastien",
+        "Bastian",
         "the CEO",
         "the boss",
+        "the president",
         "le PDG",
         "le président",
         "le patron"
       ],
+      "bio_en": "",
+      "bio_fr": "",
       "email": "nbastien@mobileappslabs.com"
     },
     {
@@ -28,13 +59,20 @@
       "role_fr": "Directeur des opérations",
       "aliases": [
         "Alexandre",
+        "Alexander",
+        "Alexandra",
         "Alex",
         "Joset",
+        "Josset",
+        "Josette",
+        "Jozet",
         "the COO",
         "operations",
         "le directeur des opérations",
         "les opérations"
       ],
+      "bio_en": "",
+      "bio_fr": "",
       "email": "ajoset@mobileappslabs.com"
     }
   ]
