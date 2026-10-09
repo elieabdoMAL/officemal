@@ -1,5 +1,5 @@
 {
-  "_about": "Voice scenarios for tests/voice/run.mjs. lines: [text, seconds of silence after it, optional voice] (voices in make-wavs.mjs: en, fr, en2 = a second English speaker, fr2). The WAV starts when the kiosk opens the mic, after her greeting. groups: run a whole group by name (e.g. `wave1`). expect: say / notSay = what the recording of her audio must / must not contain (Deepgram transcript; a string is a phrase, \"/re/\" a regex, an array means any one of them; digit words are also matched as digits, so \"/5 1 4/\" matches 'five one four' and '514'); said / notSaid = the same against the text the worker logged for her (before TTS); tools / notTools = take_message, notify_member, alert_emergency, end_conversation, pause, wake, switch; logs / notLogs = regexes on worker log messages; lang = every line she said after the greeting is in this language; ended = the session ended by itself. Goodbye scenarios also require her goodbye in the recording: the room must not close before it plays.",
+  "_about": "Voice scenarios for tests/voice/run.mjs. lines: [text, seconds of silence after it, optional voice] (voices in make-wavs.mjs: en, fr, en2 = a second English speaker, fr2). The WAV starts when the kiosk opens the mic, after her greeting. groups: run a whole group by name (e.g. `wave1`). expect: say / notSay = what the recording of her audio must / must not contain (Deepgram transcript; a string is a phrase, \"/re/\" a regex, an array means any one of them; digit words are also matched as digits, so \"/5 1 4/\" matches 'five one four' and '514'); said / notSaid = the same against the text the worker logged for her (before TTS); tools / notTools = take_message, notify_member, alert_emergency, end_conversation, pause, wake, switch; logs / notLogs = regexes on worker log messages; lang = every line she said after the greeting is in this language; goodbyeHeard = every word of her last line is at the end of the recording; ended = the session ended by itself. Goodbye scenarios also require her goodbye in the recording: the room must not close before it plays.",
 
   "lang_fr": {
     "groups": ["wave1"],
@@ -94,5 +94,68 @@
     "voice": "en",
     "lines": [["English.",140]],
     "expect": {"logs": ["/ending session in \\S+: idle/"], "ended": true}
+  },
+  "bye_en": {
+    "groups": ["goodbye", "fixes"],
+    "about": "Short goodbye: the visitor just says 'Thanks, goodbye!'; all of her goodbye must reach the kiosk before the room closes (it was cut at 'Good…').",
+    "voice": "en",
+    "lines": [["English.",11], ["Where is your office?",16], ["Thanks, goodbye!",20]],
+    "expect": {"tools": ["end_conversation"], "say": [["/bye/"]], "goodbyeHeard": true, "ended": true}
+  },
+  "bye_fr": {
+    "groups": ["goodbye", "fixes"],
+    "about": "Au revoir court : la visiteuse dit juste « Merci, au revoir ! » ; tout son au revoir doit être joué avant la fermeture.",
+    "voice": "fr",
+    "lines": [["Français.",11], ["Quelle est votre adresse ?",16], ["Merci, au revoir !",20]],
+    "expect": {"lang": "fr", "tools": ["end_conversation"], "say": [["/au revoir|bonne journee/"]], "goodbyeHeard": true, "ended": true}
+  },
+  "notify_first": {
+    "groups": ["fixes"],
+    "about": "'Here to see Alex' as the very first line, no name yet: nobody is told until the visitor gives a name, then Alexandre is told that David Chen is here.",
+    "voice": "en",
+    "lines": [["Hi, I'm here to see Alex, I have a meeting with him at two.",12], ["My name is David Chen.",16]],
+    "expect": {"tools": ["notify_member"], "logs": ["told Alexandre Joset that David Chen is here"], "notLogs": ["/told \\S+ \\S+ that (?!David Chen)/", "said she notified someone without notify_member"], "say": [["/alex/"]], "ended": false}
+  },
+  "switch_back_fr": {
+    "groups": ["switch", "fixes"],
+    "about": "Switch to English, then 'est-ce qu'on peut revenir au français ?' switches back. Said twice, as a visitor would when she doesn't answer: the English-locked STT hears nothing of French, and only listens in both languages after that.",
+    "voice": "fr",
+    "lines": [["Français, s'il vous plaît.",11], ["Can we speak English, please?",12,"en"], ["Hmm, est-ce qu'on peut revenir au français ?",8], ["Est-ce qu'on peut revenir au français ?",12], ["Quelle est votre adresse ?",16]],
+    "expect": {"logs": ["visitor asked to switch to en", "visitor asked to switch to fr"], "say": [["/sainte|turgeon|virtuel/"]], "ended": false}
+  },
+  "switch_back_en": {
+    "groups": ["switch", "fixes"],
+    "about": "Switch to French (asked twice: the English-locked STT hears nothing of the first), then 'On peut revenir en anglais ?' switches back.",
+    "voice": "en",
+    "lines": [["English, please.",11], ["Est-ce qu'on peut parler français ?",8,"fr"], ["Est-ce qu'on peut parler français ?",12,"fr"], ["On peut revenir en anglais ?",12,"fr"], ["Where is your office?",16]],
+    "expect": {"logs": ["visitor asked to switch to fr", "visitor asked to switch to en"], "say": [["/sainte|turgeon|virtual/"]], "ended": false}
+  },
+  "switch_sorry_en": {
+    "groups": ["switch", "fixes"],
+    "about": "Both languages named: 'Sorry, can we speak English? My French isn't great.' switches to English, mid-message.",
+    "voice": "fr",
+    "lines": [["Français.",11], ["Je voudrais laisser un message pour Nicolas.",12], ["Sorry, can we speak English? My French isn't great.",12,"en"], ["My name is Martin Leblanc.",14,"en"]],
+    "expect": {"logs": ["visitor asked to switch to en"], "notLogs": ["visitor asked to switch to fr"], "notTools": ["take_message"], "ended": false}
+  },
+  "switch_understand_en": {
+    "groups": ["switch", "fixes"],
+    "about": "Both languages named: 'Can we switch to English? I don't understand French well.' switches to English.",
+    "voice": "fr",
+    "lines": [["Français.",11], ["Qu'est-ce que vous faites chez Mobile Apps Labs ?",16], ["Can we switch to English? I don't understand French well.",18,"en"], ["Where is your office?",18,"en"]],
+    "expect": {"logs": ["visitor asked to switch to en"], "say": [["/sainte|turgeon|virtual/"]], "ended": false}
+  },
+  "mention_en": {
+    "groups": ["switch", "fixes"],
+    "about": "English locked: a French restaurant, French cooking are mentions, not requests.",
+    "voice": "en",
+    "lines": [["English.",11], ["We could go to a French restaurant after the meeting.",12], ["Can I talk to someone who knows French cooking?",14]],
+    "expect": {"lang": "en", "notTools": ["switch"], "ended": false}
+  },
+  "mention_fr": {
+    "groups": ["switch", "fixes"],
+    "about": "Français verrouillé : « Mon collègue parle anglais » n'est pas une demande.",
+    "voice": "fr",
+    "lines": [["Français.",11], ["Mon collègue parle anglais, il viendra demain.",14]],
+    "expect": {"lang": "fr", "notTools": ["switch"], "ended": false}
   }
 }

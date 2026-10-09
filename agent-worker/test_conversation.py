@@ -223,6 +223,33 @@ async def conv_garbled_answer() -> None:
     print("✓ re-asked, then took \"Engösch\" as English")
 
 
+async def tts_text_offline() -> None:
+    """What the Aura voice is given: a one-word opening sentence joined to the
+    next (Aura mangles "Goodbye!" said on its own). No Gemini."""
+
+    async def voice(chunks: list[str]) -> str:
+        async def gen():
+            for c in chunks:
+                yield c
+
+        return "".join([c async for c in worker.MiaAgent._join_one_word_opening(gen())])
+
+    cases = {
+        ("Goodbye! Have a great day!",): "Goodbye, Have a great day!",
+        ("Good", "bye!", " ", "Have a great day!"): "Goodbye, Have a great day!",
+        ("Goodbye!",): "Goodbye!",
+        ("Au revoir ! ", "Bonne journée !"): "Au revoir ! Bonne journée !",
+        ("Parfait. Nous continuerons en français.",): "Parfait, Nous continuerons en français.",
+        ("Yes? How can I help?",): "Yes? How can I help?",
+        ("Alright, we'll continue in English.",): "Alright, we'll continue in English.",
+        ("It was a pleasure. Goodbye!",): "It was a pleasure. Goodbye!",
+    }
+    for chunks, expected in cases.items():
+        got = await voice(list(chunks))
+        assert got == expected, f"{chunks!r} -> {got!r}, expected {expected!r}"
+    print(f"✓ TTS text: one-word opening joined, {len(cases)} cases")
+
+
 CONVERSATIONS = {
     "english": conv_choose_english,
     "first": conv_first_line_decides,
@@ -237,6 +264,7 @@ async def main() -> None:
     from test_team_messages import install_recorders
 
     install_recorders(worker)  # no email can leave, whatever she decides
+    await tts_text_offline()
     for name in sys.argv[1:] or CONVERSATIONS:
         await CONVERSATIONS[name]()
 

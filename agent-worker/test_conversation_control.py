@@ -15,6 +15,7 @@ from conversation_control import (
     says_name,
     speak_digits,
     speak_digits_stream,
+    visitor_said_name,
     wants_pause,
 )
 
@@ -143,7 +144,88 @@ def test_language() -> None:
         ("Votre site est-il en anglais?", "fr"): None,
         ("What does Mobile Apps Labs do?", "en"): None,
         ("Je voudrais laisser un message.", "fr"): None,
+        # Going back to a language (missed before 2026-10-09).
+        ("Hmm, est-ce qu'on peut revenir au français ?", "en"): "fr",
+        ("est-ce qu'on peut revenir au français", "en"): "fr",
+        ("On peut revenir en anglais ?", "fr"): "en",
+        ("On revient en français, s'il vous plaît.", "en"): "fr",
+        ("Can we go back to French?", "en"): "fr",
+        ("Can we switch back to English, please?", "fr"): "en",
+        ("Passons à l'anglais.", "fr"): "en",
+        ("Pouvez-vous me répondre en anglais ?", "fr"): "en",
+        ("Est-il possible de parler anglais ?", "fr"): "en",
+        ("Is it possible to speak in English?", "fr"): "en",
+        ("Could you say that again in French?", "en"): "fr",
+        ("Actually, can we continue in English, please?", "fr"): "en",
+        ("Plutôt en anglais, s'il vous plaît.", "fr"): "en",
+        ("English, Mia, please.", "fr"): "en",
+        ("Can't we speak French?", "en"): "fr",
+        ("Est-ce qu'on peut m'expliquer en anglais ?", "fr"): "en",
+        ("qu'on m'explique English?", "fr"): "en",  # fr-CA STT on "can we speak English?"
+        # Both named: the one they ask to speak wins.
+        ("Sorry, can we speak English? My French isn't great.", "fr"): "en",
+        ("Can we switch to English? I don't understand French well.", "fr"): "en",
+        ("Je ne parle pas bien anglais, on peut parler français ?", "en"): "fr",
+        ("My French is bad, English please.", "fr"): "en",
+        ("Can we speak French? My English is not very good.", "en"): "fr",
+        # Only the one they don't speak: the other.
+        ("Sorry, my French isn't great.", "fr"): "en",
+        ("I don't understand French well.", "fr"): "en",
+        ("Je ne comprends pas bien l'anglais.", "en"): "fr",
+        # Mere mentions.
+        ("Mon collègue parle anglais, il viendra demain.", "fr"): None,
+        ("Mon collègue parle anglais.", "fr"): None,
+        ("Can I talk to someone who knows French cooking?", "en"): None,
+        ("We could go to a French restaurant after the meeting.", "en"): None,
+        ("My partner doesn't speak French, can I bring him next time?", "en"): None,
+        ("Does Nicolas speak French?", "en"): None,
+        ("Is the app not available in French?", "en"): None,
+        ("I love French food.", "en"): None,
+        ("I'd prefer a French version of the brochure.", "en"): None,
+        ("Do you have a French version of the brochure?", "en"): None,
+        ("Ma femme est anglaise, elle parle anglais.", "fr"): None,
+        ("Nos clients parlent anglais.", "fr"): None,
+        ("Can I talk to Nicolas in English?", "en"): None,
+        ("Français ou anglais, peu importe.", "fr"): None,
     }, "language_switch")
+
+
+def test_visitor_name() -> None:
+    lines = ["Hi, I'm here to see Alex, I have a meeting with him at two."]
+    check(lambda name: visitor_said_name(name, lines, "Mia"), {
+        "there": False,  # what Gemini wrote, 2026-10-09
+        "Hi": False,
+        "the visitor": False,
+        "Alex": True,  # said, but it's who they came to see: worker.py refuses that
+        "David Chen": False,
+        "": False,
+    }, "visitor_said_name before a name")
+    lines += ["My name is David Chen.", "C'est Chloé Bergeron, B E R G E R O N.", "I'm Mr. Mark Le Blanc.", "Mia?"]
+    check(lambda name: visitor_said_name(name, lines, "Mia"), {
+        "David Chen": True,
+        "david chen": True,
+        "Chen": True,
+        "Chloe Bergeron": True,  # accents
+        "Chloé BERGERON": True,
+        "Marc Leblanc": True,  # spelling, words run together
+        "Mr. Leblanc": True,
+        "Monsieur Chen": True,
+        "Sir": False,
+        "Madame": False,
+        "Monsieur": False,
+        "David Smith": False,  # never said
+        "Mia": False,  # her name, not theirs
+        "Hello there": False,
+        "Hi David": False,
+        "Unknown": False,
+    }, "visitor_said_name after names")
+    check(lambda name: visitor_said_name(name, ["Je m'appelle Hugo Gagnon de Toitures Gagnon."]), {
+        "Hugo Gagnon": True,
+        "Hugo": True,
+        "Hugo Tremblay": False,
+    }, "visitor_said_name (FR)")
+    check(lambda name: visitor_said_name(name, ["My name is Chen, C H E N."]), {"Chen": True}, "visitor_said_name spelled")
+    check(lambda name: visitor_said_name(name, ["I'm Sam O'Brien."]), {"Sam O'Brien": True, "Sam OBrien": True}, "visitor_said_name apostrophe")
 
 
 def test_digits() -> None:
@@ -201,6 +283,7 @@ if __name__ == "__main__":
     test_pause()
     test_name()
     test_language()
+    test_visitor_name()
     test_digits()
     test_digits_stream()
     print("all conversation_control tests passed")

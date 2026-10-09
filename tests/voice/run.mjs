@@ -199,7 +199,7 @@ function dockerLogs(...args) {
 
 function workerLogs(since) {
   return dockerLogs("--since", since).split("\n").filter(Boolean).map(l => {
-    try { const j = JSON.parse(l); return { time: (j.timestamp || "").slice(11, 19), msg: j.message ?? l }; } catch { return { time: "", msg: l }; }
+    try { const j = JSON.parse(l); return { time: (j.timestamp || "").slice(11, 23), msg: j.message ?? l }; } catch { return { time: "", msg: l }; }
   });
 }
 
@@ -267,13 +267,23 @@ function check(sc, run, transcript) {
     const off = said.filter(s => s !== FIRST_MESSAGE && words(s).split(" ").length >= 4 && languageOf(s) && languageOf(s) !== e.lang);
     ok(said.length > 1 && !off.length, `every reply in ${e.lang}${off.length ? `: ${off.map(s => JSON.stringify(s)).join(", ")}` : ""}`);
   }
+  if (e.goodbyeHeard) {
+    // Her last line (the goodbye), every word of it, at the end of the
+    // recording: the room must not close before it has played.
+    const last = said.at(-1) ?? "";
+    const want = words(last).split(" ").filter(Boolean);
+    const tail = words(transcript.text).split(" ").slice(-(want.length + 8));
+    const missing = want.filter(w => !tail.includes(w));
+    ok(want.length > 0 && missing.length <= (want.length >= 5 ? 1 : 0) && tail.includes(want.at(-1)),
+      `her whole goodbye is in the recording (${JSON.stringify(last)}${missing.length ? `, missing: ${missing.join(" ")}` : ""})`);
+  }
   if (e.ended !== undefined) ok(Boolean(run.endedS) === e.ended, e.ended ? "session ended by itself" : "session still open at the end");
   ok(said.length > 1, "she answered at least once after the greeting");
   return { results, fired, said };
 }
 
 // --- main ------------------------------------------------------------------
-const INTERESTING = /^(heard|said|rejected|paused|resumed|called back|pause|stop request|language locked|STT language|visitor asked|ending session|holding the room|end_conversation|take_message|notify_member|alert_emergency|screen:)|error|exception|429/i;
+const INTERESTING = /^(heard|said|rejected|paused|resumed|called back|pause|stop request|language locked|STT language|visitor asked|ending session|holding the room|end_conversation|take_message|notify_member|alert_emergency|screen:|visitor_name|dropped|the visitor went on|deleting the room|goodbye)|error|exception|429/i;
 
 async function runOne(name) {
   const sc = SCENARIOS[name];

@@ -120,8 +120,13 @@ async def note10_talk() -> None:
     replies = await converse("fr", ["Bonjour, je suis Sophie Martin, j'ai rendez-vous avec Marc Dupont."])
     check(not recorded("notify", n), "#10 nobody notified for Marc Dupont")
     no_false_claim(replies[0], False, "#10 Marc Dupont")
-    replies = await converse("en", ["Hi, I'm here to see Alex, I have a meeting with him at two."])
-    no_false_claim(replies[0], bool(recorded("notify", n)), "#10 Alex, name not given")
+    # Seen 2026-10-09, 1 run in 3 or 4: notify_member(visitor_name="there") on this line.
+    for attempt in (1, 2, 3):
+        n = len(calls)
+        replies = await converse("en", ["Hi, I'm here to see Alex, I have a meeting with him at two."])
+        notified = recorded("notify", n)
+        check(not notified, f"#10 Alex, name not given ({attempt}/3): nobody notified before the name ({notified})")
+        no_false_claim(replies[0], False, f"#10 Alex, name not given ({attempt}/3)")
 
 
 async def note15_alexandre() -> None:

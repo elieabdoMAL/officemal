@@ -13,7 +13,11 @@ New abilities are added as **function tools** on `MiaAgent` in the worker.
 
 - French / English conversation: bilingual greeting asks "Français ou English?",
   the answer locks the language (STT, voice, replies); switches only on an
-  explicit request ("can we speak French")
+  explicit request ("can we speak French", "on peut revenir en anglais ?",
+  "I don't speak French"). When both languages are named, the one they ask to
+  speak wins ("Can we speak English? My French isn't great."); a language
+  merely mentioned doesn't switch ("mon collègue parle anglais", "a French
+  restaurant"). `conversation_control.language_switch`
 - Pause: "stop talking" / "tais-toi" / "I'm talking to someone else" → she says
   how to call her back and ignores all speech until her name (or "assistant")
   is said; a paused session ends after 2 min (`PAUSE_TIMEOUT`)
@@ -46,8 +50,25 @@ New abilities are added as **function tools** on `MiaAgent` in the worker.
   submit_project_request refuse to send the same thing to the same recipient
   twice in a conversation (code, `leads.SentLog`), unless the visitor's latest
   words ask to send it again ("again", "renvoyer", "encore une fois"…)
+- Visitor names: take_message, notify_member, send_suggestion and the project
+  request accept only a name the visitor actually said in the conversation
+  (code, `conversation_control.visitor_said_name`: case, accents and STT
+  spelling tolerated, spelled-out letters too), never a greeting or filler
+  ("there", "sir", "madame") nor the name of the person they came to see. A
+  suggestion with no such name goes anonymous
 - Ends the session herself when the visitor says goodbye (`end_conversation`),
-  after her goodbye has played
+  after her goodbye has played: the room is held until it has had time to
+  reach the kiosk, counted from when she started saying it
+  (`goodbye_grace`), then while the room still hears her. Deepgram Aura renders
+  a one-word sentence badly ("Goodbye!" alone came out empty or as "about"
+  about half the time), so the prompt asks for a goodbye of a few words and
+  the voice gets a one-word opening sentence joined to the next ("Goodbye,
+  have a great day!"; captions unchanged). A goodbye in the same reply as a send ("Yes, perfect,
+  thanks, bye!") ends only if the visitor then says nothing for 6 s
+  (`END_AFTER_SEND_S`), so they hear the confirmation and can still correct it
+- "It's on the screen" is never said about a project request before the draft
+  is shown: such a sentence is dropped before the TTS, and she is asked to show
+  it or to ask for what is missing
 - Session limits: ends after 2 min silence or 10 min total; she then rests
   with "Tap to talk to {name}" on screen (no session billed) until a tap on it
   or on the AI button starts a new one
