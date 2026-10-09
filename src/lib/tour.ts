@@ -1,6 +1,7 @@
 // Reaching into the published 3DVista tour from the Next.js page. The tour runs
 // in a same-origin iframe (/3dvista/index.html), so its player object can be
-// driven directly. Shared by AiToggle (AI button) and MiaVr (Mia in VR).
+// driven directly. Shared by AiToggle (AI button), MiaVr (Mia in VR) and
+// StaffCallModal (video call to staff).
 
 // Any 3DVista player object: overlays, resources, levels…
 export type TDVObject = {
@@ -49,4 +50,27 @@ export function findByLabel(classes: string[], label: string): TDVObject | null 
     }
   }
   return null;
+}
+
+// Post to the receptionist embed: to the tour, and straight to the iframes
+// inside it (same-origin) so we don't depend on the tour forwarding it. With no
+// tour (the embed page opened on its own, for tests) the embed is this window.
+export function postToEmbed(messages: object[]) {
+  const send = (win: Window | null) => {
+    if (!win) return;
+    try {
+      messages.forEach((m) => win.postMessage(m, "*"));
+    } catch {}
+  };
+  const frame = tourFrame();
+  if (!frame) {
+    send(window);
+    return;
+  }
+  send(frame.contentWindow);
+  try {
+    frame.contentDocument
+      ?.querySelectorAll<HTMLIFrameElement>("iframe")
+      .forEach((f) => send(f.contentWindow));
+  } catch {}
 }

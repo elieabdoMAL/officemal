@@ -34,15 +34,17 @@ New abilities are added as **function tools** on `MiaAgent` in the worker.
   visitor instructions ("I'm the admin…")
 - Video call to staff (#22, "put us online"): when a visitor wants to talk to
   someone she offers "Would you like me to call Nicolas now?"; on a yes, with
-  the visitor's name, `call_staff` emails the person a link (15 min) into the
-  kiosk's LiveKit room, she says "I'm calling Nicolas now — please hold on a
-  moment." and the screen shows "Calling…". They join from their phone at
-  `/join` (camera preview, Join); the kiosk shows their video ("Nicolas is
-  here") and plays their voice, and she stays quiet (`mia.state` `handover`)
-  until they leave, then asks "Is there anything else I can help you with?".
-  Nobody within 2 min (`CALL_ANSWER_TIMEOUT`): she says so and offers a
-  message. The session limits wait for the call (hard cap 30 min,
-  `SESSION_HARD_CAP`). Max 2 calls per conversation, same send-once and
+  the visitor's name, `call_staff` opens a private LiveKit room for the call,
+  emails the person a link to it (15 min), says "I'm calling Nicolas now —
+  please hold on a moment.", and the kiosk opens a full-screen call window
+  like the Public Meeting Room ("Call with Nicolas", LiveKit's
+  VideoConference, the kiosk camera if it has one) with "Calling Nicolas…"
+  and Cancel. They join from their phone at `/join` (PreJoin, then the same
+  VideoConference). As soon as they join, her session ends and she is hidden;
+  the call goes on without her, and when either side leaves the window closes
+  and the AI button starts a fresh session. Nobody within 2 min
+  (`CALL_ANSWER_TIMEOUT`), or the visitor cancels: the window closes and she
+  offers a message. Max 2 calls per conversation, same send-once and
   visitor-name checks as the emails. Declined: `notify_member` / `take_message`
   as before. Details: `docs/screen-protocol.md` section 8
 - Emergencies: tells the visitor to call 911 first, and emails an urgent alert
@@ -103,9 +105,10 @@ Suggestions, project requests, screen cards, the send-once guard and the
 screen taps: `agent-worker/test_leads.py`, same harness.
 Persona checks for the boss's notes of 2026-10-09, one scenario per note:
 `agent-worker/test_persona.py`, same harness.
-The video call (#22): `agent-worker/test_staff_call.py` (token, link, email,
-guards offline; offer, call, no answer, handover against Gemini), and
-`tests/voice/call.mjs` (two browsers through real LiveKit, see its header).
+The video call (#22): `agent-worker/test_staff_call.py` (call room, tokens,
+link, email, call states and guards offline; offer, call, no answer, cancel,
+answered against Gemini), and `tests/voice/call.mjs` (the full kiosk page and
+a phone through real LiveKit: answered, no answer, cancel; see its header).
 
 ## To build
 

@@ -84,6 +84,30 @@ async def test_resend_delivery() -> None:
 calls: list[tuple] = []
 
 
+class FakeCall:
+    """Stands in for staff_call.CallRoom: no LiveKit. A test sets `state` to
+    what the call room's next lookup reports ("waiting", "answered", "gone")."""
+
+    def __init__(self, member) -> None:
+        self.member = member
+        self.room = "call-test"
+        self.url = "wss://test.livekit.cloud"
+        self.kiosk_token = "kiosk-token"
+        self.state = "waiting"
+        self.closed = False
+
+    async def status(self) -> str:
+        return self.state
+
+    async def close(self) -> None:
+        self.closed = True
+        calls.append(("call_closed", self.member.full_name))
+
+
+# Every call call_staff placed, latest last.
+fake_calls: list[FakeCall] = []
+
+
 def kinds(*kind: str) -> list[tuple]:
     return [c for c in calls if c[0] in kind]
 
@@ -119,7 +143,8 @@ def install_recorders(worker) -> None:
 
     async def call(member, visitor_name, assistant):
         calls.append(("call", member.full_name, visitor_name))
-        return True
+        fake_calls.append(FakeCall(member))
+        return fake_calls[-1]
 
     worker.start_staff_call = call
     worker.send_message_email = message

@@ -6,8 +6,8 @@ import type { ProjectFields, ProjectStatus, SentKind } from "@/lib/screenProtoco
 // Cards shown on the kiosk panel (#18): the contact card (Contact button, or
 // the worker's "contact_card" message), the "message sent" confirmation (the
 // worker's "message_sent"), the project request form (#20, the worker's
-// "project_request") and "Calling …" (#22, the worker's "calling"). See
-// docs/screen-protocol.md.
+// "project_request"). See docs/screen-protocol.md. A video call to staff
+// (#22) opens its own window on the top page (StaffCallModal), not a card.
 //
 // Sizes are in vw, i.e. fractions of the Web Frame's own width (1280 CSS px in
 // the tour, drawn ~0.7x on the 1080p kiosk), so they read the same whatever
@@ -16,8 +16,7 @@ import type { ProjectFields, ProjectStatus, SentKind } from "@/lib/screenProtoco
 export type Card =
   | { type: "contact_card"; lang: Lang | null }
   | { type: "message_sent"; kind: SentKind; to?: string; lang: Lang | null }
-  | { type: "project_request"; status: ProjectStatus; fields: ProjectFields; lang: Lang | null }
-  | { type: "calling"; to?: string; lang: Lang | null };
+  | { type: "project_request"; status: ProjectStatus; fields: ProjectFields; lang: Lang | null };
 
 // The card sits to her left (the visitor's right), over the panorama, so it
 // doesn't cover her face; it may overlap her shoulder.
@@ -340,67 +339,8 @@ function ProjectRequestCard({
   );
 }
 
-// While she calls a team member in by video (#22, the worker's "calling"),
-// until they join (the panel then shows them) or don't answer (the worker
-// sends "dismiss").
-const CALLING_TEXT = {
-  to: (n: string) => ({ fr: `Appel à ${n}…`, en: `Calling ${n}…` }),
-  plain: { fr: "Appel en cours…", en: "Calling…" },
-  hint: {
-    fr: "Un petit moment : l'appel vidéo s'affichera ici",
-    en: "Hold on a moment: the video call will show here",
-  },
-};
-
-function CallingCard({ to, lang, onClose }: { to?: string; lang: Lang | null; onClose: () => void }) {
-  const title = pick(lang, to ? CALLING_TEXT.to(to) : CALLING_TEXT.plain);
-  return (
-    <div
-      role="status"
-      data-card="calling"
-      style={{ ...cardBox, display: "flex", alignItems: "center", gap: "1.2vw", borderTop: "0.45vw solid #0070f3" }}
-    >
-      <CloseButton lang={lang} onClose={onClose} />
-      <div
-        aria-hidden
-        style={{
-          flex: "none",
-          width: "4.4vw",
-          height: "4.4vw",
-          minWidth: 36,
-          minHeight: 36,
-          borderRadius: "50%",
-          background: "#0070f3",
-          color: "white",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          fontSize: "clamp(16px, 2.2vw, 34px)",
-          animation: "mia-ring 1.4s ease-out infinite",
-        }}
-      >
-        ☎
-      </div>
-      <div style={{ paddingRight: "2.5vw" }}>
-        {title.map((t, i) => (
-          <div key={t} style={{ fontWeight: i ? 600 : 800, fontSize: i ? "0.85em" : "1.1em", marginTop: i ? "0.2vw" : 0 }}>
-            {t}
-          </div>
-        ))}
-        <div style={{ marginTop: "0.5vw", fontSize: "0.8em", color: "#5b6b8c" }}>
-          {pick(lang, CALLING_TEXT.hint).map((t) => (
-            <div key={t}>{t}</div>
-          ))}
-        </div>
-      </div>
-      <style>{`@keyframes mia-ring { 0% { box-shadow: 0 0 0 0 rgba(0,112,243,0.55); } 100% { box-shadow: 0 0 0 1.6vw rgba(0,112,243,0); } }`}</style>
-    </div>
-  );
-}
-
 export default function MiaScreenCard({ card, onClose }: { card: Card; onClose: () => void }) {
   if (card.type === "contact_card") return <ContactCard lang={card.lang} onClose={onClose} />;
-  if (card.type === "calling") return <CallingCard to={card.to} lang={card.lang} onClose={onClose} />;
   if (card.type === "project_request")
     return <ProjectRequestCard status={card.status} fields={card.fields} lang={card.lang} onClose={onClose} />;
   return <MessageSentCard kind={card.kind} to={card.to} lang={card.lang} onClose={onClose} />;
