@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { findByLabel, tourFrame, type TDVObject } from "@/lib/tour";
 
 // Name of the 3DVista Web Frame hotspot that hosts the AI receptionist.
@@ -77,26 +77,39 @@ function triggerContainer(name: string): boolean {
   return false;
 }
 
-// Hiding a Web Frame doesn't unload it — the iframe keeps running and Mia keeps
-// talking behind an invisible panel. Tell the embed to go quiet as well.
-function broadcastVisibility(visible: boolean) {
+// Post to the receptionist embed: to the tour, and straight to the iframes
+// inside it (same-origin) so we don't depend on the tour forwarding it.
+function postToEmbed(messages: object[]) {
   const send = (win: Window | null) => {
     if (!win) return;
     try {
-      win.postMessage({ type: "receptionist-visible", visible }, "*");
-      win.postMessage({ type: "receptionist-mute", muted: !visible }, "*");
+      messages.forEach((m) => win.postMessage(m, "*"));
     } catch {}
   };
   const frame = tourFrame();
   send(frame?.contentWindow ?? null);
-  // Reach the nested receptionist iframe directly (same-origin) so we don't
-  // depend on the tour forwarding the message.
   try {
     frame?.contentDocument
       ?.querySelectorAll<HTMLIFrameElement>("iframe")
       .forEach((f) => send(f.contentWindow));
   } catch {}
 }
+
+// The current tour unloads the Web Frame when AIWEB is hidden, but a build that
+// only hides it would leave the iframe running and Mia talking behind an
+// invisible panel. Tell the embed to go quiet as well.
+function broadcastVisibility(visible: boolean) {
+  postToEmbed([
+    { type: "receptionist-visible", visible },
+    { type: "receptionist-mute", muted: !visible },
+  ]);
+}
+
+// How often to re-read AIWEB's real state. The tour can show or hide the frame
+// with its own actions, which this button never hears about (#9: the icon then
+// said "off" while she was on, and when her session ended the button's "hide"
+// was skipped, leaving an empty frame the tour couldn't show again).
+const SYNC_MS = 1000;
 
 const buttonStyle: React.CSSProperties = {
   background: "transparent",
@@ -124,25 +137,39 @@ const innerBase: React.CSSProperties = {
 
 export default function AiToggle({ initiallyVisible = false }: { initiallyVisible?: boolean }) {
   const [shown, setShown] = useState(initiallyVisible);
+  // The frame is up but her session has ended (idle / max length): the embed
+  // shows "Tap to talk" and holds no room. Tapping this button then starts a
+  // session rather than hiding her.
+  const [resting, setResting] = useState(false);
 
-  // Adopt the tour's real state once it has loaded, so the icon doesn't lie —
-  // AIWEB is published hidden (enabled:false). Tell the embed too: it may have
-  // loaded inside the hidden frame and opened a session nobody can see.
+  // Follow the tour's real state, so the icon doesn't lie — AIWEB is
+  // published hidden (enabled:false) and the tour may show or hide it on its
+  // own. On a change we didn't make, tell the embed too: a build that keeps a
+  // hidden frame loaded would otherwise keep (or never start) its session.
+  const shownRef = useRef(shown);
+  shownRef.current = shown;
   useEffect(() => {
-    const timer = window.setTimeout(() => {
+    const sync = () => {
       const obj = findAiFrame();
-      if (obj) {
-        const isShown = readShown(obj);
+      if (!obj) return;
+      const isShown = readShown(obj);
+      if (isShown !== shownRef.current) {
+        shownRef.current = isShown;
         setShown(isShown);
+        setResting(false);
         broadcastVisibility(isShown);
       }
-    }, 2500);
-    return () => window.clearTimeout(timer);
+    };
+    const first = window.setTimeout(sync, 2500);
+    const timer = window.setInterval(sync, SYNC_MS);
+    return () => {
+      window.clearTimeout(first);
+      window.clearInterval(timer);
+    };
   }, []);
 
-  const toggle = useCallback(() => {
-    const next = !shown;
-
+  // Show or hide AIWEB.
+  const setFrameShown = useCallback((next: boolean) => {
     // 1. The tour's own bridge, if its start action installed one.
     const bridge = (() => {
       try {
@@ -169,28 +196,42 @@ export default function AiToggle({ initiallyVisible = false }: { initiallyVisibl
     }
 
     broadcastVisibility(next);
+    shownRef.current = next;
     setShown(next);
-  }, [shown]);
+    setResting(false);
+  }, []);
+
+  // The button. Shown but resting: a tap means "talk to her", not "hide her".
+  const toggle = useCallback(() => {
+    if (shown && resting) {
+      postToEmbed([{ type: "receptionist-start" }]);
+      setResting(false);
+    } else {
+      setFrameShown(!shown);
+    }
+  }, [shown, resting, setFrameShown]);
 
   // Let the tour drive the same switch from its own actions:
   //   Add Action -> Execute JavaScript -> window.parent.toggleAI()
   useEffect(() => {
     const api = {
       toggleAI: () => toggle(),
+      // "Visible" means a live session: showing a resting frame wakes her.
       setAIVisible: (v: boolean) => {
-        if (v !== shown) toggle();
+        if (v && shown && resting) toggle();
+        else if (v !== shown) setFrameShown(v);
       },
     };
     Object.assign(window, api);
 
     // The receptionist ended her session on her own (idle or max length) and
-    // has already left the room. Switch off to match, so the frame isn't left
-    // showing an empty panel and the next visitor's tap starts a fresh session.
+    // has left the room; the frame stays up with "Tap to talk" (#9). Show the
+    // button as off so a tap on it reads as "talk to her" too.
     const onMessage = (e: MessageEvent) => {
       if (e.origin !== window.location.origin) return;
-      if ((e.data as { type?: string })?.type === "receptionist-ended") {
-        api.setAIVisible(false);
-      }
+      const type = (e.data as { type?: string })?.type;
+      if (type === "receptionist-ended") setResting(true);
+      else if (type === "receptionist-started") setResting(false);
     };
     window.addEventListener("message", onMessage);
 
@@ -199,7 +240,9 @@ export default function AiToggle({ initiallyVisible = false }: { initiallyVisibl
       delete (window as unknown as Record<string, unknown>).toggleAI;
       delete (window as unknown as Record<string, unknown>).setAIVisible;
     };
-  }, [toggle, shown]);
+  }, [toggle, setFrameShown, shown, resting]);
+
+  const live = shown && !resting;
 
   // Bottom-right, opposite the Controls column (mute / VR / recenter) which
   // owns the bottom-left corner.
@@ -224,16 +267,18 @@ export default function AiToggle({ initiallyVisible = false }: { initiallyVisibl
           e.currentTarget.style.borderColor = "rgba(255, 255, 255, 0.8)";
         }}
         style={buttonStyle}
-        title={shown ? "Hide the AI receptionist" : "Show the AI receptionist"}
+        title={
+          live ? "Hide the AI receptionist" : shown ? "Talk to the AI receptionist" : "Show the AI receptionist"
+        }
       >
         <div
           style={{
             ...innerBase,
-            background: shown ? "rgba(0, 150, 255, 0.2)" : "rgba(255, 255, 255, 0.1)",
-            color: shown ? "rgba(0, 150, 255, 0.9)" : "rgba(255, 255, 255, 0.9)",
+            background: live ? "rgba(0, 150, 255, 0.2)" : "rgba(255, 255, 255, 0.1)",
+            color: live ? "rgba(0, 150, 255, 0.9)" : "rgba(255, 255, 255, 0.9)",
           }}
         >
-          {shown ? "🙋‍♀️" : "💬"}
+          {live ? "🙋‍♀️" : "💬"}
         </div>
       </button>
     </div>

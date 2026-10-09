@@ -24,7 +24,13 @@ New abilities are added as **function tools** on `MiaAgent` in the worker.
   to everyone in `team.json` (`alert_emergency`, max 2 per conversation)
 - Ends the session herself when the visitor says goodbye (`end_conversation`),
   after her goodbye has played
-- Session limits: ends after 2 min silence or 10 min total, AI button to restart
+- Session limits: ends after 2 min silence or 10 min total; she then rests
+  with "Tap to talk to {name}" on screen (no session billed) until a tap on it
+  or on the AI button starts a new one
+- On the kiosk screen: live captions of what she says and what she heard, a
+  Contact button (card with phone, email, address, website QR), and a "say my
+  name" banner while she is paused. The worker can push cards to the screen
+  (`docs/screen-protocol.md`), but doesn't yet (wave 2)
 
 Tests for all the team tools and goodbye: `agent-worker/test_team_messages.py`
 (text conversations against the real Gemini, emails replaced by recorders).
@@ -67,7 +73,7 @@ email may not be seen fast enough.
 ### 6. End the conversation on goodbye — *done*
 `end_conversation`: Mia says a short goodbye and calls it in the same reply.
 It waits for the goodbye to finish playing, then ends the session like the idle
-limit (room deleted, kiosk hides her). The goodbye can't be interrupted.
+limit (room deleted, the kiosk shows "Tap to talk"). The goodbye can't be interrupted.
 
 ### 7. Screen states 0–6 (presence, doorbell, door)
 Needs hardware and signals the kiosk doesn't have yet:
