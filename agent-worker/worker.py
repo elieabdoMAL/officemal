@@ -36,6 +36,8 @@ The LIVEKIT_* vars are read automatically by the agents framework.
 """
 
 import asyncio
+import contextlib
+import functools
 import json
 import logging
 import os
@@ -56,15 +58,18 @@ from livekit.agents import (
     cli,
     function_tool,
 )
+from livekit.agents.llm import ChatChunk
 from livekit.agents.stt import SpeechEventType
 from livekit.plugins import deepgram, google, simli
 
 from conversation_control import (
+    fold,
     language_choice,
     language_switch,
     only_name,
     says_name,
     speak_digits_stream,
+    visitor_said_name,
     wants_pause,
 )
 from leads import (
@@ -88,6 +93,7 @@ from screen_cards import (
     project_request,
 )
 from team_messages import (
+    _norm,
     find_member,
     is_real_name,
     load_team,
@@ -158,6 +164,10 @@ INBOX = next((m for m in TEAM if m.inbox), None)
 VOICE_BY_LANG = {"fr": "aura-2-agathe-fr", "en": "aura-2-andromeda-en"}
 # Words the French Aura voice can't say, respelled for it (audio only).
 FRENCH_VOICE_RESPELL = re.compile(r"\bEnglish\b")
+# A reply that opens with a one-word sentence, then more ("Goodbye! Have a
+# great day!"), and one that is a single word so far (MiaAgent._join_one_word_opening).
+ONE_WORD_OPENING = re.compile(r"\s*([^\s.!?,;:]+)([.!]+)(?=\s+\S)")
+ONE_WORD_SO_FAR = re.compile(r"\s*[^\s.!?,;:]*[.!]*\s*$")
 
 # Voice for the bilingual greeting and anything said before the visitor has
 # chosen: the French voice says "hello" well enough (and "English" respelled,
@@ -181,8 +191,10 @@ STT_KEYTERMS = [ASSISTANT_NAME, "assistante", "tais-toi", "English", "anglais", 
 # returns nothing at all for French. So when speech produces no transcript this
 # many times in a row, she goes back to listening in both languages (her reply
 # language stays locked) until a turn is understood — enough for a French
-# visitor to be heard asking "en français, s'il vous plaît".
-UNHEARD_BEFORE_WIDENING = 2
+# visitor to be heard asking "en français, s'il vous plaît". Once: at 2, in
+# the voice tests, "Est-ce qu'on peut parler français ?" had to be said three
+# times before it was heard (2026-10-09).
+UNHEARD_BEFORE_WIDENING = 1
 # How long after the visitor stops speaking a transcript may still arrive.
 UNHEARD_AFTER_S = 2.5
 
@@ -313,25 +325,40 @@ GOODBYE = {
 # audio goes to Simli, which plays it into the room itself, and the playout
 # count the framework waits on can be thrown off by an earlier interruption (a
 # clear-buffer whose playback-finished never came is marked done after 2 s, and
-# Simli's late event then "finishes" the next segment early). Deleting the room
-# at that point cut her goodbye off entirely in testing. So wait as long as the
-# goodbye takes to say, plus the avatar pipeline, measured from "done": too long
-# when "done" was right (she stands silent a moment), never too short when it
-# wasn't. Aura speaks ~14-15 characters a second; the clamp keeps a one-word
-# goodbye audible and a rambling one from holding the room open.
+# Simli's late event then "finishes" the next segment early). Even without one,
+# "done" doesn't track the kiosk: measured 2026-10-09, the room (LiveKit's
+# active speakers) starts hearing her 1.6-2.9 s after her "speaking" state,
+# and "done" fired from ~1 s to 3.3 s after it. A lone "Goodbye!" with 2 s of
+# grace after "done" was cut off at "Good…" 3 times in 3, and a 47-character
+# one held 4.4 s at "Goodbye for [now]". So the room is held until the goodbye
+# has had time to play, counted from when she started saying it, plus the
+# avatar pipeline, and never less than GOODBYE_GRACE_MIN_S after "done"; then,
+# if the room still hears her, until she has been silent there for
+# GOODBYE_QUIET_S (let_goodbye_play). Aura speaks ~14-15 characters a second;
+# the max keeps a rambling goodbye from holding the room open.
 GOODBYE_CHARS_PER_SEC = 14.0
-AVATAR_PIPELINE_S = 1.0
-GOODBYE_GRACE_MIN_S = 2.0
-GOODBYE_GRACE_MAX_S = 8.0
-# After the grace, if LiveKit still hears the avatar speaking (a goodbye longer
-# than the estimate), wait up to this much more for her to stop.
-GOODBYE_OVERRUN_MAX_S = 5.0
+AVATAR_PIPELINE_S = 3.0
+GOODBYE_GRACE_MIN_S = 5.0
+GOODBYE_GRACE_MAX_S = 10.0
+# Silence in the room that ends a goodbye: longer than the pause between two
+# of her sentences, during which the room "no longer hears" her for ~0.4 s.
+GOODBYE_QUIET_S = 1.0
+# After the grace, wait at most this much more for the room to stop hearing her.
+GOODBYE_OVERRUN_MAX_S = 6.0
 
 
-def goodbye_grace(text: str) -> float:
-    """Seconds to hold the room open after a goodbye of `text` is reported done."""
-    estimate = len(text.strip()) / GOODBYE_CHARS_PER_SEC + AVATAR_PIPELINE_S
-    return min(max(estimate, GOODBYE_GRACE_MIN_S), GOODBYE_GRACE_MAX_S)
+def goodbye_grace(text: str, done_at: float, started_at: float | None = None) -> float:
+    """Seconds to hold the room open from `done_at` (monotonic) for a goodbye
+    of `text`, reported done then, whose audio started at `started_at`."""
+    start = done_at if started_at is None else min(started_at, done_at)
+    heard_by = start + len(text.strip()) / GOODBYE_CHARS_PER_SEC + AVATAR_PIPELINE_S
+    return min(max(heard_by - done_at, GOODBYE_GRACE_MIN_S), GOODBYE_GRACE_MAX_S)
+
+
+# A goodbye said in the same reply as a send ("Yes, perfect, thanks, bye!"):
+# the session ends only if the visitor says nothing for this long after her
+# reply, so they hear the confirmation and can still correct it.
+END_AFTER_SEND_S = 6.0
 
 # Explicit dispatch: the worker joins only rooms whose token asks for this agent
 # by name (see /api/livekit/token), never every room on the LiveKit project.
@@ -409,10 +436,61 @@ NOTIFY_CLAIM_NOTE = (
     "Otherwise say in a few words that you have not told anyone yet, and ask for what is missing."
 )
 
+# "Please check your request on the screen" before show_project_request has
+# answered SHOWN: the screen shows nothing (test_leads, FR, now and then).
+# Such sentences are dropped before anyone hears them (MiaAgent.llm_node);
+# she is then asked to show it, or to ask for what is missing.
+SCREEN_WORDS = re.compile(r"\b(screen|ecran)\b")
+DRAFT_WORDS = re.compile(
+    r"\b(request|demande|draft|brouillon|form|formulaire|summary|resume|recapitulatif|project|projet|"
+    r"everything|tout|correct|exact|accurate|check|verify|verifier|verifiez|show|display|afficher|affiche|"
+    r"affichee|affichees|affiches|details?|informations?)\b"
+)
+# The screen's other uses: the contact card (whenever she gives the office's
+# details), the "sent" cards, and Infini View, which is moved around by touch.
+NOT_DRAFT_WORDS = re.compile(
+    r"\b(contact|coordonnees|phone|telephone|number|numero|email|courriel|address|adresse|website|site|"
+    r"sent|envoye|envoyee|message|confirmation|touch|touching|tap|pan|panning|slide|sliding|swipe|drag|"
+    r"toucher|touchez|glisser|glissez|appuyer|appuyez)\b"
+)
+STILL_HERE_NOTE = (
+    "The conversation has not ended: after your goodbye, the visitor said something more. "
+    "Answer them as usual."
+)
+SCREEN_CLAIM_NOTE = (
+    "System check: you were about to tell the visitor to check their project request on the screen, "
+    "but it is not on the screen: show_project_request has not answered SHOWN. The visitor heard "
+    "nothing of it. Call show_project_request now with everything the visitor told you. If it answers "
+    "NOT SHOWN, ask for what is missing, in one short question, without mentioning the screen."
+)
+# Her sentences, for that check: a sentence ends at . ! ? or a line break.
+SENTENCE_END = re.compile(r"(?<=[.!?…])\s+|\n+")
+
+
+def sends_email(tool):
+    """Marks a tool that emails someone (take_message, notify_member, ...): a
+    goodbye in the same reply then doesn't end the session at once
+    (end_conversation, END_AFTER_SEND_S). Goes under @function_tool."""
+
+    @functools.wraps(tool)
+    async def wrapper(self: "MiaAgent", *args, **kwargs):
+        self._send_turn = self._visitor_turns
+        return await tool(self, *args, **kwargs)
+
+    return wrapper
+
+
 # Her answer when a tool refuses a repeat send (leads.SentLog).
 ALREADY_SENT = (
     "NOT SENT AGAIN: {what} was already sent to {to} in this conversation. Tell the visitor it is "
     "already sent. Send it again only if they clearly ask you to send it again."
+)
+
+# Her answer when a tool is given a visitor name the visitor never said
+# (MiaAgent._visitor_named): "Hi, I'm here to see Alex" -> visitor_name="there".
+NOT_THEIR_NAME = (
+    "NOT SENT: {name!r} is not a name the visitor has told you in this conversation, so you do not "
+    "have their name yet. Ask for it in one short question, then call this again with the name they say."
 )
 
 
@@ -479,7 +557,7 @@ class MiaAgent(Agent):
         self,
         tts,
         stt=None,
-        on_goodbye: Callable[[str], None] | None = None,
+        on_goodbye: Callable[[str, float], None] | None = None,
         on_status: Callable[[], None] | None = None,
         on_screen: Callable[[dict], None] | None = None,
     ) -> None:
@@ -488,8 +566,9 @@ class MiaAgent(Agent):
         super().__init__(instructions=MIA_SYSTEM_PROMPT)
         # Ends the session the way the idle limit does (entrypoint's
         # end_session). end_conversation calls it once her goodbye is reported
-        # played, with the words she said, so the room is held open long
-        # enough for them to actually reach the kiosk (see goodbye_grace).
+        # played, with the words she said and when (time.monotonic()), so the
+        # room is held open long enough for them to actually reach the kiosk
+        # (see goodbye_grace).
         self._on_goodbye = on_goodbye
         # Called whenever `paused` or `chosen_language` changes (screen
         # attributes, pause timeout: see entrypoint).
@@ -527,8 +606,18 @@ class MiaAgent(Agent):
         # repeat guard lets a send through again only if they asked for it.
         self._visitor_said = ""
         self._visitor_turns = 0
-        # The visitor turn in which notify_member was last called (NOTIFY_CLAIM).
+        # Everything the visitor said so far (llm_node): a name a tool is
+        # given must be one of theirs (_visitor_named).
+        self._visitor_lines: list[str] = []
+        # The visitor turn in which notify_member last answered NOTIFIED (NOTIFY_CLAIM).
         self._notify_turn = -1
+        # The visitor turn in which a tool last tried to send an email
+        # (sends_email), and the end that waits on the visitor after it.
+        self._send_turn = -1
+        # The visitor turn whose "it's on the screen" was dropped and checked (SCREEN_CLAIM_NOTE).
+        self._screen_check_turn = -1
+        self._pending_end: asyncio.Task | None = None  # see end_conversation
+        self._pending_end_turn: int | None = None
         self._tasks: set[asyncio.Task] = set()
         # The project request she is filling in (#20), field key -> value,
         # and the visitor turn it was last shown in: it is sent only after
@@ -580,6 +669,27 @@ class MiaAgent(Agent):
         if member.inbox:
             return member.role_fr if self._chosen_language == "fr" else member.first_name
         return member.full_name
+
+    def _visitor_named(self, name: str, member=None) -> bool:
+        """True when `name` is a name the visitor gave in this conversation,
+        and not just the name of `member`, who they came to see or write to:
+        "I'm here to see Alex" gave Gemini visitor_name="there", or "Alex"."""
+        if not is_real_name(name) or not visitor_said_name(name, self._visitor_lines, ASSISTANT_NAME):
+            logger.info("visitor_name %r: not a name the visitor gave, refused", name)
+            return False
+        if member is not None and not member.inbox:
+            theirs = set(_norm(" ".join((member.full_name, *member.aliases))).split())
+            if set(_norm(name).split()) <= theirs:
+                logger.info("visitor_name %r is %s's name, refused", name, member.full_name)
+                return False
+        return True
+
+    def _just_dictated(self, text: str) -> bool:
+        """True when `text` is mostly the visitor's latest words: they have
+        only just said it, so she hasn't repeated it for them to confirm."""
+        latest = set(_norm(self._visitor_said).split())
+        words = [w for w in _norm(text).split() if len(w) > 2]
+        return bool(words) and sum(w in latest for w in words) >= 0.7 * len(words)
 
     def _is_repeat(self, kind: str, recipient: str, content: str) -> bool:
         if self._sent.is_repeat(kind, recipient, content, self._visitor_said):
@@ -678,12 +788,105 @@ class MiaAgent(Agent):
         # before the turn is even complete.
         if self._paused:
             return
-        visitor = [i for i in chat_ctx.items if getattr(i, "type", "") == "message" and i.role == "user"]
+        messages = [i for i in chat_ctx.items if getattr(i, "type", "") == "message"]
+        visitor = [i for i in messages if i.role == "user"]
         if visitor:
             self._visitor_said = visitor[-1].text_content or ""
             self._visitor_turns = len(visitor)
+            self._visitor_lines = [i.text_content or "" for i in visitor]
+        if self._pending_end_turn is not None and self._visitor_turns > self._pending_end_turn:
+            # They went on after a goodbye that was waiting on them
+            # (_end_after_send). Without a word, Gemini took the conversation
+            # as over: "I can only end the conversation, and I already did."
+            logger.info("the visitor went on after the goodbye: not ending")
+            self._pending_end_turn = None
+            if self._pending_end is not None:
+                self._pending_end.cancel()
+            chat_ctx = chat_ctx.copy()
+            chat_ctx.add_message(role="system", content=STILL_HERE_NOTE)
+        project_talk = bool(self._project) or any(
+            re.search(r"\bproje[ct]t?\b", fold(i.text_content or "")) for i in messages
+        )
+        if not project_talk or self._project_shown_at is not None:
+            async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
+                yield chunk
+            return
+        # A project request may be under way and isn't on the screen yet: her
+        # text is passed on one sentence at a time, and one claiming it is on
+        # the screen is held back until the end of this step. If she called
+        # show_project_request in the same step and it answered SHOWN, the
+        # sentence is true by then and is said; otherwise it is dropped
+        # (SCREEN_CLAIM_NOTE). Tool calls pass straight through.
+        turn = self._visitor_turns
+        pending = ""
+        held: list[str] = []
+        shows = False
         async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
-            yield chunk
+            if isinstance(chunk, str):
+                text, chunk = chunk, None
+            elif isinstance(chunk, ChatChunk) and chunk.delta and chunk.delta.content:
+                text = chunk.delta.content
+                chunk = chunk.model_copy(update={"delta": chunk.delta.model_copy(update={"content": None})})
+            else:
+                text = ""
+            if isinstance(chunk, ChatChunk) and chunk.delta and chunk.delta.tool_calls:
+                shows = shows or any(c.name == "show_project_request" for c in chunk.delta.tool_calls)
+            pending += text
+            while match := SENTENCE_END.search(pending):
+                sentence, pending = pending[: match.end()], pending[match.end() :]
+                if self._early_screen_claim(sentence):
+                    held.append(sentence)
+                    continue
+                yield sentence
+            if chunk is not None:
+                yield chunk
+        if pending and self._early_screen_claim(pending):
+            held.append(pending)
+        elif pending:
+            yield pending
+        if not held:
+            return
+        if shows:
+            # Tools run as soon as they are called, while she is still talking.
+            for _ in range(10):
+                if self._project_shown_at is not None:
+                    break
+                await asyncio.sleep(0.1)
+        if self._project_shown_at is not None:
+            for sentence in held:
+                yield sentence
+            return
+        logger.warning("dropped, the project request is not on the screen yet: %r", "".join(held))
+        if self._screen_check_turn != turn:
+            self._screen_check_turn = turn
+            self._spawn(self._check_screen_claim(turn))
+
+    def _early_screen_claim(self, sentence: str) -> bool:
+        """True for "check your request on the screen" while it isn't there."""
+        if self._project_shown_at is not None:
+            return False
+        s = fold(sentence)
+        return bool(SCREEN_WORDS.search(s) and DRAFT_WORDS.search(s) and not NOT_DRAFT_WORDS.search(s))
+
+    async def _check_screen_claim(self, turn: int) -> None:
+        """A sentence about the request on the screen was dropped: once this
+        turn is over, have her show it, or ask for what is missing."""
+        try:
+            handle = self.session.current_speech
+            if handle is not None:
+                await handle
+            await asyncio.sleep(0.3)
+            if self._project_shown_at is not None or self._visitor_turns != turn or self._paused or self._ending:
+                return
+            self.session.generate_reply(instructions=SCREEN_CLAIM_NOTE)
+        except Exception:
+            logger.exception("screen claim check failed")
+
+    def _spawn(self, coro) -> asyncio.Task:
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
 
     async def tts_node(self, text, model_settings):
         # Phone numbers and long digit runs are spoken digit by digit (#6):
@@ -692,7 +895,7 @@ class MiaAgent(Agent):
         # transcript (and on-screen captions) keep the digits.
         spoken = speak_digits_stream(text, lambda: self._voice_language)
         if TTS_PROVIDER == "deepgram":
-            spoken = self._french_voice_respell(spoken)
+            spoken = self._french_voice_respell(self._join_one_word_opening(spoken))
         async for frame in Agent.default.tts_node(self, spoken, model_settings):
             yield frame
 
@@ -716,9 +919,7 @@ class MiaAgent(Agent):
                 self._show_contact_card()
             yield chunk
         if NOTIFY_CLAIM.search(said) and not self._notifications_sent:
-            task = asyncio.create_task(self._check_notify_claim(self._visitor_turns, said))
-            self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)
+            self._spawn(self._check_notify_claim(self._visitor_turns, said))
 
     async def _check_notify_claim(self, turn: int, said: str) -> None:
         """She said she told someone the visitor is here: once this turn is
@@ -742,7 +943,32 @@ class MiaAgent(Agent):
         async for chunk in text:
             yield FRENCH_VOICE_RESPELL.sub("Inglish", chunk) if self._voice_language == "fr" else chunk
 
+    @staticmethod
+    async def _join_one_word_opening(text):
+        # Aura renders a one-word sentence on its own badly: "Goodbye!" came
+        # out empty, as "about" or "you", in about half the tries (2026-10-09),
+        # and it synthesizes each sentence as soon as it ends, so "Goodbye!
+        # Have a great day!" lost its "Goodbye!" at the kiosk. A one-word
+        # opening sentence is joined to the next one for the voice: "Goodbye,
+        # have a great day!". Not a question ("Yes? How can I help?").
+        head = ""
+        async for chunk in text:
+            if head is None:
+                yield chunk
+                continue
+            head += chunk
+            if m := ONE_WORD_OPENING.match(head):
+                yield head[: m.end(1)] + "," + head[m.end(2) :]
+            elif ONE_WORD_SO_FAR.match(head):
+                continue  # may still become "Word! More words"
+            else:
+                yield head
+            head = None
+        if head:
+            yield head
+
     @function_tool()
+    @sends_email
     async def take_message(
         self,
         context: RunContext,
@@ -770,8 +996,10 @@ class MiaAgent(Agent):
                 f"NOT SENT: no single team member matches {recipient!r}. If it is unclear, ask who "
                 "they mean. Otherwise say you cannot reach that person from here and give the contact details."
             )
-        if not is_real_name(visitor_name) or not message.strip():
-            return "NOT SENT: the visitor's real name and the message are both required. Ask for what is missing."
+        if not message.strip():
+            return "NOT SENT: the message is empty. Ask the visitor what they would like to say."
+        if not self._visitor_named(visitor_name, member):
+            return NOT_THEIR_NAME.format(name=visitor_name)
         if self._is_repeat("message", member.email, message):
             self._show_sent("message", self._display_name(member))
             return ALREADY_SENT.format(what="This message", to=member.full_name)
@@ -783,6 +1011,7 @@ class MiaAgent(Agent):
         return f"SENT to {member.full_name}."
 
     @function_tool()
+    @sends_email
     async def notify_member(
         self,
         context: RunContext,
@@ -800,7 +1029,6 @@ class MiaAgent(Agent):
             member: Who they came to see, as the visitor said it: a name or a role such as "the CEO".
             note: Why they came, only if the visitor said, for example "for a two o'clock meeting". Empty otherwise.
         """
-        self._notify_turn = self._visitor_turns
         if self._notifications_sent >= MAX_NOTIFICATIONS_PER_SESSION:
             return "NOT SENT: notification limit for this conversation reached. Give the contact details instead."
         found = find_member(member, TEAM)
@@ -809,15 +1037,17 @@ class MiaAgent(Agent):
                 f"NOT SENT: no single team member matches {member!r}. If it is unclear, ask who "
                 "they mean. Otherwise say you cannot reach that person from here and give the contact details."
             )
-        if not is_real_name(visitor_name):
-            return "NOT SENT: you do not have the visitor's name yet. Ask for it, then call this again."
+        if not self._visitor_named(visitor_name, found):
+            return NOT_THEIR_NAME.format(name=visitor_name)
         # Same person told about the same visitor: a repeat, whatever the note.
         if self._is_repeat("notify", found.email, visitor_name):
             self._show_sent("notify", found.full_name)
             return ALREADY_SENT.format(what=f"The notice that {visitor_name} is here", to=found.full_name)
         if not await send_visitor_waiting_email(found, visitor_name, note):
             return "NOT SENT: the email could not be delivered. Say so plainly and give the contact details."
+        logger.info("notify_member: told %s that %s is here", found.full_name, visitor_name)
         self._notifications_sent += 1
+        self._notify_turn = self._visitor_turns
         self._sent.add("notify", found.email, visitor_name)
         self._show_sent("notify", found.full_name)
         # The words to say come with the result, not from the prompt: given
@@ -834,6 +1064,7 @@ class MiaAgent(Agent):
         )
 
     @function_tool()
+    @sends_email
     async def alert_emergency(self, context: RunContext, description: str) -> str:
         """Email an urgent alert to the whole team that there is an emergency at reception.
 
@@ -864,6 +1095,7 @@ class MiaAgent(Agent):
         )
 
     @function_tool()
+    @sends_email
     async def send_suggestion(
         self,
         context: RunContext,
@@ -887,8 +1119,14 @@ class MiaAgent(Agent):
             return "NOT SENT: suggestion limit for this conversation reached. Give the contact details instead."
         if not suggestion.strip():
             return "NOT SENT: the suggestion is empty. Ask the visitor what they would like to suggest."
-        if not is_real_name(visitor_name):
-            visitor_name = ""  # "the visitor", "anonymous": anonymous it is
+        if self._just_dictated(suggestion):
+            # "C'est exact ? Votre suggestion est envoyée" in one breath, in testing.
+            return (
+                "NOT SENT yet: the visitor has only just said it. Repeat it in a few words and ask whether "
+                "to send it; call this again once they say yes."
+            )
+        if visitor_name.strip() and not self._visitor_named(visitor_name):
+            visitor_name = ""  # "the visitor", or a name they never gave: anonymous it is
         if self._is_repeat("suggestion", INBOX.email, suggestion):
             self._show_sent("suggestion")
             return ALREADY_SENT.format(what="This suggestion", to="the team")
@@ -911,7 +1149,10 @@ class MiaAgent(Agent):
     async def show_project_request(self, raw_arguments: dict[str, object], context: RunContext) -> str:
         # Fields only ever get filled in or corrected here, never blanked:
         # Gemini sends "" for whatever it didn't think to repeat.
-        self._project.update(clean_project_fields(raw_arguments))
+        fields = clean_project_fields(raw_arguments)
+        if "name" in fields and not self._visitor_named(fields["name"]):
+            del fields["name"]  # then it is missing, and she asks for it
+        self._project.update(fields)
         missing = missing_project_fields(self._project)
         if missing:
             return "NOT SHOWN yet, still missing: " + "; ".join(missing) + ". Ask for it, one question at a time."
@@ -927,6 +1168,7 @@ class MiaAgent(Agent):
         )
 
     @function_tool()
+    @sends_email
     async def submit_project_request(self, context: RunContext) -> str:
         """Send the project request shown on the screen to the team's general inbox.
 
@@ -969,10 +1211,17 @@ class MiaAgent(Agent):
         or thanked you and want nothing else. Call it in the same reply as your
         short goodbye, after the goodbye words. Never call it while something is
         still in progress, such as a message they just confirmed: finish that
-        with its own tool first, and end in a later reply.
+        with its own tool first. If something was sent in this same reply, it
+        waits a few seconds for the visitor before ending.
         """
         if self._ending:
             return None
+        if self._send_turn == self._visitor_turns:
+            # "Yes, perfect, thanks, bye!": she sent something in this same
+            # reply. The prompt says to end only in a later reply, which
+            # Gemini didn't always do; ending here would cut the visitor off
+            # from the confirmation (and from correcting it).
+            return await self._end_after_send(context)
         # Once she's saying goodbye, let it finish: the mic stays open in a noisy
         # lobby, and a stray sound cutting her off would leave the session
         # running until the idle limit. A visitor who wasn't done taps AI again.
@@ -992,7 +1241,7 @@ class MiaAgent(Agent):
             if self._on_goodbye is not None:
                 # Everything she said this turn: if "done" came early, none of
                 # it may have played yet, so size the grace for all of it.
-                self._on_goodbye(" ".join(_assistant_texts(done_handle)))
+                self._on_goodbye(" ".join(_assistant_texts(done_handle)), time.monotonic())
 
         # Fires when this whole turn is reported played out, including any
         # reply after the tool; end_session then waits out the goodbye grace,
@@ -1004,6 +1253,57 @@ class MiaAgent(Agent):
         # She called the tool without a word. Have her say it now, in this turn.
         logger.info("end_conversation: no goodbye yet, asking for one")
         return "Ending now. Say a short, warm goodbye in the visitor's language. Do not call any tool."
+
+    async def _end_after_send(self, context: RunContext) -> str | None:
+        """end_conversation in the reply that sent something: let the reply
+        play, then end only if the visitor says nothing for END_AFTER_SEND_S."""
+        handle = context.speech_handle
+        turn = self._pending_end_turn = self._visitor_turns
+        spoken_before = _assistant_lines(handle)
+        await context.wait_for_playout()
+        logger.info(
+            "end_conversation in the reply that sent: ending if the visitor says nothing for %.0fs",
+            END_AFTER_SEND_S,
+        )
+
+        def _on_done(done_handle) -> None:
+            if self._pending_end is not None:
+                self._pending_end.cancel()
+            said = " ".join(_assistant_texts(done_handle))
+            self._pending_end = self._spawn(self._end_if_quiet(turn, self._speech_id, said, time.monotonic()))
+
+        handle.add_done_callback(_on_done)
+        if _assistant_lines(handle) > spoken_before:
+            return None
+        return (
+            "Not ended yet, because you sent it in this same reply. Say in a few words that it is sent, "
+            "as the tool's answer says, then a short goodbye. Do not call any tool."
+        )
+
+    async def _end_if_quiet(self, turn: int, speech: int, said: str, done_at: float) -> None:
+        try:
+            await asyncio.sleep(END_AFTER_SEND_S)
+            if (
+                self._ending
+                or self._paused
+                or self._visitor_turns != turn
+                or self._speech_id != speech
+                or self.session.user_state == "speaking"
+                or self.session.agent_state in ("speaking", "thinking")
+            ):
+                return  # they went on (llm_node)
+            logger.info("end_conversation: nothing more from the visitor, ending")
+            self._ending = True
+            if self._on_goodbye is not None:
+                self._on_goodbye(said, done_at)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("ending after the send failed")
+
+    async def on_exit(self) -> None:
+        if self._pending_end is not None:
+            self._pending_end.cancel()
 
     @function_tool()
     async def pause_conversation(self, context: RunContext) -> None:
@@ -1062,7 +1362,7 @@ class MiaAgent(Agent):
                 return _reply_language_note(self._last_raw_language)  # offer FR/EN
             self._choose_language(choice)
             return CHOSEN_NOTE.format(name=LANGUAGE_NAMES[choice])
-        switch = language_switch(text, self._chosen_language)
+        switch = language_switch(text, self._chosen_language, ASSISTANT_NAME)
         if switch is not None:
             logger.info("visitor asked to switch to %s", switch)
             self._choose_language(switch)
@@ -1225,36 +1525,62 @@ async def entrypoint(ctx: JobContext) -> None:
     avatar_quiet = asyncio.Event()
     avatar_quiet.set()
 
+    # When the room last stopped hearing her (time.monotonic()).
+    avatar_quiet_since = time.monotonic()
+
     @ctx.room.on("active_speakers_changed")
     def _on_speakers(speakers) -> None:
+        nonlocal avatar_quiet_since
         if any(p.identity == avatar.avatar_identity for p in speakers):
             avatar_quiet.clear()
-        else:
+        elif not avatar_quiet.is_set():
+            avatar_quiet_since = time.monotonic()
             avatar_quiet.set()
 
-    async def let_goodbye_play(text: str) -> None:
-        """Hold the room open until `text`, reported played, has been heard."""
-        grace = goodbye_grace(text)
-        logger.info("holding the room %.1fs for the goodbye to play out", grace)
-        await asyncio.sleep(grace)
-        if not avatar_quiet.is_set():
-            logger.info("avatar still speaking after the grace; waiting for it to stop")
-            try:
-                await asyncio.wait_for(avatar_quiet.wait(), GOODBYE_OVERRUN_MAX_S)
-            except asyncio.TimeoutError:
-                logger.warning("avatar still speaking %.0fs past the grace; ending anyway", GOODBYE_OVERRUN_MAX_S)
+    # When she last started speaking (the agent's "speaking" state: her audio
+    # is going out to the avatar), to time her goodbye (goodbye_grace).
+    speaking_since: float | None = None
+
+    async def let_goodbye_play(text: str, done_at: float) -> None:
+        """Hold the room open until `text`, reported played at `done_at`, has been heard."""
+        wait = done_at + goodbye_grace(text, done_at, speaking_since) - time.monotonic()
+        logger.info(
+            "holding the room %.1fs for the goodbye to play out (%d chars, started speaking %.1fs before done)",
+            max(wait, 0.0),
+            len(text),
+            done_at - speaking_since if speaking_since is not None else -1.0,
+        )
+        if wait > 0:
+            await asyncio.sleep(wait)
+        # Then, if the room still hears her (a goodbye longer than the
+        # estimate), until she has been silent there for GOODBYE_QUIET_S: a
+        # pause between two sentences is not the end. Only ever longer: the
+        # room's detection misses a lone short word like "Goodbye!".
+        give_up = time.monotonic() + GOODBYE_OVERRUN_MAX_S
+        while (left := give_up - time.monotonic()) > 0:
+            if avatar_quiet.is_set():
+                quiet_for = time.monotonic() - avatar_quiet_since
+                if quiet_for >= GOODBYE_QUIET_S:
+                    return
+                await asyncio.sleep(min(GOODBYE_QUIET_S - quiet_for, left))
+                continue
+            logger.info("goodbye still playing in the room: waiting for it to end")
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(avatar_quiet.wait(), left)
+        logger.warning("goodbye still playing %.0fs past the grace; ending anyway", GOODBYE_OVERRUN_MAX_S)
 
     ending = False
 
-    async def end_session(reason: str, goodbye: bool = False, said: str = "") -> None:
+    async def end_session(reason: str, goodbye: bool = False, said: str = "", done_at: float | None = None) -> None:
         """Close the room for everyone and release this job. Safe to call twice.
 
         Deleting the room is what stops the bill: it disconnects the kiosk and
         the Simli avatar at once, instead of each lingering until a timeout.
 
         goodbye: say GOODBYE first (the hard cap ends her mid-conversation).
-        said: a goodbye she has already said (end_conversation). Either way the
-        room stays open until the goodbye has had time to reach the kiosk.
+        said: a goodbye she has already said (end_conversation), reported
+        played at `done_at`. Either way the room stays open until the goodbye
+        has had time to reach the kiosk.
         """
         nonlocal ending
         if ending:
@@ -1274,9 +1600,12 @@ async def entrypoint(ctx: JobContext) -> None:
                 await session.say(said, allow_interruptions=False)
             except Exception:
                 logger.exception("goodbye failed; ending anyway")
+            done_at = time.monotonic()
         if said:
-            await let_goodbye_play(said)
+            await let_goodbye_play(said, done_at if done_at is not None else time.monotonic())
         try:
+            if said and speaking_since is not None:
+                logger.info("deleting the room %.1fs after she started her goodbye", time.monotonic() - speaking_since)
             await ctx.delete_room()
         except Exception:
             logger.exception("delete_room failed; LiveKit's departure timeout will close it")
@@ -1356,7 +1685,7 @@ async def entrypoint(ctx: JobContext) -> None:
     agent = MiaAgent(
         tts=tts,
         stt=stt,
-        on_goodbye=lambda said: spawn(end_session("visitor said goodbye", said=said)),
+        on_goodbye=lambda said, done_at: spawn(end_session("visitor said goodbye", said=said, done_at=done_at)),
         on_status=on_status,
         on_screen=lambda msg: spawn(send_screen(msg)),
     )
@@ -1397,7 +1726,10 @@ async def entrypoint(ctx: JobContext) -> None:
             spawn(agent.check_heard())
 
     @session.on("agent_state_changed")
-    def _on_agent_state(_ev) -> None:
+    def _on_agent_state(ev) -> None:
+        nonlocal speaking_since
+        if ev.new_state == "speaking":
+            speaking_since = time.monotonic()
         spawn(publish_screen_state())
 
     # The visitor left (AI button turned off, page closed, network gone):

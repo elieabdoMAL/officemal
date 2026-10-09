@@ -145,7 +145,7 @@ class Conversation:
         # slot the session speaks through), so clear it and the swap. on_goodbye
         # stands in for end_session, which in production deletes the room once the
         # goodbye it is handed has had time to play.
-        def on_goodbye(said: str) -> None:
+        def on_goodbye(said: str, done_at: float) -> None:
             assert said.strip(), "end_session must be handed the goodbye she said, to time its playout"
             calls.append(("end",))
 

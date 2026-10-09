@@ -114,6 +114,7 @@ async def test_tool_guards() -> None:
 
     agent = worker.MiaAgent(tts=None, on_screen=lambda msg: calls.append(("screen", msg)))
     agent._chosen_language = "en"
+    agent._visitor_lines = ["I'm Ana Silva, I'd like a loyalty app for my bakery."]
     n = len(calls)
     show = agent.show_project_request
     submit = agent.submit_project_request
@@ -141,6 +142,95 @@ async def test_tool_guards() -> None:
     out = await submit(None)
     check(out.startswith("NOT SENT AGAIN"), f"same request twice refused: {out}")
     check(len(recorded("project", n)) == 1, "still one email")
+
+    print("— visitor names the tools are given, direct calls:")
+    agent = worker.MiaAgent(tts=None, on_screen=lambda msg: calls.append(("screen", msg)))
+    agent._chosen_language = "en"
+    agent._visitor_lines = ["Hi, I'm here to see Alex, I have a meeting with him at two."]
+    n = len(calls)
+    for name in ("there", "Alex", "Alexandre", "the visitor", "David Chen"):
+        out = await agent.notify_member(None, visitor_name=name, member="Alex", note="meeting at two")
+        check(out.startswith("NOT SENT") and "name" in out, f"notify_member(visitor_name={name!r}) before any name: {out[:60]}")
+        out = await agent.take_message(None, visitor_name=name, recipient="Alex", message="Running late.")
+        check(out.startswith("NOT SENT"), f"take_message(visitor_name={name!r}) before any name: {out[:60]}")
+    check(not recorded("notify", n) and not recorded("message", n), "nothing sent without the visitor's name")
+    agent._visitor_lines.append("My name is David Chen.")
+    out = await agent.notify_member(None, visitor_name="David Chen", member="Alex", note="meeting at two")
+    check(out.startswith("NOTIFIED"), f"notify_member once the visitor said it: {out[:40]}")
+    agent._visitor_said = "I have a suggestion: you should add background music in the lobby."
+    out = await agent.send_suggestion(None, suggestion="You should add background music in the lobby.")
+    check(out.startswith("NOT SENT yet"), f"send_suggestion in the turn it was dictated, before she repeats it: {out[:50]}")
+    agent._visitor_said = "Yes, send it."
+    out = await agent.send_suggestion(None, suggestion="Add music.", visitor_name="Sir")
+    sent = recorded("suggestion", n)
+    check(out.startswith("SENT") and sent and sent[0][3] == "", f"send_suggestion with a made-up name goes anonymous: {sent}")
+    out = await agent.show_project_request(
+        {"name": "there", "email": "d@chen.ca", "description": "An app", "company": "none", "timeline": "none", "budget": "none"}, None
+    )
+    check(out.startswith("NOT SHOWN") and "their name" in out, f"show_project_request with a made-up name: {out[:70]}")
+    out = await agent.show_project_request({"name": "David Chen"}, None)
+    check(out.startswith("SHOWN"), f"show_project_request with the name they said: {out[:40]}")
+
+
+async def test_screen_claim_filter() -> None:
+    """#6: "check your request on the screen" before show_project_request
+    answered SHOWN is dropped from what she says. Scripted LLM, no Gemini."""
+    print("— 'it's on the screen' before the draft is shown, scripted LLM:")
+    import worker
+    from livekit.agents.llm import ChatChunk, ChatContext, ChoiceDelta, FunctionToolCall
+
+    script: list = []
+
+    async def scripted(_agent, chat_ctx, tools, model_settings):
+        for chunk in script:
+            yield chunk
+
+    def text(t: str) -> ChatChunk:
+        return ChatChunk(id="t", delta=ChoiceDelta(role="assistant", content=t))
+
+    async def run(agent, ctx, chunks: list) -> tuple[str, list]:
+        script[:] = chunks
+        out = [c async for c in agent.llm_node(ctx, [], None)]
+        said = "".join(c if isinstance(c, str) else (c.delta.content or "") for c in out)
+        return said, [c for c in out if isinstance(c, ChatChunk) and c.delta and c.delta.tool_calls]
+
+    real = worker.Agent.default.llm_node
+    worker.Agent.default.llm_node = scripted
+    agent = worker.MiaAgent(tts=None)
+    agent._screen_check_turn = 1  # no session here for the follow-up reply (SCREEN_CLAIM_NOTE)
+    plain = worker.MiaAgent(tts=None)
+    ctx = ChatContext.empty()
+    ctx.add_message(role="user", content="Nous aimerions un site web pour vendre nos bouquets, c'est notre projet.")
+    try:
+        said, _ = await run(agent, ctx, [text("Merci Chloé ! Je vais afficher votre demande "), text("à l'écran. Quel est votre "), text("budget ?")])
+        check("écran" not in said and "Merci" in said and "budget ?" in said, f"FR claim dropped, the rest kept: {said!r}")
+        said, _ = await run(agent, ctx, [text("Veuillez vérifier sur l'écran si les détails de votre demande sont corrects.")])
+        check(said == "", f"FR claim alone dropped: {said!r}")
+        call = FunctionToolCall(name="show_project_request", arguments="{}", call_id="c1")
+        said, calls_out = await run(agent, ctx, [text("Please take a look at the screen and let me know if everything looks right. "),
+                                                 ChatChunk(id="t", delta=ChoiceDelta(role="assistant", tool_calls=[call]))])
+        check(said == "" and len(calls_out) == 1, f"EN claim dropped, the tool call passes: {said!r} {len(calls_out)}")
+        # Same step, but show_project_request answers SHOWN while she talks: then it's true, and said.
+        shown_soon = asyncio.get_running_loop().call_later(0.3, setattr, agent, "_project_shown_at", 2)
+        said, _ = await run(agent, ctx, [text("Parfait. Votre demande est affichée à l'écran, pouvez-vous la vérifier ? "),
+                                         ChatChunk(id="t", delta=ChoiceDelta(role="assistant", tool_calls=[call]))])
+        shown_soon.cancel()
+        check("écran" in said and said.startswith("Parfait."), f"claim kept once the same step showed the draft: {said!r}")
+        agent._project_shown_at = None
+        said, _ = await run(agent, ctx, [text("Touchez l'écran et glissez le doigt pour vous déplacer. "),
+                                         text("Nos coordonnées sont aussi à l'écran. Avez-vous un projet en tête ?")])
+        check("Touchez l'écran" in said and "coordonnées" in said, f"other uses of the screen kept: {said!r}")
+        agent._project_shown_at = 3
+        said, _ = await run(agent, ctx, [text("Veuillez vérifier votre demande à l'écran.")])
+        check("écran" in said, f"once shown, the screen may be mentioned: {said!r}")
+        ctx = ChatContext.empty()
+        ctx.add_message(role="user", content="Can I leave a message for Nicolas?")
+        said, _ = await run(plain, ctx, [text("You'll see it on the screen in a moment, you can check everything there.")])
+        check("screen" in said, f"no project talk: nothing dropped: {said!r}")
+    finally:
+        worker.Agent.default.llm_node = real
+        for task in list(agent._tasks) + list(plain._tasks):
+            task.cancel()
 
 
 # ---------------------------------------------------------------- with Gemini
@@ -267,11 +357,14 @@ async def conv_suggestion() -> None:
 ASKS = [
     ("budget", ("budget",)),
     ("timeline", ("timeline", "when would", "when do you", "time frame", "timeframe", "deadline",
-                  "échéancier", "échéance", "délai", "quand ")),
+                  "échéancier", "échéance", "délai", "quand ", "période", "calendrier")),
     ("contact", ("email", "e-mail", "phone", "reach you", "contact you", "courriel", "téléphone", "joindre", "numéro")),
     ("company", ("company", "business", "bakery called", "name of your bakery", "entreprise", "société", "compagnie")),
     ("name", ("your name", "votre nom", "vous appelez")),
-    ("description", ("project", "describe", "app to do", "projet", "décrire")),
+    # Not every sentence with "project" in it: "une demande de projet, c'est bien ça ?" is a yes/no.
+    ("description", ("describe", "décri", "app to do", "tell me about your project", "tell me more about your project",
+                     "what is your project", "what's your project", "quel est votre projet", "parlez-moi de votre projet",
+                     "en quelques mots", "what kind of", "quel type de", "quel genre de")),
 ]
 
 
@@ -467,6 +560,7 @@ async def main() -> None:
     install_recorders(worker)
     test_offline()
     await test_tool_guards()
+    await test_screen_claim_filter()
     for name in sys.argv[1:] or SCENARIOS:
         await SCENARIOS[name]()
     print(f"\n{len(failures)} failed check(s)" + "".join(f"\n  ✗ {f}" for f in failures))

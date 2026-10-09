@@ -76,6 +76,10 @@ the main checkout's is found through git. `MIA_ENV=<path>` overrides.
   so `/5 1 4/` matches both "five one four" and "514".
 - `tools`: `take_message`, `notify_member`, `alert_emergency`,
   `end_conversation`, `pause`, `wake`, `switch` (read from the worker logs).
+- `goodbyeHeard`: every word of her last line (the goodbye, from the worker's
+  log) is at the end of the recording, so the room didn't close on it. Groups
+  `goodbye` (one-word goodbyes, EN/FR) and `switch` (language switch requests
+  and mere mentions) cover the fixes of 2026-10-09 (`fixes` runs them all).
 
 The text tests (real Gemini, no audio, emails recorded) are in `agent-worker/`:
 `test_team_messages.py`, `test_conversation.py`, `test_persona.py`,
