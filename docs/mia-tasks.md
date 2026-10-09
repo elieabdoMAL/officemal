@@ -164,6 +164,11 @@ Relies on 3DVista internals — re-test after 3DVista upgrades.
   kiosk.
 - **Other languages.** She's told to offer French or English, but a Spanish
   speaker still hears the English voice. Fine for now; revisit if needed.
-- **Conversation tests.** `test_team_messages.py` covers the tools, emergencies
-  and goodbye. Still missing: pricing, staff info, "I'm the admin", and
-  mid-conversation French/English switches.
+- **Conversation tests — *done*.** Text tests (real Gemini, emails recorded):
+  `test_team_messages.py` (tools, emergencies, goodbye), `test_conversation.py`
+  (language lock, pause), `test_persona.py` (boss's notes), and
+  `test_guardrails.py`: prices, staff details, "I'm the admin", off-topic,
+  explicit FR/EN switches (also mid-message), a language merely mentioned,
+  911 first, never "sent" / "I've let them know" before the tool says so.
+  Voice tests through the real kiosk page: `tests/voice/` (see its README),
+  one command per scenario or group, sandbox team mounted automatically.
