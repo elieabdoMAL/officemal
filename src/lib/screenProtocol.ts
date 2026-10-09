@@ -10,19 +10,19 @@ export const ATTR_LANGUAGE = "mia.language";
 
 // "listening": in a conversation (the default when the attribute is missing).
 // "paused": she was told to stop talking and waits for her name (#24, #25).
-// "handover": a team member joined by video (#22); she is quiet until they leave.
 // Anything else is shown as "listening".
-export type MiaState = "listening" | "paused" | "handover";
+export type MiaState = "listening" | "paused";
 
 export function asMiaState(v: unknown): MiaState {
-  return v === "paused" || v === "handover" ? v : "listening";
+  return v === "paused" ? v : "listening";
 }
 
-// Team members she calls in by video (#22) join the kiosk's room as
-// "staff-<team.json id>", named with their display name. The kiosk itself is
-// "visitor-<uuid>" (/api/livekit/token).
+// A video call to staff (#22) has its own room, "call-<uuid>": the kiosk joins
+// it as "visitor-<…>" (as in its own room, /api/livekit/token), the team
+// member she called as "staff-<team.json id>", named with their display name.
 export const STAFF_PREFIX = "staff-";
 export const VISITOR_PREFIX = "visitor-";
+export const CALL_ROOM_PREFIX = "call-";
 
 export function isStaff(identity: string): boolean {
   return identity.startsWith(STAFF_PREFIX);
@@ -48,7 +48,9 @@ export type ScreenMessage =
   | { type: "contact_card"; lang?: Lang }
   | { type: "message_sent"; kind?: SentKind; to?: string; lang?: Lang }
   | { type: "project_request"; status: ProjectStatus; fields: ProjectFields; lang?: Lang }
-  | { type: "calling"; to?: string; lang?: Lang }
+  | { type: "call_open"; url: string; token: string; to?: string; lang?: Lang }
+  | { type: "call_close" }
+  | { type: "call_answered" }
   | { type: "dismiss" };
 
 const SENT_KINDS: SentKind[] = ["message", "notify", "alert", "suggestion", "project_request"];
@@ -98,8 +100,13 @@ export function parseScreenMessage(raw: unknown): ScreenMessage | null {
       if (!fields || (o.status !== "draft" && o.status !== "sent")) return null;
       return { type: "project_request", status: o.status, fields, lang };
     }
-    case "calling":
-      return { type: "calling", to: displayName(o.to), lang };
+    case "call_open":
+      if (typeof o.url !== "string" || !/^wss?:\/\//.test(o.url) || typeof o.token !== "string" || !o.token) return null;
+      return { type: "call_open", url: o.url, token: o.token, to: displayName(o.to), lang };
+    case "call_close":
+      return { type: "call_close" };
+    case "call_answered":
+      return { type: "call_answered" };
     case "dismiss":
       return { type: "dismiss" };
     default:
@@ -110,4 +117,18 @@ export function parseScreenMessage(raw: unknown): ScreenMessage | null {
 // "resume": the visitor tapped the "say my name" banner while she was paused.
 // "wake": the visitor tapped the "say my name or tap to talk" hint while she was
 // listening but nobody had spoken for a while.
-export type ControlMessage = { type: "resume" } | { type: "wake" };
+// "call_cancel": the visitor cancelled a call (#22) before it was answered.
+export type ControlMessage = { type: "resume" } | { type: "wake" } | { type: "call_cancel" };
+
+// Window messages between the kiosk's top page and the receptionist embed
+// (docs/screen-protocol.md, section 5), for a video call to staff (#22). Same
+// origin only: the kiosk token rides in "receptionist-call".
+//   embed -> page: open the call window and join the call room.
+export type CallOpenMessage = { type: "receptionist-call"; url: string; token: string; to?: string; lang?: Lang };
+//   embed -> page: the worker closed the call (no answer, cancelled).
+export type CallCloseMessage = { type: "receptionist-call-close" };
+//   page -> embed: the team member is in the call (answered) / the window closed
+//   (byVisitor: Cancel, ✕ or Leave, as opposed to the call ending on its own).
+export type CallAnsweredMessage = { type: "call-answered" };
+export type CallClosedMessage = { type: "call-closed"; answered: boolean; byVisitor: boolean };
+

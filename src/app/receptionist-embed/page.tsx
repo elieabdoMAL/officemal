@@ -3,6 +3,7 @@
 import ImmersiveReceptionistPanel from "@/components/ImmersiveReceptionistPanel";
 import SimliReceptionistPanel from "@/components/SimliReceptionistPanel";
 import SimliLiveKitPanel from "@/components/SimliLiveKitPanel";
+import StaffCallModal from "@/components/StaffCallModal";
 
 // Switch the avatar backend without code changes:
 //   NEXT_PUBLIC_AVATAR_PROVIDER=simli-livekit -> Simli Trinity face via a
@@ -27,7 +28,12 @@ export default function ReceptionistEmbedPage() {
       }}
     >
       {PROVIDER === "simli-livekit" ? (
-        <SimliLiveKitPanel />
+        <>
+          <SimliLiveKitPanel />
+          {/* A video call to staff (#22) opens on the kiosk page; this one
+              only when the embed is opened on its own (tests). */}
+          <StaffCallModal topOnly />
+        </>
       ) : PROVIDER === "simli" ? (
         <SimliReceptionistPanel />
       ) : (

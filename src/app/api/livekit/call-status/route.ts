@@ -6,13 +6,16 @@ export const dynamic = "force-dynamic";
 
 // Checks a staff join link (#22) before the /join page uses it.
 //
-// The receptionist worker emails a team member a link to /join with a LiveKit
-// token for one kiosk room (agent-worker/staff_call.py). Before turning on
-// their camera, the page POSTs the token here:
+// The receptionist worker opens a private room for each call ("call-<uuid>")
+// and emails a team member a link to /join with a LiveKit token for it
+// (agent-worker/staff_call.py). Before turning on their camera, the page
+// POSTs the token here:
 //   - the token must be ours (signed with LIVEKIT_API_SECRET), unexpired, and
-//     a staff token for a kiosk room — so a forged link can't point the page
-//     at someone else's LiveKit server: the URL to join comes from here;
-//   - the visitor must still be in the room. Joining a room that's gone would
+//     a staff token for a call room — so a forged link can't point the page at
+//     someone else's LiveKit server: the URL to join comes from here;
+//   - the call room must still be open with the visitor (the kiosk, a
+//     "visitor-…" participant) in it. The room is deleted when the call ends,
+//     goes unanswered, or the visitor leaves; joining a room that's gone would
 //     quietly create an empty one, with the team member waiting in it alone.
 //
 // Body: { token }. Answer: { url, room, name, visitor, visitorHere, expiresAt }
@@ -24,6 +27,7 @@ function cleanEnv(v: string | undefined): string | undefined {
 
 const STAFF_PREFIX = "staff-";
 const VISITOR_PREFIX = "visitor-";
+const CALL_ROOM_PREFIX = "call-";
 
 export async function POST(req: Request) {
   const url = cleanEnv(process.env.LIVEKIT_URL);
@@ -47,7 +51,7 @@ export async function POST(req: Request) {
   }
   const room = claims.video?.room ?? "";
   const identity = claims.sub ?? "";
-  if (!claims.video?.roomJoin || !room.startsWith("kiosk-") || !identity.startsWith(STAFF_PREFIX)) {
+  if (!claims.video?.roomJoin || !room.startsWith(CALL_ROOM_PREFIX) || !identity.startsWith(STAFF_PREFIX)) {
     return NextResponse.json({ error: "invalid" }, { status: 401 });
   }
 
@@ -57,7 +61,7 @@ export async function POST(req: Request) {
     const participants = await rooms.listParticipants(room);
     visitorHere = participants.some((p) => p.identity.startsWith(VISITOR_PREFIX));
   } catch (err) {
-    // The room is gone (the visitor left, the worker deleted it): same answer.
+    // The room is gone (the call ended, or the visitor left): same answer.
     console.log("[livekit/call-status] room not available:", room, (err as Error)?.message);
   }
 

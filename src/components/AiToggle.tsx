@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { findByLabel, tourFrame, type TDVObject } from "@/lib/tour";
+import { findByLabel, postToEmbed, tourFrame, type TDVObject } from "@/lib/tour";
 
 // Name of the 3DVista Web Frame hotspot that hosts the AI receptionist.
 // Panorama overlays store the editor name under `data.label` (components on the
@@ -75,24 +75,6 @@ function triggerContainer(name: string): boolean {
     "*"
   );
   return false;
-}
-
-// Post to the receptionist embed: to the tour, and straight to the iframes
-// inside it (same-origin) so we don't depend on the tour forwarding it.
-function postToEmbed(messages: object[]) {
-  const send = (win: Window | null) => {
-    if (!win) return;
-    try {
-      messages.forEach((m) => win.postMessage(m, "*"));
-    } catch {}
-  };
-  const frame = tourFrame();
-  send(frame?.contentWindow ?? null);
-  try {
-    frame?.contentDocument
-      ?.querySelectorAll<HTMLIFrameElement>("iframe")
-      .forEach((f) => send(f.contentWindow));
-  } catch {}
 }
 
 // The current tour unloads the Web Frame when AIWEB is hidden, but a build that
@@ -227,10 +209,14 @@ export default function AiToggle({ initiallyVisible = false }: { initiallyVisibl
     // The receptionist ended her session on her own (idle or max length) and
     // has left the room; the frame stays up with "Tap to talk" (#9). Show the
     // button as off so a tap on it reads as "talk to her" too.
+    // Ended because a video call to staff was answered (#22, reason "call"):
+    // the call goes on in its own window and she is hidden altogether, so the
+    // AI button starts a fresh session once the call is over.
     const onMessage = (e: MessageEvent) => {
       if (e.origin !== window.location.origin) return;
-      const type = (e.data as { type?: string })?.type;
-      if (type === "receptionist-ended") setResting(true);
+      const { type, reason } = (e.data ?? {}) as { type?: string; reason?: string };
+      if (type === "receptionist-ended" && reason === "call") setFrameShown(false);
+      else if (type === "receptionist-ended") setResting(true);
       else if (type === "receptionist-started") setResting(false);
     };
     window.addEventListener("message", onMessage);

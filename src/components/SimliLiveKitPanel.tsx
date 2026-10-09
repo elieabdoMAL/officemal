@@ -21,8 +21,8 @@ import {
   TOPIC_SCREEN,
   TOPIC_TRANSCRIPTION,
   asMiaState,
-  isStaff,
   parseScreenMessage,
+  type CallOpenMessage,
   type ControlMessage,
   type MiaState,
   type ScreenMessage,
@@ -30,7 +30,6 @@ import {
 import MiaCaptions, { useCaptions, type Speaker } from "@/components/MiaCaptions";
 import MiaScreenCard, { ContactButton, type Card } from "@/components/MiaScreenCards";
 import MiaBanner from "@/components/MiaBanner";
-import MiaStaffTile from "@/components/MiaStaffTile";
 
 // Simli Trinity receptionist over LiveKit. Unlike SimliReceptionistPanel (which
 // used Simli Auto + Daily, a Legacy-only pipeline), this joins a LiveKit room
@@ -61,10 +60,13 @@ import MiaStaffTile from "@/components/MiaStaffTile";
 // push on "mia.screen" (#18), and the "say my name" banner while she's paused
 // (#24, #25), from the worker's "mia.state" / "mia.language" attributes.
 //
-// Video call to staff (#22): a team member she calls in joins this room from
-// a link (/join) as "staff-…". Their camera and voice get their own elements
-// (never hers), she steps aside, and their tile says "{name} is here" until
-// they leave; the worker keeps her quiet meanwhile ("handover").
+// Video call to staff (#22): the call has its own room. The worker sends
+// "call_open" with the kiosk's token for it; this panel hands it to the top
+// page (StaffCallModal opens the call window there) and mutes its own mic
+// while the window is up, so she hears nothing of the call. Unanswered or
+// cancelled: the window closes, the mic opens, she offers a message. Answered:
+// the worker sends "call_answered" and ends her session; the panel then tells
+// the top page to hide her (receptionist-ended, reason "call"), not to rest.
 
 type Status = "idle" | "connecting" | "ready" | "speaking" | "error";
 
@@ -132,8 +134,6 @@ const IDLE_HINT_MS = 12000;
 function cardMs(card: Card): number {
   if (card.type === "contact_card") return 45000;
   if (card.type === "project_request") return card.status === "draft" ? 180000 : 15000;
-  // The worker gives up after 2 min (CALL_ANSWER_TIMEOUT) and dismisses it.
-  if (card.type === "calling") return 150000;
   return 10000;
 }
 
@@ -172,14 +172,13 @@ export default function SimliLiveKitPanel({
   // miaDev.state()/language() (dev only, below): win over the real attributes.
   const devAttrs = useRef<{ state?: string; language?: string }>({});
 
-  // The team member in the call (#22), by display name, and whether their camera is on.
-  const [staffName, setStaffName] = useState<string | null>(null);
-  const [staffHasVideo, setStaffHasVideo] = useState(false);
+  // A video call to staff (#22) is open in the top page's call window, and
+  // whether the person called has joined it (her session then ends).
+  const [inCall, setInCall] = useState(false);
+  const callAnsweredRef = useRef(false);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  const staffVideoRef = useRef<HTMLVideoElement | null>(null);
-  const staffAudioRef = useRef<HTMLAudioElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const rafRef = useRef<number | null>(null);
   const roomRef = useRef<Room | null>(null);
@@ -202,11 +201,15 @@ export default function SimliLiveKitPanel({
   // turn ends). The only wait is for her greeting at the start of each session
   // (greetingOver, set from the active-speaker events in the connection
   // effect), with GREETING_FALLBACK_MS as a backstop. Browser echo
-  // cancellation covers the rest of the session.
+  // cancellation covers the rest of the session. While a call window is up
+  // (#22) the mic is shut: the call has the visitor's voice, not her.
   const greetedRef = useRef(false);
   const [greetingOver, setGreetingOver] = useState(false);
   useEffect(() => {
-    if (status !== "ready" || hidden) return;
+    if (inCall) setMic(false);
+  }, [inCall, setMic]);
+  useEffect(() => {
+    if (status !== "ready" || hidden || inCall) return;
 
     if (greetedRef.current || greetingOver) {
       greetedRef.current = true;
@@ -219,7 +222,7 @@ export default function SimliLiveKitPanel({
       setMic(true);
     }, GREETING_FALLBACK_MS);
     return () => window.clearTimeout(timer);
-  }, [status, hidden, greetingOver, setMic]);
+  }, [status, hidden, inCall, greetingOver, setMic]);
 
   // The panorama can hide this Web Frame (AiToggle button / a 3DVista action).
   // If hiding doesn't unload the iframe, `hidden` is what ends the session (see
@@ -243,11 +246,13 @@ export default function SimliLiveKitPanel({
     return () => window.removeEventListener("message", onMessage);
   }, []);
 
-  // Tell the top page (AiToggle) whether a session is on, so its icon matches.
-  // Same origin only: the kiosk page and this embed are one Next app.
-  const tellTop = useCallback((type: "receptionist-ended" | "receptionist-started") => {
+  // Tell the top page (AiToggle, StaffCallModal) what happened: a session
+  // started or ended (reason "call": a video call to staff took over, #22),
+  // or a call to open or close. Same origin only: the kiosk page and this
+  // embed are one Next app, and a call message carries a join token.
+  const tellTop = useCallback((msg: { type: string; [k: string]: unknown }) => {
     try {
-      window.top?.postMessage({ type }, window.location.origin);
+      window.top?.postMessage(msg, window.location.origin);
     } catch {}
   }, []);
 
@@ -256,10 +261,26 @@ export default function SimliLiveKitPanel({
   const showScreenMessage = useCallback((m: ScreenMessage) => {
     console.log("[SimliLK] screen message:", m.type);
     if (m.type === "dismiss") setCard(null);
+    else if (m.type === "call_open") {
+      // Video call to staff (#22): the call window opens on the top page.
+      callAnsweredRef.current = false;
+      setInCall(true);
+      setCard(null);
+      const open: CallOpenMessage = {
+        type: "receptionist-call",
+        url: m.url,
+        token: m.token,
+        to: m.to,
+        lang: m.lang ?? langRef.current ?? undefined,
+      };
+      tellTop(open);
+    } else if (m.type === "call_close") {
+      setInCall(false);
+      tellTop({ type: "receptionist-call-close" });
+    } else if (m.type === "call_answered") callAnsweredRef.current = true;
     else if (m.type === "contact_card") setCard({ type: "contact_card", lang: m.lang ?? langRef.current });
     else if (m.type === "project_request")
       setCard({ type: "project_request", status: m.status, fields: m.fields, lang: m.lang ?? langRef.current });
-    else if (m.type === "calling") setCard({ type: "calling", to: m.to, lang: m.lang ?? langRef.current });
     else
       setCard({
         type: "message_sent",
@@ -267,7 +288,7 @@ export default function SimliLiveKitPanel({
         to: m.to,
         lang: m.lang ?? langRef.current,
       });
-  }, []);
+  }, [tellTop]);
 
   useEffect(() => {
     if (!card) return;
@@ -286,6 +307,25 @@ export default function SimliLiveKitPanel({
       .catch((e) => console.warn("[SimliLK] control send failed:", e));
   }, []);
 
+  // The top page's call window (#22): the person called joined it, or it
+  // closed. Cancelled by the visitor before anyone joined: the worker is told,
+  // and she offers a message. Same origin only.
+  useEffect(() => {
+    const onMessage = (e: MessageEvent) => {
+      if (e.origin !== window.location.origin) return;
+      const data = e.data as { type?: string; answered?: boolean; byVisitor?: boolean };
+      if (data?.type === "call-answered") {
+        callAnsweredRef.current = true;
+      } else if (data?.type === "call-closed") {
+        console.log("[SimliLK] call window closed", data);
+        setInCall(false);
+        if (data.byVisitor && !data.answered && !callAnsweredRef.current) sendControl({ type: "call_cancel" });
+      }
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, [sendControl]);
+
   // The idle hint: in a session, she's listening, and nobody has spoken for
   // IDLE_HINT_MS. Any turn change (or a tap on the hint) restarts the wait.
   useEffect(() => {
@@ -297,14 +337,8 @@ export default function SimliLiveKitPanel({
 
   useEffect(() => {
     if (audioRef.current) audioRef.current.muted = hidden;
-    if (staffAudioRef.current) staffAudioRef.current.muted = hidden;
     if (hidden) setMic(false);
   }, [hidden, setMic]);
-
-  // Their tile replaces the "Calling …" card as soon as they're in.
-  useEffect(() => {
-    if (staffName) setCard((c) => (c?.type === "calling" ? null : c));
-  }, [staffName]);
 
   // "Thinking" is inferred from silence, so nothing guarantees it ends — a
   // rejected turn ("I didn't get that" never reaches the LLM) or a dropped
@@ -421,16 +455,6 @@ export default function SimliLiveKitPanel({
           ) => {
             if (cancelled) return;
             console.log("[SimliLK] track subscribed:", track.kind, participant.identity);
-            if (isStaff(participant.identity)) {
-              // A team member in the call (#22): their own elements, never hers.
-              if (track.kind === Track.Kind.Video) {
-                attachTrack(staffVideoRef.current, track);
-                setStaffHasVideo(true);
-              } else if (track.kind === Track.Kind.Audio) {
-                attachTrack(staffAudioRef.current, track);
-              }
-              return;
-            }
             if (track.kind === Track.Kind.Video) {
               attachTrack(videoRef.current, track);
               setStatus("ready");
@@ -443,12 +467,16 @@ export default function SimliLiveKitPanel({
         // Fires only when the room ends without us leaving it: the worker hit
         // its idle/max limit and deleted the room, or the network gave out past
         // what livekit-client's own reconnect can recover. Either way she's
-        // gone: rest (no room, "Tap to talk") and tell the top page.
+        // gone: rest (no room, "Tap to talk") and tell the top page. Ended
+        // because a video call to staff was answered (#22): hide instead, the
+        // call goes on in its window and the AI button brings her back.
         room.on(RoomEvent.Disconnected, (reason) => {
           if (cancelled) return;
-          console.warn("[SimliLK] room ended:", reason);
-          tellTop("receptionist-ended");
-          setResting(true);
+          const forCall = callAnsweredRef.current;
+          console.warn("[SimliLK] room ended:", reason, forCall ? "(call answered)" : "");
+          tellTop(forCall ? { type: "receptionist-ended", reason: "call" } : { type: "receptionist-ended" });
+          if (forCall) setHidden(true);
+          else setResting(true);
           // A draft project request holds the visitor's name, email and
           // phone: it goes with their session, not to the next visitor.
           setCard(null);
@@ -512,36 +540,13 @@ export default function SimliLiveKitPanel({
         room.on(RoomEvent.ParticipantConnected, readAttributes);
         room.on(RoomEvent.ParticipantDisconnected, readAttributes);
 
-        // Who from the team is in the call (#22), from the room itself: their
-        // tile shows the moment they join, even before her "handover" state.
-        const readStaff = () => {
-          if (cancelled) return;
-          const p = [...room.remoteParticipants.values()].find((r) => isStaff(r.identity));
-          if (p) console.log("[SimliLK] staff in the call:", p.identity, p.name);
-          setStaffName(p ? p.name || p.identity : null);
-          if (!p) setStaffHasVideo(false);
-        };
-        room.on(RoomEvent.ParticipantConnected, readStaff);
-        room.on(RoomEvent.ParticipantDisconnected, readStaff);
-        const staffCamera = (on: boolean) => (_pub: unknown, p: Participant) => {
-          if (!cancelled && isStaff(p.identity)) setStaffHasVideo(on && p.isCameraEnabled);
-        };
-        room.on(RoomEvent.TrackMuted, staffCamera(false));
-        room.on(RoomEvent.TrackUnmuted, staffCamera(true));
-        room.on(RoomEvent.TrackUnsubscribed, (track: RemoteTrack, _pub, participant: RemoteParticipant) => {
-          if (cancelled || !isStaff(participant.identity)) return;
-          track.detach();
-          if (track.kind === Track.Kind.Video) setStaffHasVideo(false);
-        });
-
         // Whose turn it is, derived from who's actually making sound. The
         // avatar publishes as a remote participant, so anyone remote speaking
-        // is her, except a team member in the call (#22); the local
-        // participant is the visitor.
+        // is her; the local participant is the visitor.
         room.on(RoomEvent.ActiveSpeakersChanged, (speakers: Participant[]) => {
           if (cancelled) return;
           const visitorTalking = speakers.some((s) => s.isLocal);
-          const avatarTalking = speakers.some((s) => !s.isLocal && !isStaff(s.identity));
+          const avatarTalking = speakers.some((s) => !s.isLocal);
 
           if (avatarTalking) setTurn("answering");
           else if (visitorTalking) setTurn("hearing");
@@ -588,9 +593,8 @@ export default function SimliLiveKitPanel({
         roomRef.current = room;
         readyRef.current = true;
         readAttributes();
-        readStaff();
         console.log("[SimliLK] in room", room.name);
-        tellTop("receptionist-started");
+        tellTop({ type: "receptionist-started" });
         setStatus("ready");
       } catch (err) {
         console.error("[SimliLK] start error:", err);
@@ -631,10 +635,10 @@ export default function SimliLiveKitPanel({
       // and wipe the canvas so a resting panel isn't a frozen picture of her
       // (the tour's still image of her shows through instead).
       if (videoRef.current) videoRef.current.srcObject = null;
-      if (staffVideoRef.current) staffVideoRef.current.srcObject = null;
-      if (staffAudioRef.current) staffAudioRef.current.srcObject = null;
-      setStaffName(null);
-      setStaffHasVideo(false);
+      // A call window still up belongs to the top page now; this session's
+      // mic and her part in the call are over.
+      setInCall(false);
+      callAnsweredRef.current = false;
       const canvas = canvasRef.current;
       canvas?.getContext("2d")?.clearRect(0, 0, canvas.width, canvas.height);
       clearCaptions();
@@ -652,7 +656,7 @@ export default function SimliLiveKitPanel({
   //   miaDev.screen({ type: "message_sent", to: "Nicolas Bastien" })
   //   miaDev.caption("mia", "Bonjour !")      miaDev.caption("visitor", "Hi")
   //   miaDev.state("paused")   miaDev.language("en")   miaDev.end()
-  //   miaDev.screen({ type: "calling", to: "Nicolas Bastien" })   miaDev.staff("Nicolas Bastien")
+  //   miaDev.screen({ type: "call_open", url: "wss://…", token: "…", to: "Nicolas Bastien" })
   // To go through LiveKit itself, see scripts/mia-screen-push.py.
   useEffect(() => {
     if (process.env.NODE_ENV !== "development") return;
@@ -672,8 +676,6 @@ export default function SimliLiveKitPanel({
         devAttrs.current.language = l;
         setLang(asLang(l));
       },
-      // A team member's tile without a call (#22): miaDev.staff("Nicolas Bastien"), miaDev.staff(null).
-      staff: (name: string | null) => setStaffName(name),
       end: () => roomRef.current?.disconnect(),
     };
     (window as unknown as { miaDev?: typeof dev }).miaDev = dev;
@@ -689,15 +691,11 @@ export default function SimliLiveKitPanel({
 
   const connecting = status !== "ready" && status !== "speaking";
   const inSession = !hidden && !resting && !connecting;
-  // A team member is in the call (#22): their tile, and she steps aside.
-  const handover = inSession && (staffName !== null || miaState === "handover");
-  const paused = inSession && !handover && miaState === "paused";
-  const banner =
-    resting && !hidden ? "resting" : paused ? "paused" : inSession && !handover && idleHint ? "idle" : null;
-  const showPill = inSession && listening && !banner && !handover;
-  // Scaled from her feet, as below; during a call she moves aside, smaller,
-  // to make room for the team member's tile on the right.
-  const avatarTransform = handover ? "translateX(-27%) scale(0.72)" : `scale(${AVATAR_SCALE})`;
+  const paused = inSession && miaState === "paused";
+  const banner = resting && !hidden ? "resting" : paused ? "paused" : inSession && idleHint ? "idle" : null;
+  const showPill = inSession && listening && !banner;
+  // Scaled from her feet, as below.
+  const avatarTransform = `scale(${AVATAR_SCALE})`;
   // Captions stack above whatever holds the bottom edge.
   const captionBottom = banner === "paused" ? "9vw" : banner ? "6vw" : "4.2vw";
 
@@ -769,10 +767,6 @@ export default function SimliLiveKitPanel({
 
       {/* The avatar's TTS audio plays through this element. */}
       <audio ref={audioRef} autoPlay />
-
-      {/* A team member in the call (#22): their voice, and their tile. */}
-      <audio ref={staffAudioRef} autoPlay />
-      <MiaStaffTile name={handover ? staffName : null} hasVideo={staffHasVideo} lang={lang} videoRef={staffVideoRef} />
 
       {connecting && !hidden && !resting && (
         <div
@@ -851,8 +845,8 @@ export default function SimliLiveKitPanel({
           captions={captions}
           lang={lang}
           // While paused she isn't in the conversation: the visitor is talking
-          // to someone else, which has no business on the screen. Same in a call.
-          showVisitor={!paused && !handover}
+          // to someone else, which has no business on the screen.
+          showVisitor={!paused}
           bottom={captionBottom}
         />
       )}
@@ -873,7 +867,7 @@ export default function SimliLiveKitPanel({
         />
       )}
 
-      {!hidden && !handover && (
+      {!hidden && (
         <ContactButton
           active={card?.type === "contact_card"}
           onClick={() =>
