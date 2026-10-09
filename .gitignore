@@ -71,3 +71,7 @@ agent-worker/.env
 
 .vercel
 .env*
+
+# Google service account key for Linda's calendar access (never commit)
+agent-worker/*service-account*.json
+agent-worker/google-*.json
