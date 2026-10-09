@@ -11,7 +11,14 @@ New abilities are added as **function tools** on `MiaAgent` in the worker.
 
 ## Works today
 
-- French / English conversation, switching per turn, French greeting by default
+- French / English conversation: bilingual greeting asks "Français ou English?",
+  the answer locks the language (STT, voice, replies); switches only on an
+  explicit request ("can we speak French")
+- Pause: "stop talking" / "tais-toi" / "I'm talking to someone else" → she says
+  how to call her back and ignores all speech until her name (or "assistant")
+  is said; a paused session ends after 2 min (`PAUSE_TIMEOUT`)
+- Phone numbers and long digit runs are spoken digit by digit, in groups
+- Her name is one setting, `ASSISTANT_NAME` (default Mia)
 - General questions about Mobile Apps Labs from the company knowledge
 - Contact details (phone, email, address, website)
 - Take a message for someone in `team.json` (email via Resend, read back before
