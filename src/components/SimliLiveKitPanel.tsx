@@ -11,6 +11,24 @@ import {
   type RemoteParticipant,
 } from "livekit-client";
 import { applyChromaKey } from "@/lib/chromaKey";
+import { asLang, type Lang } from "@/lib/assistant";
+import {
+  ATTR_LANGUAGE,
+  ATTR_SEGMENT_ID,
+  ATTR_STATE,
+  ATTR_TRANSCRIPTION_FINAL,
+  TOPIC_CONTROL,
+  TOPIC_SCREEN,
+  TOPIC_TRANSCRIPTION,
+  asMiaState,
+  parseScreenMessage,
+  type ControlMessage,
+  type MiaState,
+  type ScreenMessage,
+} from "@/lib/screenProtocol";
+import MiaCaptions, { useCaptions, type Speaker } from "@/components/MiaCaptions";
+import MiaScreenCard, { ContactButton, type Card } from "@/components/MiaScreenCards";
+import MiaBanner from "@/components/MiaBanner";
 
 // Simli Trinity receptionist over LiveKit. Unlike SimliReceptionistPanel (which
 // used Simli Auto + Daily, a Legacy-only pipeline), this joins a LiveKit room
@@ -26,11 +44,20 @@ import { applyChromaKey } from "@/lib/chromaKey";
 //     didn't get that."
 //   - A session lives only while she's shown. Hiding the frame (AI button, a
 //     3DVista action) leaves the room, which ends the session server-side;
-//     showing it again starts a fresh one, greeting and all. Hiding a Web Frame
-//     doesn't unload it, so this is done by hand rather than by unmounting.
+//     showing it again starts a fresh one, greeting and all. The current tour
+//     build unloads the Web Frame when AIWEB is disabled and loads it again
+//     when enabled (seen 2026-10-09), which does the same on its own; the
+//     "receptionist-visible" messages cover builds that only hide it.
 //   - The worker ends sessions on its own (2 min idle / 10 min max) by deleting
-//     the room. When that happens we tell the top page, whose AI button hides
-//     the frame, so the next visitor brings her back with one tap.
+//     the room. She then rests (#9): the frame stays up with a "Tap to talk to
+//     {name}" button and no room, so nothing is billed until someone taps it
+//     (or the AI button) and a fresh session starts. The top page is told, so
+//     the AI button shows she's off.
+//
+// On top of her (docs/screen-protocol.md): live captions from LiveKit's
+// transcription streams (#16), a Contact button and the cards the worker can
+// push on "mia.screen" (#18), and the "say my name" banner while she's paused
+// (#24, #25), from the worker's "mia.state" / "mia.language" attributes.
 
 type Status = "idle" | "connecting" | "ready" | "speaking" | "error";
 
@@ -87,6 +114,13 @@ const GREETING_FALLBACK_MS = 20000;
 // Longest we'll claim she's "thinking" before admitting we're back to waiting.
 const THINKING_TIMEOUT_MS = 8000;
 
+// Nobody has spoken for this long: swap "Go ahead — I'm listening" for the
+// "Say {name} or tap to talk" hint.
+const IDLE_HINT_MS = 12000;
+
+// Cards close on their own: the next visitor shouldn't find the last one's.
+const CARD_MS: Record<Card["type"], number> = { contact_card: 45000, message_sent: 10000 };
+
 // How much to enlarge her within the Web Frame. Simli renders her small inside
 // a 16:9 feed and objectFit "contain" letterboxes that, so she reads as a
 // distant figure at kiosk distance. Scaling here rather than resizing the
@@ -107,7 +141,20 @@ export default function SimliLiveKitPanel({
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [listening, setListening] = useState(false);
   const [hidden, setHidden] = useState(false);
+  // Session over (idle / max length / network), frame still up: no room,
+  // "Tap to talk" shown until someone taps.
+  const [resting, setResting] = useState(false);
   const [turn, setTurn] = useState<Turn>("waiting");
+  const [miaState, setMiaState] = useState<MiaState>("listening");
+  const [lang, setLang] = useState<Lang | null>(null);
+  const langRef = useRef<Lang | null>(null);
+  langRef.current = lang;
+  const [card, setCard] = useState<Card | null>(null);
+  const [idleHint, setIdleHint] = useState(false);
+  const [idleTick, setIdleTick] = useState(0); // bumped to restart the idle wait
+  const { captions, update: updateCaption, clear: clearCaptions } = useCaptions();
+  // miaDev.state()/language() (dev only, below): win over the real attributes.
+  const devAttrs = useRef<{ state?: string; language?: string }>({});
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -153,20 +200,75 @@ export default function SimliLiveKitPanel({
   }, [status, hidden, greetingOver, setMic]);
 
   // The panorama can hide this Web Frame (AiToggle button / a 3DVista action).
-  // Hiding doesn't unload the iframe, so `hidden` is what ends the session (see
-  // the connection effect) and starts a new one when she's shown again.
+  // If hiding doesn't unload the iframe, `hidden` is what ends the session (see
+  // the connection effect) and starts a new one when she's shown again. Being
+  // shown again is a fresh start, so it also wakes her from resting.
   useEffect(() => {
     const onMessage = (e: MessageEvent) => {
       const data = e.data as { type?: string; visible?: boolean; muted?: boolean };
       if (data?.type === "receptionist-visible" && typeof data.visible === "boolean") {
         setHidden(!data.visible);
+        if (data.visible) setResting(false);
       } else if (data?.type === "receptionist-mute" && typeof data.muted === "boolean") {
         setHidden(data.muted);
+      } else if (data?.type === "receptionist-start" && e.origin === window.location.origin) {
+        // AI button tapped while she rests: same as tapping "Tap to talk".
+        setHidden(false);
+        setResting(false);
       }
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
   }, []);
+
+  // Tell the top page (AiToggle) whether a session is on, so its icon matches.
+  // Same origin only: the kiosk page and this embed are one Next app.
+  const tellTop = useCallback((type: "receptionist-ended" | "receptionist-started") => {
+    try {
+      window.top?.postMessage({ type }, window.location.origin);
+    } catch {}
+  }, []);
+
+  // A message the worker pushed on "mia.screen" (or the Contact button, or the
+  // dev hook below). The card takes her current language unless it names one.
+  const showScreenMessage = useCallback((m: ScreenMessage) => {
+    console.log("[SimliLK] screen message:", m.type);
+    if (m.type === "dismiss") setCard(null);
+    else if (m.type === "contact_card") setCard({ type: "contact_card", lang: m.lang ?? langRef.current });
+    else
+      setCard({
+        type: "message_sent",
+        kind: m.kind ?? "message",
+        to: m.to,
+        lang: m.lang ?? langRef.current,
+      });
+  }, []);
+
+  useEffect(() => {
+    if (!card) return;
+    const timer = window.setTimeout(() => setCard(null), CARD_MS[card.type]);
+    return () => window.clearTimeout(timer);
+  }, [card]);
+
+  // Screen -> worker (TOPIC_CONTROL). Fire and forget: a worker that doesn't
+  // handle a message yet just ignores it.
+  const sendControl = useCallback((msg: ControlMessage) => {
+    const room = roomRef.current;
+    if (!room || !readyRef.current) return;
+    room.localParticipant
+      .sendText(JSON.stringify(msg), { topic: TOPIC_CONTROL })
+      .then(() => console.log("[SimliLK] control sent:", msg.type))
+      .catch((e) => console.warn("[SimliLK] control send failed:", e));
+  }, []);
+
+  // The idle hint: in a session, she's listening, and nobody has spoken for
+  // IDLE_HINT_MS. Any turn change (or a tap on the hint) restarts the wait.
+  useEffect(() => {
+    setIdleHint(false);
+    if (hidden || resting || !listening || miaState !== "listening" || turn !== "waiting") return;
+    const timer = window.setTimeout(() => setIdleHint(true), IDLE_HINT_MS);
+    return () => window.clearTimeout(timer);
+  }, [hidden, resting, listening, miaState, turn, idleTick]);
 
   useEffect(() => {
     if (audioRef.current) audioRef.current.muted = hidden;
@@ -229,7 +331,7 @@ export default function SimliLiveKitPanel({
   // One session per showing: runs while shown, torn down (room left) when
   // hidden. The worker sees the visitor leave and deletes the room.
   useEffect(() => {
-    if (!autoStart || hidden) return;
+    if (!autoStart || hidden || resting) return;
 
     let cancelled = false;
     let localRoom: Room | null = null;
@@ -237,6 +339,8 @@ export default function SimliLiveKitPanel({
     greetedRef.current = false;
     setGreetingOver(false);
     setTurn("waiting");
+    setMiaState(asMiaState(devAttrs.current.state));
+    setLang(asLang(devAttrs.current.language));
     // Her greeting is over once she has spoken and then stayed quiet for
     // GREETING_PAUSE_MS (see the ActiveSpeakersChanged handler below).
     let avatarHasSpoken = false;
@@ -298,15 +402,71 @@ export default function SimliLiveKitPanel({
         // Fires only when the room ends without us leaving it: the worker hit
         // its idle/max limit and deleted the room, or the network gave out past
         // what livekit-client's own reconnect can recover. Either way she's
-        // gone, so stand down and ask the top page to switch the AI button off.
+        // gone: rest (no room, "Tap to talk") and tell the top page.
         room.on(RoomEvent.Disconnected, (reason) => {
           if (cancelled) return;
           console.warn("[SimliLK] room ended:", reason);
-          try {
-            window.top?.postMessage({ type: "receptionist-ended" }, window.location.origin);
-          } catch {}
-          setHidden(true);
+          tellTop("receptionist-ended");
+          setResting(true);
         });
+
+        // Live captions (#16). AgentSession publishes both sides on
+        // lk.transcription: her words as one stream per reply, written a few
+        // words at a time in step with her audio; the visitor's (sent with the
+        // visitor's identity) as one stream per update, each the whole phrase
+        // so far, the last marked final.
+        room.registerTextStreamHandler(TOPIC_TRANSCRIPTION, async (reader, { identity }) => {
+          const who: Speaker = identity === room.localParticipant.identity ? "visitor" : "mia";
+          const attrs = reader.info.attributes ?? {};
+          const id = attrs[ATTR_SEGMENT_ID] ?? reader.info.id;
+          try {
+            if (who === "visitor") {
+              const text = await reader.readAll();
+              if (!cancelled) updateCaption(who, id, text, attrs[ATTR_TRANSCRIPTION_FINAL] === "true");
+              return;
+            }
+            let text = "";
+            for await (const chunk of reader) {
+              if (cancelled) return;
+              text += chunk;
+              updateCaption(who, id, text, false);
+            }
+            if (!cancelled) updateCaption(who, id, text, true);
+          } catch (e) {
+            console.warn("[SimliLK] transcription stream failed:", e);
+          }
+        });
+
+        // Cards the worker pushes to the screen (#18).
+        room.registerTextStreamHandler(TOPIC_SCREEN, async (reader, { identity }) => {
+          try {
+            const msg = parseScreenMessage(await reader.readAll());
+            if (msg && !cancelled) showScreenMessage(msg);
+            else if (!msg) console.warn("[SimliLK] ignored screen message from", identity);
+          } catch (e) {
+            console.warn("[SimliLK] screen stream failed:", e);
+          }
+        });
+
+        // Her state and language (#24, #25), from whichever remote participant
+        // carries them (the worker; the Simli avatar is a separate participant).
+        const readAttributes = () => {
+          if (cancelled) return;
+          let state: string | undefined;
+          let language: string | undefined;
+          room.remoteParticipants.forEach((p) => {
+            state = p.attributes[ATTR_STATE] ?? state;
+            language = p.attributes[ATTR_LANGUAGE] ?? language;
+          });
+          state = devAttrs.current.state ?? state;
+          language = devAttrs.current.language ?? language;
+          console.log(`[SimliLK] ${ATTR_STATE}=${state ?? "-"} ${ATTR_LANGUAGE}=${language ?? "-"}`);
+          setMiaState(asMiaState(state));
+          setLang(asLang(language));
+        };
+        room.on(RoomEvent.ParticipantAttributesChanged, readAttributes);
+        room.on(RoomEvent.ParticipantConnected, readAttributes);
+        room.on(RoomEvent.ParticipantDisconnected, readAttributes);
 
         // Whose turn it is, derived from who's actually making sound. The
         // avatar publishes as a remote participant, so anyone remote speaking
@@ -360,6 +520,9 @@ export default function SimliLiveKitPanel({
 
         roomRef.current = room;
         readyRef.current = true;
+        readAttributes();
+        console.log("[SimliLK] in room", room.name);
+        tellTop("receptionist-started");
         setStatus("ready");
       } catch (err) {
         console.error("[SimliLK] start error:", err);
@@ -396,20 +559,71 @@ export default function SimliLiveKitPanel({
       }
       roomRef.current = null;
       SESSION_ACTIVE = false; // release the lock when this session tears down
-      // Drop the last frame so the next showing doesn't flash the old session.
+      // Drop the last frame so the next showing doesn't flash the old session,
+      // and wipe the canvas so a resting panel isn't a frozen picture of her
+      // (the tour's still image of her shows through instead).
       if (videoRef.current) videoRef.current.srcObject = null;
+      const canvas = canvasRef.current;
+      canvas?.getContext("2d")?.clearRect(0, 0, canvas.width, canvas.height);
+      clearCaptions();
+      setMiaState("listening");
       setListening(false);
       setStatus("idle");
     };
-  }, [autoStart, hidden]);
+  }, [autoStart, hidden, resting, tellTop, updateCaption, clearCaptions, showScreenMessage]);
+
+  // Dev only (stripped from production builds): drive the screen without a
+  // worker, for layout work and the Playwright screenshots. In the browser
+  // console of /receptionist-embed:
+  //   miaDev.screen({ type: "contact_card" })
+  //   miaDev.screen({ type: "message_sent", to: "Nicolas Bastien" })
+  //   miaDev.caption("mia", "Bonjour !")      miaDev.caption("visitor", "Hi")
+  //   miaDev.state("paused")   miaDev.language("en")   miaDev.end()
+  // To go through LiveKit itself, see scripts/mia-screen-push.py.
+  useEffect(() => {
+    if (process.env.NODE_ENV !== "development") return;
+    let n = 0;
+    const dev = {
+      screen: (m: unknown) => {
+        const msg = parseScreenMessage(m);
+        if (msg) showScreenMessage(msg);
+        return msg;
+      },
+      caption: (who: Speaker, text: string, final = true) => updateCaption(who, `dev-${who}-${n++}`, text, final),
+      state: (s: string) => {
+        devAttrs.current.state = s;
+        setMiaState(asMiaState(s));
+      },
+      language: (l: string) => {
+        devAttrs.current.language = l;
+        setLang(asLang(l));
+      },
+      end: () => roomRef.current?.disconnect(),
+    };
+    (window as unknown as { miaDev?: typeof dev }).miaDev = dev;
+    return () => {
+      delete (window as unknown as { miaDev?: typeof dev }).miaDev;
+    };
+  }, [showScreenMessage, updateCaption]);
+
+  const wake = useCallback(() => {
+    setHidden(false);
+    setResting(false);
+  }, []);
 
   const connecting = status !== "ready" && status !== "speaking";
+  const inSession = !hidden && !resting && !connecting;
+  const paused = inSession && miaState === "paused";
+  const banner = resting && !hidden ? "resting" : paused ? "paused" : inSession && idleHint ? "idle" : null;
+  const showPill = inSession && listening && !banner;
+  // Captions stack above whatever holds the bottom edge.
+  const captionBottom = banner === "paused" ? "9vw" : banner ? "6vw" : "4.2vw";
 
   return (
     <div
       // No press-to-talk: if she's on screen, she's hearing you. Visibility is
-      // the only thing that gates the mic (see the effect above), so there's
-      // nothing to click here.
+      // the only thing that gates the mic (see the effect above). The only
+      // things to tap are the Contact button, cards and banners.
       style={{
         position: "relative",
         width: "100%",
@@ -419,8 +633,8 @@ export default function SimliLiveKitPanel({
         fontFamily: "sans-serif",
         color: "white",
         boxSizing: "border-box",
-        // Nothing here is interactive any more — let taps fall through to the
-        // panorama behind her instead of dying on this panel.
+        // Let taps fall through to the panorama behind her instead of dying
+        // on this panel; the buttons and cards opt back in.
         pointerEvents: "none",
         userSelect: "none",
         WebkitUserSelect: "none",
@@ -472,7 +686,7 @@ export default function SimliLiveKitPanel({
       {/* The avatar's TTS audio plays through this element. */}
       <audio ref={audioRef} autoPlay />
 
-      {connecting && !hidden && (
+      {connecting && !hidden && !resting && (
         <div
           style={{
             position: "absolute",
@@ -503,8 +717,12 @@ export default function SimliLiveKitPanel({
           in the layout but invisible. That sizes the pill to the *longest*
           label ("Go ahead — I'm listening") permanently, so it doesn't resize
           as the state changes — and it stays correct if the wording changes,
-          unlike a hardcoded width. */}
-      {!connecting && !hidden && listening && (
+          unlike a hardcoded width.
+
+          While she's paused or nobody has spoken for a while, a banner takes
+          its place (below). Sized in vw like the rest of the overlay: the
+          frame is 1280px wide but drawn ~0.7x on the kiosk, so 13px was ~9px. */}
+      {showPill && (
         <div
           style={{
             position: "absolute",
@@ -512,12 +730,12 @@ export default function SimliLiveKitPanel({
             bottom: 0,
             transform: "translateX(-50%)",
             display: "grid",
-            padding: "9px 18px",
+            padding: "0.7vw 1.4vw",
             lineHeight: 1.25,
             borderRadius: 999,
             background: TURN_LABEL[turn].bg,
             color: "white",
-            fontSize: 13,
+            fontSize: "clamp(13px, 1.45vw, 24px)",
             fontWeight: 600,
             textAlign: "center",
             textShadow: "0 2px 8px rgba(0,0,0,0.8)",
@@ -539,6 +757,44 @@ export default function SimliLiveKitPanel({
           ))}
         </div>
       )}
+
+      {!hidden && (
+        <MiaCaptions
+          captions={captions}
+          lang={lang}
+          // While paused she isn't in the conversation: the visitor is talking
+          // to someone else, which has no business on the screen.
+          showVisitor={!paused}
+          bottom={captionBottom}
+        />
+      )}
+
+      {banner && (
+        <MiaBanner
+          kind={banner}
+          lang={lang}
+          onTap={() => {
+            if (banner === "resting") wake();
+            else {
+              // Paused: ask the worker to resume. Idle: tell it someone is
+              // there; either way the mic is already open.
+              sendControl({ type: banner === "paused" ? "resume" : "wake" });
+              setIdleTick((t) => t + 1);
+            }
+          }}
+        />
+      )}
+
+      {!hidden && (
+        <ContactButton
+          active={card?.type === "contact_card"}
+          onClick={() =>
+            card?.type === "contact_card" ? setCard(null) : showScreenMessage({ type: "contact_card" })
+          }
+        />
+      )}
+
+      {!hidden && card && <MiaScreenCard card={card} onClose={() => setCard(null)} />}
     </div>
   );
 }
