@@ -119,7 +119,14 @@ const THINKING_TIMEOUT_MS = 8000;
 const IDLE_HINT_MS = 12000;
 
 // Cards close on their own: the next visitor shouldn't find the last one's.
-const CARD_MS: Record<Card["type"], number> = { contact_card: 45000, message_sent: 10000 };
+// A draft project request stays while the visitor checks it and she applies
+// corrections (each update restarts the wait); the worker's screen_cards.py
+// keeps the same times.
+function cardMs(card: Card): number {
+  if (card.type === "contact_card") return 45000;
+  if (card.type === "project_request") return card.status === "draft" ? 180000 : 15000;
+  return 10000;
+}
 
 // How much to enlarge her within the Web Frame. Simli renders her small inside
 // a 16:9 feed and objectFit "contain" letterboxes that, so she reads as a
@@ -235,6 +242,8 @@ export default function SimliLiveKitPanel({
     console.log("[SimliLK] screen message:", m.type);
     if (m.type === "dismiss") setCard(null);
     else if (m.type === "contact_card") setCard({ type: "contact_card", lang: m.lang ?? langRef.current });
+    else if (m.type === "project_request")
+      setCard({ type: "project_request", status: m.status, fields: m.fields, lang: m.lang ?? langRef.current });
     else
       setCard({
         type: "message_sent",
@@ -246,7 +255,7 @@ export default function SimliLiveKitPanel({
 
   useEffect(() => {
     if (!card) return;
-    const timer = window.setTimeout(() => setCard(null), CARD_MS[card.type]);
+    const timer = window.setTimeout(() => setCard(null), cardMs(card));
     return () => window.clearTimeout(timer);
   }, [card]);
 
@@ -408,6 +417,9 @@ export default function SimliLiveKitPanel({
           console.warn("[SimliLK] room ended:", reason);
           tellTop("receptionist-ended");
           setResting(true);
+          // A draft project request holds the visitor's name, email and
+          // phone: it goes with their session, not to the next visitor.
+          setCard(null);
         });
 
         // Live captions (#16). AgentSession publishes both sides on
@@ -566,6 +578,7 @@ export default function SimliLiveKitPanel({
       const canvas = canvasRef.current;
       canvas?.getContext("2d")?.clearRect(0, 0, canvas.width, canvas.height);
       clearCaptions();
+      setCard(null);
       setMiaState("listening");
       setListening(false);
       setStatus("idle");
