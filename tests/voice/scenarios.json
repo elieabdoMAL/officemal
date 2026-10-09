@@ -33,7 +33,7 @@
     "groups": ["wave1"],
     "about": "Numéro de téléphone (#6), puis lentement : chiffres groupés, puis un par un ; jamais « cinq cent quatorze ».",
     "voice": "fr",
-    "lines": [["Français.",11], ["Quel est votre numéro de téléphone ?",14], ["Pouvez-vous le répéter lentement, s'il vous plaît ?",22]],
+    "lines": [["Français.",11], ["Quel est votre numéro de téléphone ?",14], ["Pouvez-vous le répéter lentement, s'il vous plaît ?",30]],
     "expect": {"lang": "fr", "say": [["/5 1 4 5 7 3 2 3 2 4 .*5 1 4 5 7 3 2 3 2 4/"]], "notSay": ["/cent|mille|quatorze|soixante|vingt|trente/"], "said": ["/un, cinq, un, quatre, cinq/"], "ended": false}
   },
   "talk_someone": {
