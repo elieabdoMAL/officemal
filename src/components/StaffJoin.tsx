@@ -250,7 +250,7 @@ export default function StaffJoin() {
       )}
 
       {!inCall && (
-        <div style={{ ...centered, flex: 1, flexDirection: "column", gap: 14, padding: "24px 20px" }}>
+        <div style={{ ...centered, flex: 1, flexDirection: "column", gap: 12, padding: "16px 20px 12px" }}>
           <Message phase={phase} visitor={visitor} name={call?.name ?? ""} error={error} />
         </div>
       )}
@@ -359,7 +359,7 @@ const dot: React.CSSProperties = {
 
 const selfPreview: React.CSSProperties = {
   alignSelf: "center",
-  width: "min(88vw, 360px)",
+  width: "min(88vw, 360px, 30vh)", // 3:4, so at most 40% of the screen: Join stays in view on an iPhone SE
   aspectRatio: "3 / 4",
   objectFit: "cover",
   borderRadius: 16,

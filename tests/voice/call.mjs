@@ -425,8 +425,8 @@ async function answered() {
     step("Transcripts (Deepgram, of what the kiosk played)");
     note(`Linda (kiosk): ${t.mia}`);
     note(`Nicolas (kiosk): ${t.staff}`);
-    check(/nicolas/i.test(t.staff) && /tuesday/i.test(t.staff), "his voice reached the kiosk");
-    check(/calling nicolas/i.test(t.mia) && /anything else/i.test(t.mia), "the kiosk played her call line and her 'anything else'");
+    check(/nich?olas/i.test(t.staff) && /tuesday/i.test(t.staff), "his voice reached the kiosk");
+    check(/calling nich?olas/i.test(t.mia) && /anything else/i.test(t.mia), "the kiosk played her call line and her 'anything else'");
     fs.writeFileSync(path.join(DIR, `${current}_worker.log`), workerLogs(start).join("\n"));
   }
 }
@@ -485,7 +485,7 @@ async function noanswer() {
     const t = await finish(kiosk, phone);
     step("Transcript (Deepgram, of what the kiosk played)");
     note(`Linda (kiosk): ${t.mia}`);
-    check(/calling alexandre/i.test(t.mia) && /message/i.test(t.mia), "the kiosk played her call line and the message offer");
+    check(/calling alexand(er|re|ra)/i.test(t.mia) && /message/i.test(t.mia), "the kiosk played her call line and the message offer");
     fs.writeFileSync(path.join(DIR, `${current}_worker.log`), workerLogs(start).join("\n"));
   }
 }
