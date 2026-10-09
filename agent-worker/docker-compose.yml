@@ -1,0 +1,19 @@
+# PC-side: build the image and push it to Docker Hub (account: elieabdomal).
+#
+#   docker login
+#   docker compose build
+#   docker compose push
+#
+# IMPORTANT: the server is linux/amd64. If your PC is a different architecture,
+# build for the server's platform — see build-and-push.sh which handles this
+# with buildx. (Plain `docker compose build` only works if your PC is amd64.)
+services:
+  simli-worker:
+    image: elieabdomal/simli-worker:latest
+    build:
+      context: .
+      platforms:
+        - linux/amd64
+    container_name: simli-worker
+    env_file: .env
+    restart: unless-stopped

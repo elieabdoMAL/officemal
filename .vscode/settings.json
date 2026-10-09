@@ -1,0 +1,5 @@
+{
+  // Don't auto-activate agent-worker/.venv in new terminals. The worker runs in
+  // Docker, and that venv points at a Python that's no longer installed.
+  "python.terminal.activateEnvironment": false
+}

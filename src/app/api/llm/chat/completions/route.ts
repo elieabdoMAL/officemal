@@ -12,9 +12,10 @@ export const dynamic = "force-dynamic";
 // straight at Anthropic yields a non-streaming JSON blob Simli can't parse, and
 // the avatar stays silent.
 //
-// This route sits in between: Simli -> /api/llm/chat -> Anthropic (stream:true)
-// and pipes the SSE straight back. Point Simli's llmConfig.baseURL at
-// `<your-deployed-origin>/api/llm` (Simli appends /chat/completions).
+// This route sits in between: Simli -> /api/llm/chat/completions -> Anthropic
+// (stream:true) and pipes the SSE straight back. Point Simli's
+// llmConfig.baseURL at `<your-deployed-origin>/api/llm` — Simli appends
+// `/chat/completions`, which lands exactly here.
 //
 // NOTE: Simli's servers call this over the public internet, so it must be the
 // deployed URL — localhost is unreachable from Simli (which is also why the

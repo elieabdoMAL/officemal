@@ -1,0 +1,7 @@
+.venv/
+.env
+test_*.py
+__pycache__/
+*.pyc
+README.md
+requirements.lock.txt
