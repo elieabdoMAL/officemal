@@ -28,12 +28,30 @@ export const ATTR_SEGMENT_ID = "lk.segment_id";
 
 export type SentKind = "message" | "notify" | "alert" | "suggestion" | "project_request";
 
+// The project request form (#20), field key -> value, in the order the worker
+// sent them (its PROJECT_FIELDS, agent-worker/leads.py). Empty = not given.
+export type ProjectFields = [key: string, value: string][];
+export type ProjectStatus = "draft" | "sent";
+
 export type ScreenMessage =
   | { type: "contact_card"; lang?: Lang }
   | { type: "message_sent"; kind?: SentKind; to?: string; lang?: Lang }
+  | { type: "project_request"; status: ProjectStatus; fields: ProjectFields; lang?: Lang }
   | { type: "dismiss" };
 
 const SENT_KINDS: SentKind[] = ["message", "notify", "alert", "suggestion", "project_request"];
+
+// Visitor-dictated text: keep the card's size sane whatever arrives.
+const MAX_PROJECT_FIELDS = 12;
+const MAX_PROJECT_VALUE = 600;
+
+function parseProjectFields(raw: unknown): ProjectFields | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  return Object.entries(raw as Record<string, unknown>)
+    .filter(([, v]) => typeof v === "string" || v == null)
+    .slice(0, MAX_PROJECT_FIELDS)
+    .map(([k, v]) => [k.slice(0, 40), ((v as string | null) ?? "").trim().slice(0, MAX_PROJECT_VALUE)]);
+}
 
 // Unknown or malformed messages come back null and are ignored, so the worker
 // can start sending a new type before the screen knows how to draw it.
@@ -59,6 +77,11 @@ export function parseScreenMessage(raw: unknown): ScreenMessage | null {
         to: typeof o.to === "string" && o.to.trim() ? o.to.trim().slice(0, 80) : undefined,
         lang,
       };
+    case "project_request": {
+      const fields = parseProjectFields(o.fields);
+      if (!fields || (o.status !== "draft" && o.status !== "sent")) return null;
+      return { type: "project_request", status: o.status, fields, lang };
+    }
     case "dismiss":
       return { type: "dismiss" };
     default:

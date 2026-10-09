@@ -1,11 +1,12 @@
 "use client";
 
-import { CONTACT, pick, type Bilingual, type Lang } from "@/lib/assistant";
-import type { SentKind } from "@/lib/screenProtocol";
+import { ASSISTANT_NAME, CONTACT, pick, type Bilingual, type Lang } from "@/lib/assistant";
+import type { ProjectFields, ProjectStatus, SentKind } from "@/lib/screenProtocol";
 
 // Cards shown on the kiosk panel (#18): the contact card (Contact button, or
-// the worker's "contact_card" message) and the "message sent" confirmation
-// (the worker's "message_sent"). See docs/screen-protocol.md.
+// the worker's "contact_card" message), the "message sent" confirmation (the
+// worker's "message_sent") and the project request form (#20, the worker's
+// "project_request"). See docs/screen-protocol.md.
 //
 // Sizes are in vw, i.e. fractions of the Web Frame's own width (1280 CSS px in
 // the tour, drawn ~0.7x on the 1080p kiosk), so they read the same whatever
@@ -13,7 +14,8 @@ import type { SentKind } from "@/lib/screenProtocol";
 
 export type Card =
   | { type: "contact_card"; lang: Lang | null }
-  | { type: "message_sent"; kind: SentKind; to?: string; lang: Lang | null };
+  | { type: "message_sent"; kind: SentKind; to?: string; lang: Lang | null }
+  | { type: "project_request"; status: ProjectStatus; fields: ProjectFields; lang: Lang | null };
 
 // The card sits to her left (the visitor's right), over the panorama, so it
 // doesn't cover her face; it may overlap her shoulder.
@@ -45,7 +47,8 @@ const L = {
 };
 
 function label(lang: Lang | null, text: Bilingual) {
-  return pick(lang, text).join(" · ");
+  // "Budget · Budget" reads as a glitch: same word in both, say it once.
+  return [...new Set(pick(lang, text))].join(" · ");
 }
 
 function CloseButton({ lang, onClose }: { lang: Lang | null; onClose: () => void }) {
@@ -187,8 +190,158 @@ function MessageSentCard({
   );
 }
 
+// Labels for the worker's PROJECT_FIELDS (agent-worker/leads.py). A field the
+// worker adds later still shows, under its key, until it gets a label here.
+const PROJECT_LABEL: Record<string, Bilingual> = {
+  name: { fr: "Nom", en: "Name" },
+  company: { fr: "Entreprise", en: "Company" },
+  email: { fr: "Courriel", en: "Email" },
+  phone: { fr: "Téléphone", en: "Phone" },
+  description: { fr: "Projet", en: "Project" },
+  timeline: { fr: "Échéancier", en: "Timeline" },
+  budget: { fr: "Budget", en: "Budget" },
+};
+
+const PROJECT_TEXT = {
+  draftTitle: { fr: "Votre demande de projet", en: "Your project request" },
+  draftHint: {
+    fr: `Vérifiez-la et dites à ${ASSISTANT_NAME} quoi corriger`,
+    en: `Please check it and tell ${ASSISTANT_NAME} what to change`,
+  },
+  sentTitle: { fr: "Demande de projet envoyée", en: "Project request sent" },
+  sentHint: { fr: "L'équipe vous reviendra", en: "The team will get back to you" },
+};
+
+function projectLabel(key: string): Bilingual {
+  const plain = key.replace(/_/g, " ");
+  return PROJECT_LABEL[key] ?? { fr: plain, en: plain };
+}
+
+function ProjectRequestCard({
+  status,
+  fields,
+  lang,
+  onClose,
+}: {
+  status: ProjectStatus;
+  fields: ProjectFields;
+  lang: Lang | null;
+  onClose: () => void;
+}) {
+  const sent = status === "sent";
+  // The draft shows every field, so the visitor sees what's still blank; the
+  // sent card only what went out.
+  const rows = sent ? fields.filter(([, v]) => v) : fields;
+  const title = pick(lang, sent ? PROJECT_TEXT.sentTitle : PROJECT_TEXT.draftTitle);
+  const hint = pick(lang, sent ? PROJECT_TEXT.sentHint : PROJECT_TEXT.draftHint);
+
+  return (
+    <div
+      role={sent ? "status" : "dialog"}
+      aria-label={title[0]}
+      data-project-status={status}
+      style={{
+        ...cardBox,
+        width: "38%",
+        fontSize: "clamp(11px, 1.35vw, 22px)",
+        borderTop: `0.45vw solid ${sent ? "#16a34a" : "#f59e0b"}`,
+      }}
+    >
+      <CloseButton lang={lang} onClose={onClose} />
+      <div style={{ display: "flex", alignItems: "center", gap: "0.9vw", paddingRight: "3vw" }}>
+        {sent && (
+          <div
+            aria-hidden
+            style={{
+              flex: "none",
+              width: "3vw",
+              height: "3vw",
+              minWidth: 26,
+              minHeight: 26,
+              borderRadius: "50%",
+              background: "#16a34a",
+              color: "white",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              fontWeight: 800,
+            }}
+          >
+            ✓
+          </div>
+        )}
+        <div style={{ fontSize: "1.2em", fontWeight: 800, lineHeight: 1.2 }}>
+          {title.map((t, i) => (
+            <div key={t} style={i ? { fontSize: "0.75em", fontWeight: 600, color: "#5b6b8c" } : undefined}>
+              {t}
+            </div>
+          ))}
+        </div>
+      </div>
+      <dl
+        style={{
+          display: "grid",
+          gridTemplateColumns: "auto 1fr",
+          columnGap: "1.2vw",
+          rowGap: "0.45vw",
+          margin: "1vw 0 0",
+        }}
+      >
+        {rows.map(([key, value]) => (
+          <div key={key} style={{ display: "contents" }}>
+            <dt
+              style={{
+                fontSize: "0.72em",
+                fontWeight: 700,
+                textTransform: "uppercase",
+                letterSpacing: "0.06em",
+                color: "#5b6b8c",
+                paddingTop: "0.25em",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {label(lang, projectLabel(key))}
+            </dt>
+            <dd
+              style={{
+                margin: 0,
+                fontWeight: value ? 600 : 400,
+                color: value ? "#14213d" : "#9aa5bd",
+                overflowWrap: "anywhere",
+                // A long description shouldn't push the card off the frame.
+                display: "-webkit-box",
+                WebkitLineClamp: key === "description" ? 4 : 2,
+                WebkitBoxOrient: "vertical",
+                overflow: "hidden",
+              }}
+            >
+              {value || "—"}
+            </dd>
+          </div>
+        ))}
+      </dl>
+      <div
+        style={{
+          marginTop: "1vw",
+          paddingTop: "0.7vw",
+          borderTop: "1px solid rgba(20,33,61,0.12)",
+          fontSize: "0.85em",
+          fontWeight: 600,
+          color: sent ? "#15803d" : "#b45309",
+        }}
+      >
+        {hint.map((t) => (
+          <div key={t}>{t}</div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function MiaScreenCard({ card, onClose }: { card: Card; onClose: () => void }) {
   if (card.type === "contact_card") return <ContactCard lang={card.lang} onClose={onClose} />;
+  if (card.type === "project_request")
+    return <ProjectRequestCard status={card.status} fields={card.fields} lang={card.lang} onClose={onClose} />;
   return <MessageSentCard kind={card.kind} to={card.to} lang={card.lang} onClose={onClose} />;
 }
 

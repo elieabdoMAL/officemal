@@ -79,7 +79,8 @@ async def test_resend_delivery() -> None:
     print("✓ Resend accepted message, notify and emergency test emails (to delivered@resend.dev)")
 
 
-# What the tools did, by kind: ("message" | "notify" | "emergency" | "end", details).
+# What the tools did, by kind: ("message" | "notify" | "emergency" | "suggestion" |
+# "project" | "end" | "screen", details). "screen" is a mia.screen message she sent.
 calls: list[tuple] = []
 
 
@@ -108,66 +109,111 @@ def install_recorders(worker) -> None:
         calls.append(("emergency", [m.full_name for m in team], description))
         return True
 
+    async def suggestion(inbox, suggestion, visitor_name, reply_contact):
+        calls.append(("suggestion", inbox.full_name, suggestion, visitor_name, reply_contact))
+        return True
+
+    async def project(inbox, fields, language):
+        calls.append(("project", inbox.full_name, dict(fields), language))
+        return True
+
     worker.send_message_email = message
     worker.send_visitor_waiting_email = notify
     worker.send_emergency_email = emergency
+    worker.send_suggestion_email = suggestion
+    worker.send_project_request_email = project
+
+
+class Conversation:
+    """One text conversation with her, kept open between lines:
+
+        async with Conversation("en") as c:
+            reply = await c.say("Hi!")
+
+    `agent` is the MiaAgent, for tests that need its state."""
+
+    def __init__(self, lang: str) -> None:
+        self.lang = lang
+
+    async def __aenter__(self) -> "Conversation":
+        from livekit.agents import AgentSession
+        from livekit.plugins import google
+
+        import worker
+
+        # Text only: no voice. MiaAgent keeps its TTS in Agent._tts (the base class
+        # slot the session speaks through), so clear it and the swap. on_goodbye
+        # stands in for end_session, which in production deletes the room once the
+        # goodbye it is handed has had time to play.
+        def on_goodbye(said: str) -> None:
+            assert said.strip(), "end_session must be handed the goodbye she said, to time its playout"
+            calls.append(("end",))
+
+        agent = worker.MiaAgent(tts=None, on_goodbye=on_goodbye, on_screen=lambda msg: calls.append(("screen", msg)))
+        agent._tts = None
+        # As if the visitor had answered "Français ou English?" with `lang`, so the
+        # screen messages carry it as they would on the kiosk.
+        agent._chosen_language = self.lang
+        agent._speak_in = lambda _lang: None
+        # In production the greeting is spoken before the visitor talks and sits in
+        # her history; without it she tends to greet again.
+        history = agent.chat_ctx.copy()
+        history.add_message(role="assistant", content=worker.FIRST_MESSAGE)
+        await agent.update_chat_ctx(history)
+
+        # Text runs skip on_user_turn_completed, which adds the per-turn "reply in
+        # <language>" note on spoken turns. Add the same note here instead, or she
+        # answers English lines in French after that French greeting.
+        base_llm_node = agent.llm_node
+
+        async def llm_node(chat_ctx, tools, model_settings):
+            chat_ctx = chat_ctx.copy()
+            chat_ctx.add_message(role="system", content=worker._reply_language_note(agent._last_raw_language))
+            async for chunk in base_llm_node(chat_ctx, tools, model_settings):
+                yield chunk
+
+        agent.llm_node = llm_node
+        # Same LLM settings as worker.entrypoint (thinking off).
+        llm = google.LLM(model="gemini-2.5-flash", thinking_config={"thinking_budget": 0})
+        self.agent = agent
+        self.session = AgentSession(llm=llm)
+        await self.session.__aenter__()
+        await self.session.start(agent)
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        await self.session.__aexit__(*exc)
+
+    async def say(self, line: str) -> str:
+        """The visitor says `line`; her reply."""
+        self.agent._last_raw_language = self.lang  # what Deepgram would report
+        before = len(calls)
+        seen = len(self.session.history.items)
+        await self.session.run(user_input=line)
+        # Anything she says right after, on her own (the worker's checks can
+        # add a reply), belongs to this turn too.
+        for _ in range(2):
+            await asyncio.sleep(0.5)  # on_goodbye runs from a speech-done callback
+            while (speech := self.session.current_speech) is not None:
+                await speech
+        reply = " ".join(
+            item.text_content
+            for item in self.session.history.items[seen:]
+            if getattr(item, "type", "") == "message" and item.role == "assistant" and item.text_content
+        )
+        tools = "".join(
+            f" [screen {c[1].get('type')} {c[1].get('kind') or c[1].get('status') or ''}]".replace(" ]", "]")
+            if c[0] == "screen" else f" [{c[0]} recorded]"
+            for c in calls[before:]
+        )
+        print(f"  VISITOR: {line}\n  MIA:     {reply}{tools}")
+        return reply
 
 
 async def converse(lang: str, lines: list[str]) -> list[str]:
     """Play `lines` as one conversation; return her reply to each."""
-    from livekit.agents import AgentSession
-    from livekit.plugins import google
-
-    import worker
-
-    # Text only: no voice. MiaAgent keeps its TTS in Agent._tts (the base class
-    # slot the session speaks through), so clear it and the swap. on_goodbye
-    # stands in for end_session, which in production deletes the room once the
-    # goodbye it is handed has had time to play.
-    def on_goodbye(said: str) -> None:
-        assert said.strip(), "end_session must be handed the goodbye she said, to time its playout"
-        calls.append(("end",))
-
-    agent = worker.MiaAgent(tts=None, on_goodbye=on_goodbye)
-    agent._tts = None
-    agent._speak_in = lambda _lang: None
-    # In production the greeting is spoken before the visitor talks and sits in
-    # her history; without it she tends to greet again.
-    history = agent.chat_ctx.copy()
-    history.add_message(role="assistant", content=worker.FIRST_MESSAGE)
-    await agent.update_chat_ctx(history)
-
-    # Text runs skip on_user_turn_completed, which adds the per-turn "reply in
-    # <language>" note on spoken turns. Add the same note here instead, or she
-    # answers English lines in French after that French greeting.
-    base_llm_node = agent.llm_node
-
-    async def llm_node(chat_ctx, tools, model_settings):
-        chat_ctx = chat_ctx.copy()
-        chat_ctx.add_message(role="system", content=worker._reply_language_note(agent._last_raw_language))
-        async for chunk in base_llm_node(chat_ctx, tools, model_settings):
-            yield chunk
-
-    agent.llm_node = llm_node
-    # Same LLM settings as worker.entrypoint (thinking off).
-    llm = google.LLM(model="gemini-2.5-flash", thinking_config={"thinking_budget": 0})
-    replies = []
-    async with AgentSession(llm=llm) as session:
-        await session.start(agent)
-        for line in lines:
-            agent._last_raw_language = lang  # what Deepgram would report
-            before = len(calls)
-            result = await session.run(user_input=line)
-            await asyncio.sleep(0.2)  # on_goodbye runs from a speech-done callback
-            reply = " ".join(
-                ev.item.text_content
-                for ev in result.events
-                if getattr(ev, "type", "") == "message" and ev.item.role == "assistant"
-            )
-            tools = "".join(f" [{c[0]} recorded]" for c in calls[before:])
-            print(f"  VISITOR: {line}\n  MIA:     {reply}{tools}")
-            replies.append(reply)
-    return replies
+    async with Conversation(lang) as c:
+        return [await c.say(line) for line in lines]
 
 
 async def conv_message() -> None:

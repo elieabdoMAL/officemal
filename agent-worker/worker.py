@@ -18,6 +18,11 @@ and Gemini is told every turn to reply in it — until the visitor explicitly
 asks to switch. "Stop talking" pauses her until her name is said. What the
 visitor's words mean for this is decided in conversation_control.py.
 
+She also drives the kiosk screen (docs/screen-protocol.md, screen_cards.py):
+cards on "mia.screen" (contact details, "sent" confirmations, the project
+request form) and taps back on "mia.control". Suggestions and project requests
+(leads.py) go to the team's general inbox.
+
 Run:
     python worker.py dev      # local dev + hot reload (test via LiveKit Sandbox)
     python worker.py start    # production (under systemd on the server)
@@ -31,9 +36,11 @@ The LIVEKIT_* vars are read automatically by the agents framework.
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,6 +66,26 @@ from conversation_control import (
     says_name,
     speak_digits_stream,
     wants_pause,
+)
+from leads import (
+    SentLog,
+    clean_project_fields,
+    missing_project_fields,
+    project_fields_prompt,
+    project_request_schema,
+    project_screen_fields,
+    send_project_request_email,
+    send_suggestion_email,
+)
+from screen_cards import (
+    DRAFT_CARD_S,
+    SENT_CARD_S,
+    TOPIC_CONTROL,
+    TOPIC_SCREEN,
+    contact_card,
+    gives_contact_details,
+    message_sent,
+    project_request,
 )
 from team_messages import (
     find_member,
@@ -100,7 +127,11 @@ def load_prompt() -> str:
     """mia_prompt.txt with its placeholders filled. str.replace, not format():
     the prompt may contain braces of its own."""
     text = PROMPT_FILE.read_text(encoding="utf-8").strip()
-    return text.replace("{ASSISTANT_NAME}", ASSISTANT_NAME).replace("{FIRST_MESSAGE}", FIRST_MESSAGE)
+    return (
+        text.replace("{ASSISTANT_NAME}", ASSISTANT_NAME)
+        .replace("{FIRST_MESSAGE}", FIRST_MESSAGE)
+        .replace("{PROJECT_FIELDS}", project_fields_prompt())
+    )
 
 
 MIA_SYSTEM_PROMPT = load_prompt() + "\n\n" + team_prompt_section(TEAM)
@@ -113,6 +144,12 @@ MAX_NOTIFICATIONS_PER_SESSION = 3
 # Emails the whole team. A second alert allows for "it's getting worse"; past
 # that it's a prank or a loop, and the visitor has already been told 911.
 MAX_EMERGENCY_ALERTS_PER_SESSION = 2
+# Both go to the general inbox. A second allows for a correction after sending.
+MAX_SUGGESTIONS_PER_SESSION = 2
+MAX_PROJECT_REQUESTS_PER_SESSION = 2
+
+# The general inbox (info@, team.json), where suggestions and project requests go.
+INBOX = next((m for m in TEAM if m.inbox), None)
 
 # One Aura voice speaks one language, so we swap the TTS model per turn to match
 # whatever Deepgram detected. andromeda-en is the plugin's own default — keeping
@@ -339,6 +376,44 @@ WOKEN_ASKING_NOTE = (
     "You were paused and the visitor just called you back by name; you heard nothing in "
     "between. Answer what they are asking now, directly: do not say that you are listening."
 )
+# Tapping the "say my name" banner on the screen does what her name does
+# ("resume" on mia.control, docs/screen-protocol.md).
+TAPPED_NOTE = (
+    "You were paused and the visitor just tapped the screen to call you back; you heard nothing "
+    "in between. Say in a few words that you are listening and ask how you can help."
+)
+
+# Said when the visitor taps the "say my name or tap to talk" hint while she
+# waits ("wake" on mia.control). Before the language is chosen, in both.
+WAKE_LINE = {
+    "en": "Yes? How can I help?",
+    "fr": "Oui ? Comment puis-je vous aider ?",
+}
+WAKE_LINE_BOTH = "Oui? Yes? Français ou English?"
+
+# "I've let Alexandre know you're here" with no notify_member call: a lie to
+# the visitor. Gemini did it now and then (the base branch, every time, on
+# "J'ai rendez-vous avec Alexandre. Je suis Lucie Bouchard."), so the worker
+# checks what she said and has her make it true (or take it back) at once.
+NOTIFY_CLAIM = re.compile(
+    r"\bI(?:'ve| have) (?:let (?!you\b)\w+ know|notified|informed)\b"
+    r"|\bI(?:'m| am) (?:letting (?!you\b)\w+ know|notifying|informing)\b"
+    r"|\bj'ai (?:prévenu|informé|avisé)\b"
+    r"|\bje (?:préviens|vais prévenir|l'informe|vais l'informer|l'avise)\b",
+    re.IGNORECASE,
+)
+NOTIFY_CLAIM_NOTE = (
+    "System check: in your last reply you told the visitor you let someone know they are here, "
+    "but notify_member was not called, so nobody was told. If you have the visitor's name and "
+    "know who they came to see, call notify_member now, then confirm it as its answer says. "
+    "Otherwise say in a few words that you have not told anyone yet, and ask for what is missing."
+)
+
+# Her answer when a tool refuses a repeat send (leads.SentLog).
+ALREADY_SENT = (
+    "NOT SENT AGAIN: {what} was already sent to {to} in this conversation. Tell the visitor it is "
+    "already sent. Send it again only if they clearly ask you to send it again."
+)
 
 
 def _assistant_texts(handle) -> list[str]:
@@ -406,6 +481,7 @@ class MiaAgent(Agent):
         stt=None,
         on_goodbye: Callable[[str], None] | None = None,
         on_status: Callable[[], None] | None = None,
+        on_screen: Callable[[dict], None] | None = None,
     ) -> None:
         # tts: deepgram.TTS or elevenlabs.TTS, see make_tts
         # stt: the session's deepgram.STT, so the language lock can retune it
@@ -418,6 +494,12 @@ class MiaAgent(Agent):
         # Called whenever `paused` or `chosen_language` changes (screen
         # attributes, pause timeout: see entrypoint).
         self._on_status = on_status
+        # Sends one "mia.screen" message to the kiosk (entrypoint's
+        # send_screen). Never awaited: the screen must not hold up her reply.
+        self._on_screen = on_screen
+        # Until then a card of hers is on screen that the contact card mustn't
+        # replace (screen_cards.SENT_CARD_S / DRAFT_CARD_S).
+        self._card_busy_until = 0.0
         self._ending = False
         self._tts = tts  # held directly so we can swap the voice per turn
         self._stt_ctl = stt  # not _stt: that is the base class slot
@@ -438,6 +520,21 @@ class MiaAgent(Agent):
         self._messages_sent = 0
         self._notifications_sent = 0
         self._emergency_alerts_sent = 0
+        self._suggestions_sent = 0
+        self._project_requests_sent = 0
+        self._sent = SentLog()
+        # The visitor's latest words, as Gemini sees them (llm_node): the
+        # repeat guard lets a send through again only if they asked for it.
+        self._visitor_said = ""
+        self._visitor_turns = 0
+        # The visitor turn in which notify_member was last called (NOTIFY_CLAIM).
+        self._notify_turn = -1
+        self._tasks: set[asyncio.Task] = set()
+        # The project request she is filling in (#20), field key -> value,
+        # and the visitor turn it was last shown in: it is sent only after
+        # the visitor has answered the draft as shown.
+        self._project: dict[str, str] = {}
+        self._project_shown_at: int | None = None
 
     @property
     def language(self) -> str:
@@ -456,6 +553,39 @@ class MiaAgent(Agent):
     def _status_changed(self) -> None:
         if self._on_status is not None:
             self._on_status()
+
+    def _show(self, msg: dict, busy_for: float = 0.0) -> None:
+        """Put a card on the kiosk screen. Never raises: the screen is extra,
+        the conversation goes on without it."""
+        if busy_for:
+            self._card_busy_until = time.monotonic() + busy_for
+        if self._on_screen is None:
+            return
+        try:
+            self._on_screen(msg)
+        except Exception:
+            logger.exception("screen message %s failed", msg.get("type"))
+
+    def _show_sent(self, kind: str, to: str = "") -> None:
+        self._show(message_sent(kind, self._chosen_language, to), busy_for=SENT_CARD_S)
+
+    def _show_contact_card(self) -> None:
+        if time.monotonic() < self._card_busy_until:
+            logger.info("contact details said; another card is up, contact card skipped")
+            return
+        self._show(contact_card(self._chosen_language))
+
+    def _display_name(self, member) -> str:
+        """How the screen names a recipient: a person's name, or the inbox in her language."""
+        if member.inbox:
+            return member.role_fr if self._chosen_language == "fr" else member.first_name
+        return member.full_name
+
+    def _is_repeat(self, kind: str, recipient: str, content: str) -> bool:
+        if self._sent.is_repeat(kind, recipient, content, self._visitor_said):
+            logger.info("%s to %s: same content already sent, refused", kind, recipient)
+            return True
+        return False
 
     def _set_paused(self, paused: bool) -> None:
         if paused != self._paused:
@@ -548,6 +678,10 @@ class MiaAgent(Agent):
         # before the turn is even complete.
         if self._paused:
             return
+        visitor = [i for i in chat_ctx.items if getattr(i, "type", "") == "message" and i.role == "user"]
+        if visitor:
+            self._visitor_said = visitor[-1].text_content or ""
+            self._visitor_turns = len(visitor)
         async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
             yield chunk
 
@@ -561,6 +695,45 @@ class MiaAgent(Agent):
             spoken = self._french_voice_respell(spoken)
         async for frame in Agent.default.tts_node(self, spoken, model_settings):
             yield frame
+
+    async def transcription_node(self, text, model_settings):
+        # When she gives the office's phone, email, address or website, the
+        # contact card comes up with them (#18), once per reply. This node
+        # carries her words for the captions and her history, so it sees only
+        # replies that are actually played (unlike the TTS's, which also runs
+        # for guesses that preemptive generation throws away), and runs in the
+        # text-only tests too.
+        async for chunk in Agent.default.transcription_node(self, self._watch_for_contact_details(text), model_settings):
+            yield chunk
+
+    async def _watch_for_contact_details(self, text):
+        said = ""
+        shown = False
+        async for chunk in text:
+            said += chunk
+            if not shown and gives_contact_details(said):
+                shown = True
+                self._show_contact_card()
+            yield chunk
+        if NOTIFY_CLAIM.search(said) and not self._notifications_sent:
+            task = asyncio.create_task(self._check_notify_claim(self._visitor_turns, said))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
+    async def _check_notify_claim(self, turn: int, said: str) -> None:
+        """She said she told someone the visitor is here: once this turn is
+        over (its tools included), make sure notify_member actually ran."""
+        try:
+            handle = self.session.current_speech
+            if handle is not None:
+                await handle
+            await asyncio.sleep(0.3)
+            if self._notify_turn == turn or self._notifications_sent or self._paused or self._ending:
+                return
+            logger.warning("said she notified someone without notify_member: %r", said)
+            self.session.generate_reply(instructions=NOTIFY_CLAIM_NOTE)
+        except Exception:
+            logger.exception("notify claim check failed")
 
     async def _french_voice_respell(self, text):
         # Aura's French voice reads "English" the French way: in her greeting
@@ -599,9 +772,14 @@ class MiaAgent(Agent):
             )
         if not is_real_name(visitor_name) or not message.strip():
             return "NOT SENT: the visitor's real name and the message are both required. Ask for what is missing."
+        if self._is_repeat("message", member.email, message):
+            self._show_sent("message", self._display_name(member))
+            return ALREADY_SENT.format(what="This message", to=member.full_name)
         if not await send_message_email(member, visitor_name, message, reply_contact):
             return "NOT SENT: the email could not be delivered. Say so plainly and give the contact details."
         self._messages_sent += 1
+        self._sent.add("message", member.email, message)
+        self._show_sent("message", self._display_name(member))
         return f"SENT to {member.full_name}."
 
     @function_tool()
@@ -622,6 +800,7 @@ class MiaAgent(Agent):
             member: Who they came to see, as the visitor said it: a name or a role such as "the CEO".
             note: Why they came, only if the visitor said, for example "for a two o'clock meeting". Empty otherwise.
         """
+        self._notify_turn = self._visitor_turns
         if self._notifications_sent >= MAX_NOTIFICATIONS_PER_SESSION:
             return "NOT SENT: notification limit for this conversation reached. Give the contact details instead."
         found = find_member(member, TEAM)
@@ -632,10 +811,27 @@ class MiaAgent(Agent):
             )
         if not is_real_name(visitor_name):
             return "NOT SENT: you do not have the visitor's name yet. Ask for it, then call this again."
+        # Same person told about the same visitor: a repeat, whatever the note.
+        if self._is_repeat("notify", found.email, visitor_name):
+            self._show_sent("notify", found.full_name)
+            return ALREADY_SENT.format(what=f"The notice that {visitor_name} is here", to=found.full_name)
         if not await send_visitor_waiting_email(found, visitor_name, note):
             return "NOT SENT: the email could not be delivered. Say so plainly and give the contact details."
         self._notifications_sent += 1
-        return f"NOTIFIED {found.full_name} by email."
+        self._sent.add("notify", found.email, visitor_name)
+        self._show_sent("notify", found.full_name)
+        # The words to say come with the result, not from the prompt: given
+        # them up front, Gemini sometimes said "J'ai prévenu Alexandre" without
+        # calling this at all (seen on the base branch 3 times out of 3).
+        first = found.first_name
+        return (
+            f"NOTIFIED {found.full_name} by email. Now tell the visitor, in their language, that you let "
+            f"{first} know they are here and that {first} will get back to them, then ask whether they "
+            f"would like to leave {first} a message too. For example, in English: I've let {first} know "
+            f"you're here, {first} will get back to you. Would you like to leave a message too? In French: "
+            f"J'ai prévenu {first} que vous êtes ici, {first} va vous revenir. Voulez-vous lui laisser un "
+            "message aussi ?"
+        )
 
     @function_tool()
     async def alert_emergency(self, context: RunContext, description: str) -> str:
@@ -644,6 +840,7 @@ class MiaAgent(Agent):
         Call this straight away when someone is hurt, unwell, or reports a fire,
         smoke or any danger, in the same reply where you tell them to call 911.
         Tell the visitor the team was alerted only if this returns ALERTED.
+        Never say the team received or read it, or that someone is coming.
 
         Args:
             description: What the visitor reported, in a few words, for example "visitor says there is smoke in the hallway".
@@ -657,7 +854,112 @@ class MiaAgent(Agent):
                 "ask anyone nearby for help, and call the office."
             )
         self._emergency_alerts_sent += 1
-        return "ALERTED: the whole team was emailed."
+        self._show_sent("alert")
+        # Sent is all we know, not that anyone has read it: Chat P's report
+        # had her telling visitors the team "received" the email.
+        return (
+            "ALERTED: an urgent email went out to the whole team. Say only that the team has been "
+            "alerted. You do not know whether anyone has read it: never say they received it, saw it "
+            "or are on their way."
+        )
+
+    @function_tool()
+    async def send_suggestion(
+        self,
+        context: RunContext,
+        suggestion: str,
+        visitor_name: str = "",
+        reply_contact: str = "",
+    ) -> str:
+        """Put a visitor's suggestion in the suggestion box: an email to the team's general inbox.
+
+        Call this only after repeating the suggestion to the visitor in a few
+        words and they said yes. Tell them it was sent only if this returns SENT.
+
+        Args:
+            suggestion: The suggestion, in the visitor's own words.
+            visitor_name: The visitor's name, only if they gave it. Empty to stay anonymous.
+            reply_contact: A phone number or email for a reply, only if the visitor wants one. Empty otherwise.
+        """
+        if INBOX is None:
+            return "NOT SENT: there is no suggestion box here. Give the contact details instead."
+        if self._suggestions_sent >= MAX_SUGGESTIONS_PER_SESSION:
+            return "NOT SENT: suggestion limit for this conversation reached. Give the contact details instead."
+        if not suggestion.strip():
+            return "NOT SENT: the suggestion is empty. Ask the visitor what they would like to suggest."
+        if not is_real_name(visitor_name):
+            visitor_name = ""  # "the visitor", "anonymous": anonymous it is
+        if self._is_repeat("suggestion", INBOX.email, suggestion):
+            self._show_sent("suggestion")
+            return ALREADY_SENT.format(what="This suggestion", to="the team")
+        if not await send_suggestion_email(INBOX, suggestion, visitor_name, reply_contact):
+            return "NOT SENT: the email could not be delivered. Say so plainly and give the contact details."
+        self._suggestions_sent += 1
+        self._sent.add("suggestion", INBOX.email, suggestion)
+        self._show_sent("suggestion")
+        return "SENT to the team's general inbox."
+
+    @function_tool(
+        raw_schema=project_request_schema(
+            "show_project_request",
+            "Show the visitor's project request on the screen as a draft for them to check. Call it "
+            "once you have everything the PROJECT REQUESTS section asks for, and again with the "
+            "corrected fields whenever the visitor corrects something. Pass every field you know; "
+            "leave out what they did not give. Nothing is sent: that is submit_project_request.",
+        )
+    )
+    async def show_project_request(self, raw_arguments: dict[str, object], context: RunContext) -> str:
+        # Fields only ever get filled in or corrected here, never blanked:
+        # Gemini sends "" for whatever it didn't think to repeat.
+        self._project.update(clean_project_fields(raw_arguments))
+        missing = missing_project_fields(self._project)
+        if missing:
+            return "NOT SHOWN yet, still missing: " + "; ".join(missing) + ". Ask for it, one question at a time."
+        self._project_shown_at = self._visitor_turns
+        self._show(
+            project_request("draft", project_screen_fields(self._project), self._chosen_language),
+            busy_for=DRAFT_CARD_S,
+        )
+        logger.info("project request draft shown: %s", self._project)
+        return (
+            "SHOWN on the screen. Ask the visitor in one short sentence to check it there and tell you "
+            "if anything needs changing. Do not read it all out."
+        )
+
+    @function_tool()
+    async def submit_project_request(self, context: RunContext) -> str:
+        """Send the project request shown on the screen to the team's general inbox.
+
+        Call this only after the visitor has checked the draft shown by
+        show_project_request and said it is right. Tell them it was sent only
+        if this returns SENT.
+        """
+        if INBOX is None:
+            return "NOT SENT: project requests cannot be sent from here. Give the contact details instead."
+        if self._project_shown_at is None:
+            return "NOT SENT: show the request on the screen with show_project_request first."
+        if missing_project_fields(self._project):
+            return "NOT SENT: the request is incomplete. Call show_project_request with what is missing."
+        # The visitor must have answered the draft as it is now, not just
+        # seen it appear in this same reply.
+        if self._visitor_turns == self._project_shown_at:
+            return "NOT SENT: the visitor has not checked the draft yet. Ask them to check it on the screen."
+        if self._project_requests_sent >= MAX_PROJECT_REQUESTS_PER_SESSION:
+            return "NOT SENT: project request limit for this conversation reached. Give the contact details instead."
+        content = json.dumps(self._project, sort_keys=True, ensure_ascii=False)
+        if self._is_repeat("project_request", INBOX.email, content):
+            return ALREADY_SENT.format(what="This project request", to="the team")
+        fields = dict(self._project)
+        if not await send_project_request_email(INBOX, fields, self.language):
+            return "NOT SENT: the email could not be delivered. Say so plainly and give the contact details."
+        self._project_requests_sent += 1
+        self._sent.add("project_request", INBOX.email, content)
+        self._show(
+            project_request("sent", project_screen_fields(fields), self._chosen_language),
+            busy_for=SENT_CARD_S,
+        )
+        logger.info("project request sent: %s", fields)
+        return "SENT to the team's general inbox."
 
     @function_tool()
     async def end_conversation(self, context: RunContext) -> str | None:
@@ -720,6 +1022,34 @@ class MiaAgent(Agent):
         self._set_paused(True)
         self.session.say(PAUSE_LINE[self.language], allow_interruptions=False)
         return None  # no reply after the tool
+
+    def resume_by_tap(self):
+        """The visitor tapped the "say my name" banner: the same as her name.
+        Returns her reply's SpeechHandle, or None if she wasn't paused."""
+        if not self._paused or self._ending:
+            logger.info("resume tapped, not paused: ignored")
+            return None
+        logger.info("called back by a tap on the screen")
+        self._set_paused(False)
+        lang = self._chosen_language or self._last_language
+        self._speak_in(lang)
+        return self.session.generate_reply(instructions=_reply_language_note(lang) + " " + TAPPED_NOTE)
+
+    def wake_by_tap(self) -> None:
+        """The visitor tapped the "tap to talk" hint: a short "Yes?", only if
+        she is waiting for them (not paused, speaking, thinking or hearing them)."""
+        if (
+            self._paused
+            or self._ending
+            or self.session.agent_state != "listening"
+            or self.session.user_state == "speaking"
+        ):
+            logger.info("wake tapped while %s/%s: ignored", self.session.agent_state, self.session.user_state)
+            return
+        logger.info("woken by a tap on the screen")
+        lang = self._chosen_language
+        self._speak_in(lang or DEFAULT_LANG)
+        self.session.say(WAKE_LINE[lang] if lang else WAKE_LINE_BOTH)
 
     def _language_note(self, text: str) -> str:
         """Lock, keep or switch the conversation language; the note for Gemini."""
@@ -1008,6 +1338,19 @@ async def entrypoint(ctx: JobContext) -> None:
             pause_timer.cancel()
             pause_timer = None
 
+    # Cards for the screen ("mia.screen", docs/screen-protocol.md), one text
+    # stream each, in order. Fail-safe: a screen that can't be reached costs
+    # the card, never the conversation.
+    screen_lock = asyncio.Lock()
+
+    async def send_screen(msg: dict) -> None:
+        async with screen_lock:
+            try:
+                await ctx.room.local_participant.send_text(json.dumps(msg, ensure_ascii=False), topic=TOPIC_SCREEN)
+                logger.info("screen card: %s", msg)
+            except Exception:
+                logger.exception("could not send the screen card %s", msg.get("type"))
+
     # end_conversation's goodbye has already been said, so no goodbye=True
     # here; passing what she said still holds the room open while it plays.
     agent = MiaAgent(
@@ -1015,6 +1358,25 @@ async def entrypoint(ctx: JobContext) -> None:
         stt=stt,
         on_goodbye=lambda said: spawn(end_session("visitor said goodbye", said=said)),
         on_status=on_status,
+        on_screen=lambda msg: spawn(send_screen(msg)),
+    )
+
+    # Taps on the screen ("mia.control"): "resume" on the paused banner, "wake"
+    # on the "tap to talk" hint. Anything else, or bad JSON, is ignored.
+    async def handle_control(reader, identity: str) -> None:
+        try:
+            msg = json.loads(await reader.read_all())
+            kind = msg.get("type") if isinstance(msg, dict) else None
+            logger.info("screen control from %s: %s", identity, kind)
+            if kind == "resume":
+                agent.resume_by_tap()
+            elif kind == "wake":
+                agent.wake_by_tap()
+        except Exception:
+            logger.exception("screen control from %s failed", identity)
+
+    ctx.room.register_text_stream_handler(
+        TOPIC_CONTROL, lambda reader, identity: spawn(handle_control(reader, identity))
     )
 
     # Log what she says next to what she heard ("heard …" in MiaAgent), so her
