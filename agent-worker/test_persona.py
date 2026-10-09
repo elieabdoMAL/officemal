@@ -98,22 +98,25 @@ async def note3_confirm_person() -> None:
 
 
 async def note10_talk() -> None:
+    # Since the video call (#22), she offers to call the person and calls on a
+    # yes once she has the visitor's name (more in test_staff_call.py).
     print("— #10 English, wants to talk to someone, no name:")
     n = len(calls)
-    replies = await converse("en", ["Hi, I'd like to talk to someone please.", "I'm Paul Lavoie."])
-    notified = recorded("notify", n)
+    replies = await converse("en", ["Hi, I'd like to talk to someone please.", "Yes please. I'm Paul Lavoie."])
+    called = recorded("call", n)
     no_false_claim(replies[0], False, "#10 before the name")
-    check(len(notified) == 1 and notified[0][1] == "Nicolas Bastien", f"#10 Nicolas notified: {notified}")
-    check(has(replies[-1], "message"), "#10 offers to leave a message too")
+    check(has(replies[0], "call"), "#10 offers to call someone")
+    check(len(called) == 1 and called[0][1] == "Nicolas Bastien", f"#10 Nicolas called: {called}")
+    check(has(replies[-1], "calling nicolas"), "#10 says she is calling Nicolas")
     check(len(replies[0].split()) <= 30, f"#10 no over-justification on the first reply ({len(replies[0].split())} words)")
 
     print("— #10 French, wants a real person:")
     n = len(calls)
-    replies = await converse("fr", ["Est-ce que je peux parler à une vraie personne ?", "Lucie Bouchard."])
-    notified = recorded("notify", n)
+    replies = await converse("fr", ["Est-ce que je peux parler à une vraie personne ?", "Oui, s'il vous plaît. Lucie Bouchard."])
+    called = recorded("call", n)
     no_false_claim(replies[0], False, "#10 before the name (FR)")
-    check(len(notified) == 1, f"#10 someone notified (FR): {notified}")
-    check(has(replies[-1], "message"), "#10 offers a message (FR)")
+    check(len(called) == 1, f"#10 someone called (FR): {called}")
+    check(has(replies[-1], "j'appelle"), "#10 says 'J'appelle …' (FR)")
 
     print("— #10 meeting with someone not on the team, and with Alex before the name:")
     n = len(calls)
@@ -131,18 +134,19 @@ async def note10_talk() -> None:
 
 async def note15_alexandre() -> None:
     for lang, first, name, spelled in (
-        ("en", "I want to talk to Alexandre.", "Mark Stone.", "Alexandre"),
-        ("en", "I want to talk to Alexander.", "Nina Patel.", "Alexander (STT)"),
-        ("en", "Can I speak with Alexandra please?", "Tom Reid.", "Alexandra (STT)"),
-        ("fr", "Je veux parler à Alexandre.", "Julien Côté.", "Alexandre (FR)"),
+        ("en", "I want to talk to Alexandre.", "Yes please, I'm Mark Stone.", "Alexandre"),
+        ("en", "I want to talk to Alexander.", "Yes please, I'm Nina Patel.", "Alexander (STT)"),
+        ("en", "Can I speak with Alexandra please?", "Yes please, I'm Tom Reid.", "Alexandra (STT)"),
+        ("fr", "Je veux parler à Alexandre.", "Oui, s'il vous plaît, je suis Julien Côté.", "Alexandre (FR)"),
     ):
         print(f"— #15 {spelled}:")
         n = len(calls)
         replies = await converse(lang, [first, name])
-        notified = recorded("notify", n)
+        # Called on the yes (#22), or notified: either way, Alexandre.
+        reached = recorded("call", n) + recorded("notify", n)
         check(not has(replies[0], *REFUSED), f"#15 {spelled}: no 'can't give the info' refusal")
         no_false_claim(replies[0], False, f"#15 {spelled} before the name")
-        check(len(notified) == 1 and notified[0][1] == "Alexandre Joset", f"#15 {spelled}: Alexandre notified: {notified}")
+        check(len(reached) == 1 and reached[0][1] == "Alexandre Joset", f"#15 {spelled}: Alexandre called or notified: {reached}")
 
 
 async def note5_where() -> None:

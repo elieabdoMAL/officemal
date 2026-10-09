@@ -21,6 +21,7 @@ import {
   TOPIC_SCREEN,
   TOPIC_TRANSCRIPTION,
   asMiaState,
+  isStaff,
   parseScreenMessage,
   type ControlMessage,
   type MiaState,
@@ -29,6 +30,7 @@ import {
 import MiaCaptions, { useCaptions, type Speaker } from "@/components/MiaCaptions";
 import MiaScreenCard, { ContactButton, type Card } from "@/components/MiaScreenCards";
 import MiaBanner from "@/components/MiaBanner";
+import MiaStaffTile from "@/components/MiaStaffTile";
 
 // Simli Trinity receptionist over LiveKit. Unlike SimliReceptionistPanel (which
 // used Simli Auto + Daily, a Legacy-only pipeline), this joins a LiveKit room
@@ -58,6 +60,11 @@ import MiaBanner from "@/components/MiaBanner";
 // transcription streams (#16), a Contact button and the cards the worker can
 // push on "mia.screen" (#18), and the "say my name" banner while she's paused
 // (#24, #25), from the worker's "mia.state" / "mia.language" attributes.
+//
+// Video call to staff (#22): a team member she calls in joins this room from
+// a link (/join) as "staff-…". Their camera and voice get their own elements
+// (never hers), she steps aside, and their tile says "{name} is here" until
+// they leave; the worker keeps her quiet meanwhile ("handover").
 
 type Status = "idle" | "connecting" | "ready" | "speaking" | "error";
 
@@ -125,6 +132,8 @@ const IDLE_HINT_MS = 12000;
 function cardMs(card: Card): number {
   if (card.type === "contact_card") return 45000;
   if (card.type === "project_request") return card.status === "draft" ? 180000 : 15000;
+  // The worker gives up after 2 min (CALL_ANSWER_TIMEOUT) and dismisses it.
+  if (card.type === "calling") return 150000;
   return 10000;
 }
 
@@ -163,8 +172,14 @@ export default function SimliLiveKitPanel({
   // miaDev.state()/language() (dev only, below): win over the real attributes.
   const devAttrs = useRef<{ state?: string; language?: string }>({});
 
+  // The team member in the call (#22), by display name, and whether their camera is on.
+  const [staffName, setStaffName] = useState<string | null>(null);
+  const [staffHasVideo, setStaffHasVideo] = useState(false);
+
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const staffVideoRef = useRef<HTMLVideoElement | null>(null);
+  const staffAudioRef = useRef<HTMLAudioElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const rafRef = useRef<number | null>(null);
   const roomRef = useRef<Room | null>(null);
@@ -244,6 +259,7 @@ export default function SimliLiveKitPanel({
     else if (m.type === "contact_card") setCard({ type: "contact_card", lang: m.lang ?? langRef.current });
     else if (m.type === "project_request")
       setCard({ type: "project_request", status: m.status, fields: m.fields, lang: m.lang ?? langRef.current });
+    else if (m.type === "calling") setCard({ type: "calling", to: m.to, lang: m.lang ?? langRef.current });
     else
       setCard({
         type: "message_sent",
@@ -281,8 +297,14 @@ export default function SimliLiveKitPanel({
 
   useEffect(() => {
     if (audioRef.current) audioRef.current.muted = hidden;
+    if (staffAudioRef.current) staffAudioRef.current.muted = hidden;
     if (hidden) setMic(false);
   }, [hidden, setMic]);
+
+  // Their tile replaces the "Calling …" card as soon as they're in.
+  useEffect(() => {
+    if (staffName) setCard((c) => (c?.type === "calling" ? null : c));
+  }, [staffName]);
 
   // "Thinking" is inferred from silence, so nothing guarantees it ends — a
   // rejected turn ("I didn't get that" never reaches the LLM) or a dropped
@@ -395,10 +417,20 @@ export default function SimliLiveKitPanel({
           (
             track: RemoteTrack,
             _pub: RemoteTrackPublication,
-            _participant: RemoteParticipant
+            participant: RemoteParticipant
           ) => {
             if (cancelled) return;
-            console.log("[SimliLK] track subscribed:", track.kind);
+            console.log("[SimliLK] track subscribed:", track.kind, participant.identity);
+            if (isStaff(participant.identity)) {
+              // A team member in the call (#22): their own elements, never hers.
+              if (track.kind === Track.Kind.Video) {
+                attachTrack(staffVideoRef.current, track);
+                setStaffHasVideo(true);
+              } else if (track.kind === Track.Kind.Audio) {
+                attachTrack(staffAudioRef.current, track);
+              }
+              return;
+            }
             if (track.kind === Track.Kind.Video) {
               attachTrack(videoRef.current, track);
               setStatus("ready");
@@ -480,13 +512,36 @@ export default function SimliLiveKitPanel({
         room.on(RoomEvent.ParticipantConnected, readAttributes);
         room.on(RoomEvent.ParticipantDisconnected, readAttributes);
 
+        // Who from the team is in the call (#22), from the room itself: their
+        // tile shows the moment they join, even before her "handover" state.
+        const readStaff = () => {
+          if (cancelled) return;
+          const p = [...room.remoteParticipants.values()].find((r) => isStaff(r.identity));
+          if (p) console.log("[SimliLK] staff in the call:", p.identity, p.name);
+          setStaffName(p ? p.name || p.identity : null);
+          if (!p) setStaffHasVideo(false);
+        };
+        room.on(RoomEvent.ParticipantConnected, readStaff);
+        room.on(RoomEvent.ParticipantDisconnected, readStaff);
+        const staffCamera = (on: boolean) => (_pub: unknown, p: Participant) => {
+          if (!cancelled && isStaff(p.identity)) setStaffHasVideo(on && p.isCameraEnabled);
+        };
+        room.on(RoomEvent.TrackMuted, staffCamera(false));
+        room.on(RoomEvent.TrackUnmuted, staffCamera(true));
+        room.on(RoomEvent.TrackUnsubscribed, (track: RemoteTrack, _pub, participant: RemoteParticipant) => {
+          if (cancelled || !isStaff(participant.identity)) return;
+          track.detach();
+          if (track.kind === Track.Kind.Video) setStaffHasVideo(false);
+        });
+
         // Whose turn it is, derived from who's actually making sound. The
         // avatar publishes as a remote participant, so anyone remote speaking
-        // is her; the local participant is the visitor.
+        // is her, except a team member in the call (#22); the local
+        // participant is the visitor.
         room.on(RoomEvent.ActiveSpeakersChanged, (speakers: Participant[]) => {
           if (cancelled) return;
           const visitorTalking = speakers.some((s) => s.isLocal);
-          const avatarTalking = speakers.some((s) => !s.isLocal);
+          const avatarTalking = speakers.some((s) => !s.isLocal && !isStaff(s.identity));
 
           if (avatarTalking) setTurn("answering");
           else if (visitorTalking) setTurn("hearing");
@@ -533,6 +588,7 @@ export default function SimliLiveKitPanel({
         roomRef.current = room;
         readyRef.current = true;
         readAttributes();
+        readStaff();
         console.log("[SimliLK] in room", room.name);
         tellTop("receptionist-started");
         setStatus("ready");
@@ -575,6 +631,10 @@ export default function SimliLiveKitPanel({
       // and wipe the canvas so a resting panel isn't a frozen picture of her
       // (the tour's still image of her shows through instead).
       if (videoRef.current) videoRef.current.srcObject = null;
+      if (staffVideoRef.current) staffVideoRef.current.srcObject = null;
+      if (staffAudioRef.current) staffAudioRef.current.srcObject = null;
+      setStaffName(null);
+      setStaffHasVideo(false);
       const canvas = canvasRef.current;
       canvas?.getContext("2d")?.clearRect(0, 0, canvas.width, canvas.height);
       clearCaptions();
@@ -592,6 +652,7 @@ export default function SimliLiveKitPanel({
   //   miaDev.screen({ type: "message_sent", to: "Nicolas Bastien" })
   //   miaDev.caption("mia", "Bonjour !")      miaDev.caption("visitor", "Hi")
   //   miaDev.state("paused")   miaDev.language("en")   miaDev.end()
+  //   miaDev.screen({ type: "calling", to: "Nicolas Bastien" })   miaDev.staff("Nicolas Bastien")
   // To go through LiveKit itself, see scripts/mia-screen-push.py.
   useEffect(() => {
     if (process.env.NODE_ENV !== "development") return;
@@ -611,6 +672,8 @@ export default function SimliLiveKitPanel({
         devAttrs.current.language = l;
         setLang(asLang(l));
       },
+      // A team member's tile without a call (#22): miaDev.staff("Nicolas Bastien"), miaDev.staff(null).
+      staff: (name: string | null) => setStaffName(name),
       end: () => roomRef.current?.disconnect(),
     };
     (window as unknown as { miaDev?: typeof dev }).miaDev = dev;
@@ -626,9 +689,15 @@ export default function SimliLiveKitPanel({
 
   const connecting = status !== "ready" && status !== "speaking";
   const inSession = !hidden && !resting && !connecting;
-  const paused = inSession && miaState === "paused";
-  const banner = resting && !hidden ? "resting" : paused ? "paused" : inSession && idleHint ? "idle" : null;
-  const showPill = inSession && listening && !banner;
+  // A team member is in the call (#22): their tile, and she steps aside.
+  const handover = inSession && (staffName !== null || miaState === "handover");
+  const paused = inSession && !handover && miaState === "paused";
+  const banner =
+    resting && !hidden ? "resting" : paused ? "paused" : inSession && !handover && idleHint ? "idle" : null;
+  const showPill = inSession && listening && !banner && !handover;
+  // Scaled from her feet, as below; during a call she moves aside, smaller,
+  // to make room for the team member's tile on the right.
+  const avatarTransform = handover ? "translateX(-27%) scale(0.72)" : `scale(${AVATAR_SCALE})`;
   // Captions stack above whatever holds the bottom edge.
   const captionBottom = banner === "paused" ? "9vw" : banner ? "6vw" : "4.2vw";
 
@@ -668,8 +737,9 @@ export default function SimliLiveKitPanel({
                 width: "100%",
                 height: "100%",
                 objectFit: "contain",
-                transform: `scale(${AVATAR_SCALE})`,
+                transform: avatarTransform,
                 transformOrigin: "bottom center",
+                transition: "transform 0.6s ease",
                 pointerEvents: "none",
               }
         }
@@ -689,8 +759,9 @@ export default function SimliLiveKitPanel({
             width: "100%",
             height: "100%",
             objectFit: "contain",
-            transform: `scale(${AVATAR_SCALE})`,
+            transform: avatarTransform,
             transformOrigin: "bottom center",
+            transition: "transform 0.6s ease",
             pointerEvents: "none",
           }}
         />
@@ -698,6 +769,10 @@ export default function SimliLiveKitPanel({
 
       {/* The avatar's TTS audio plays through this element. */}
       <audio ref={audioRef} autoPlay />
+
+      {/* A team member in the call (#22): their voice, and their tile. */}
+      <audio ref={staffAudioRef} autoPlay />
+      <MiaStaffTile name={handover ? staffName : null} hasVideo={staffHasVideo} lang={lang} videoRef={staffVideoRef} />
 
       {connecting && !hidden && !resting && (
         <div
@@ -776,8 +851,8 @@ export default function SimliLiveKitPanel({
           captions={captions}
           lang={lang}
           // While paused she isn't in the conversation: the visitor is talking
-          // to someone else, which has no business on the screen.
-          showVisitor={!paused}
+          // to someone else, which has no business on the screen. Same in a call.
+          showVisitor={!paused && !handover}
           bottom={captionBottom}
         />
       )}
@@ -798,7 +873,7 @@ export default function SimliLiveKitPanel({
         />
       )}
 
-      {!hidden && (
+      {!hidden && !handover && (
         <ContactButton
           active={card?.type === "contact_card"}
           onClick={() =>

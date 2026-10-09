@@ -80,7 +80,7 @@ async def test_resend_delivery() -> None:
 
 
 # What the tools did, by kind: ("message" | "notify" | "emergency" | "suggestion" |
-# "project" | "end" | "screen", details). "screen" is a mia.screen message she sent.
+# "project" | "call" | "end" | "screen", details). "screen" is a mia.screen message she sent.
 calls: list[tuple] = []
 
 
@@ -117,6 +117,11 @@ def install_recorders(worker) -> None:
         calls.append(("project", inbox.full_name, dict(fields), language))
         return True
 
+    async def call(member, visitor_name, assistant):
+        calls.append(("call", member.full_name, visitor_name))
+        return True
+
+    worker.start_staff_call = call
     worker.send_message_email = message
     worker.send_visitor_waiting_email = notify
     worker.send_emergency_email = emergency

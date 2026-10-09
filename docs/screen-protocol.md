@@ -7,9 +7,12 @@ side: `src/lib/screenProtocol.ts`; worker side: `agent-worker/screen_cards.py`
 together.
 
 Everything goes through the LiveKit room the kiosk joins for each session.
-Participants in that room: the visitor (the kiosk browser), the worker
-(`agent-…`, an agent participant), and the Simli avatar (`simli-avatar-agent`,
-which only publishes her face and voice).
+Participants in that room: the visitor (the kiosk browser, `visitor-<uuid>`),
+the worker (`agent-…`, an agent participant), and the Simli avatar
+(`simli-avatar-agent`, which only publishes her face and voice). During a
+video call (#22, section 8), also the team member she called in
+(`staff-<team.json id>`, named with their display name), who publishes camera
+and mic.
 
 ## 1. Her state and language: participant attributes (worker → screen)
 
@@ -24,6 +27,7 @@ await ctx.room.local_participant.set_attributes({"mia.state": "paused", "mia.lan
 | `mia.state` | `listening` (default) | Normal conversation: turn pill ("Go ahead — I'm listening", "Speaking"…). After 12 s with nobody speaking, the pill becomes the hint "Say “{name}” or tap to talk". |
 | | `speaking` | Her reply is playing. The screen treats it like `listening` (the pill already follows who is speaking). |
 | | `paused` (#24, #25) | Big banner "My name is {name} — say my name to talk to me" in place of the pill. The visitor's captions are hidden (they're talking to someone else). Tapping the banner sends `resume` (section 4). `paused` wins over `speaking`: her "No problem, I'll stop talking…" line plays while the state is already `paused`. |
+| | `handover` (#22) | A team member is in the call (section 8): she hears and says nothing. Their tile ("{first name} is here") on the right, her moved aside and smaller; no pill, banner, Contact button or visitor captions. The screen also goes into this layout on its own as soon as a `staff-…` participant joins. `handover` wins over `paused` (a call un-pauses her). |
 | `mia.language` | `fr` / `en` | The conversation language once the visitor chose it (#23); changes only on an explicit request to switch. Language of the banners, card labels and caption labels. **Absent** before the choice (she greets in both, "Bonjour, hello! Français ou English?"): the screen shows both (French first). |
 | `mia.name` | e.g. `Mia` | Her name, from the worker's `ASSISTANT_NAME`. The screen currently uses `NEXT_PUBLIC_ASSISTANT_NAME` (section 6); the two must match. |
 
@@ -77,7 +81,8 @@ await ctx.room.local_participant.send_text(
 | `contact_card` | `lang?` | Card on the right of the frame: phone, email, address, website, QR code to the website. Closes after 45 s or on ×. Same card as the panel's Contact button. | When her words give the office's phone, email, address or website (`gives_contact_details`, checked in `transcription_node`, so only for speech that is actually played; once per reply). The visitor's own 514 number or email read back doesn't count. Skipped while another card of hers is up (a `message_sent` for 10 s, a draft `project_request` for 180 s), so "you can also call us at…" never replaces them. |
 | `message_sent` | `kind?`, `to?`, `lang?` | Green ✓ card, closes after 10 s. Text by `kind`: `message` "Message sent to {to}", `notify` "{to} has been told you're here", `alert` "The team has been alerted", `suggestion` "Suggestion sent — thank you!", `project_request` "Project request sent". Without `to`: "Message sent" / "The team has been told you're here". | When the tool succeeds, before she says so (#3): `take_message` → SENT (`kind` `message`, `to` the person's name, or the general inbox's name in her language: "the general inbox" / "la boîte de réception générale"), `notify_member` → NOTIFIED (`notify`, `to` the person), `alert_emergency` → ALERTED (`alert`, no `to`), `send_suggestion` → SENT (`suggestion`). Again when a tool refuses a repeat send ("already sent"), since it is. A project request uses its own card (below), not `kind: project_request`. |
 | `project_request` | `status`, `fields`, `lang?` | The project request form (#20), see below. | `show_project_request` (`draft`) and `submit_project_request` (`sent`). |
-| `dismiss` | – | Closes the current card. | Not used yet. |
+| `calling` | `to?`, `lang?` | Blue "Calling {to}…" card with a ringing ☎ and "Hold on a moment: the video call will show here". Closes after 150 s, when a `staff-…` participant joins (their tile takes over), or on `dismiss`. | `call_staff` (#22) once the invitation email is out (`to` the person's full name). Stays up while she waits: the contact card is skipped meanwhile. |
+| `dismiss` | – | Closes the current card. | When the person she called joins, or doesn't answer within `CALL_ANSWER_TIMEOUT`, if the `calling` card is still the one up. |
 
 `lang` (`fr`/`en`) overrides `mia.language` for that card. The worker always
 sets it to the session language once the visitor has chosen one, and leaves it
@@ -160,9 +165,64 @@ Set it in Vercel and redeploy (it is inlined at build time). The name she
 - **Dev server only** (`next dev`): the embed page exposes `window.miaDev`:
   `miaDev.screen({type: "contact_card"})`, `miaDev.caption("mia", "Bonjour")`,
   `miaDev.state("paused")`, `miaDev.language("en")`, `miaDev.end()` (ends the
-  session as the worker would → resting). Stripped from production builds.
+  session as the worker would → resting), `miaDev.staff("Nicolas Bastien")` /
+  `miaDev.staff(null)` (a team member's tile, no video). Stripped from
+  production builds.
 - **Through LiveKit** (any build): `scripts/mia-screen-push.py` joins a kiosk
   room as an extra participant, pushes `mia.screen` messages, sets `mia.*`
   attributes on itself, and prints the `mia.control` taps it receives. The room
   name is in the browser console (`[SimliLK] in room kiosk-…`). Usage in the
   script's docstring.
+
+## 8. Video call to staff (#22)
+
+When a visitor wants to talk to someone, she offers to call them; on a yes
+(and once she has the visitor's name), `call_staff` (`agent-worker/staff_call.py`):
+
+1. mints a LiveKit token for **this kiosk's room only**: identity
+   `staff-<team.json id>`, name = their display name, may publish camera and
+   mic only (no data), valid 15 min to join, the visitor's name in its
+   metadata;
+2. emails them (Resend, the address in `team.json`, so the sandbox team file
+   covers tests) "{visitor} is at the kiosk — join the call" with a link to
+   `<SITE_URL>/join#t=<token>&u=<LiveKit URL>`. The token is in the fragment,
+   which browsers never send to a server;
+3. sends the `calling` card and says "I'm calling {first name} now — please
+   hold on a moment." (worker's words, not Gemini's).
+
+The **/join page** (`src/app/join`, `src/components/StaffJoin.tsx`) posts the
+token to `/api/livekit/call-status`, which verifies it (ours, unexpired, a
+`staff-` token for a `kiosk-` room) and lists the room's participants: no
+`visitor-…` left → "The visitor has left", without joining (joining a deleted
+room would create an empty one). Otherwise: camera preview, mic/camera
+toggles, **Join the call**. The page joins the URL the server gives, never the
+link's `u`. In the call it shows the kiosk's picture (her; the kiosk has no
+camera) and plays the room's sound (the visitor, and her). The room deleted
+(the visitor left, the session ended) → "The visitor has left"; Leave → "You
+left the call".
+
+**Kiosk**: tracks from a `staff-…` participant go to their own `<video>` and
+`<audio>` (never hers); the screen shows their tile on the right with
+"{first name} is here", moves her aside, and hides the pill, banners, Contact
+button and the visitor's captions. A `staff-…` speaker never counts as her
+in the turn pill.
+
+**Worker**, while a `staff-…` participant is in the room: `mia.state` =
+`handover`, her ears are off (nothing reaches the STT, no LLM calls), a pause
+is cancelled. When the last one leaves she says "Is there anything else I can
+help you with?" and goes back to `listening`; a note in her history says the
+person joined and she heard none of it.
+
+**No answer** within `CALL_ANSWER_TIMEOUT` (120 s): `dismiss`, then she says
+that {first name} isn't available and offers to take a message (Gemini, told
+by a system note). If they join later anyway, while the link is still valid,
+the handover happens just the same.
+
+**Limits**: idle (`SESSION_IDLE_TIMEOUT`), pause (`PAUSE_TIMEOUT`) and max
+length (`SESSION_MAX_LENGTH`) don't end a session while she is waiting for an
+answer or someone is in the call; after the call the visitor gets at least
+`AFTER_CALL_S` (180 s) more, and idle counts again from the end of the call.
+No session ever passes `SESSION_HARD_CAP` (1800 s), call or not. Simli's own
+limits default to `SESSION_HARD_CAP + 30` (she's silent during the call, and
+Simli counts that as idle). One call at a time, two per session, once per
+person unless the visitor asks to try again.

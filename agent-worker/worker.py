@@ -21,7 +21,9 @@ visitor's words mean for this is decided in conversation_control.py.
 She also drives the kiosk screen (docs/screen-protocol.md, screen_cards.py):
 cards on "mia.screen" (contact details, "sent" confirmations, the project
 request form) and taps back on "mia.control". Suggestions and project requests
-(leads.py) go to the team's general inbox.
+(leads.py) go to the team's general inbox. She can call a team member into
+the kiosk conversation by video, and stays quiet while they're in it
+(staff_call.py).
 
 Run:
     python worker.py dev      # local dev + hot reload (test via LiveKit Sandbox)
@@ -31,7 +33,8 @@ Env (see env.example): SIMLI_API_KEY, SIMLI_FACE_ID, GOOGLE_API_KEY,
 DEEPGRAM_API_KEY, LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET.
 Optional: ASSISTANT_NAME, SESSION_IDLE_TIMEOUT, SESSION_MAX_LENGTH,
 PAUSE_TIMEOUT, LIVEKIT_AGENT_NAME, TTS_PROVIDER, ELEVENLABS_API_KEY,
-ELEVENLABS_VOICE_ID, ELEVENLABS_MODEL.
+ELEVENLABS_VOICE_ID, ELEVENLABS_MODEL, SITE_URL, CALL_ANSWER_TIMEOUT,
+SESSION_HARD_CAP.
 The LIVEKIT_* vars are read automatically by the agents framework.
 """
 
@@ -92,6 +95,15 @@ from screen_cards import (
     message_sent,
     project_request,
 )
+from staff_call import (
+    AFTER_CALL_S,
+    CALL_ANSWER_TIMEOUT,
+    MAX_CALLS_PER_SESSION,
+    SESSION_HARD_CAP,
+    calling_card,
+    watch_staff,
+)
+from staff_call import call_member as start_staff_call
 from team_messages import (
     _norm,
     find_member,
@@ -343,8 +355,12 @@ PAUSE_TIMEOUT = _env_int("PAUSE_TIMEOUT", SESSION_IDLE_TIMEOUT)
 
 # Simli's own limits, kept 30s behind ours as a backstop: if this worker ever
 # fails to end a session, Simli still stops rendering (and billing) by itself.
-MAX_IDLE_TIME = _env_int("SIMLI_MAX_IDLE_TIME", SESSION_IDLE_TIMEOUT + 30)
-MAX_SESSION_LENGTH = _env_int("SIMLI_MAX_SESSION_LENGTH", SESSION_MAX_LENGTH + 30)
+# A video call to staff (#22, staff_call.py) can keep a session open up to
+# SESSION_HARD_CAP, with her silent the whole time the person is in it, and
+# Simli's idle time counts her silence: both backstops must cover that, or
+# her face would leave mid-call and she couldn't take the visitor back.
+MAX_IDLE_TIME = _env_int("SIMLI_MAX_IDLE_TIME", max(SESSION_IDLE_TIMEOUT, SESSION_HARD_CAP) + 30)
+MAX_SESSION_LENGTH = _env_int("SIMLI_MAX_SESSION_LENGTH", max(SESSION_MAX_LENGTH, SESSION_HARD_CAP) + 30)
 
 # Said when the hard cap ends a conversation mid-flow, so she doesn't just vanish.
 GOODBYE = {
@@ -449,6 +465,34 @@ WAKE_LINE = {
     "fr": "Oui ? Comment puis-je vous aider ?",
 }
 WAKE_LINE_BOTH = "Oui? Yes? Français ou English?"
+
+# Video call to staff (#22, staff_call.py). Said by the worker, not Gemini:
+# the same words every time, and only once the invitation is really out.
+CALLING_LINE = {
+    "en": "I'm calling {first} now — please hold on a moment.",
+    "fr": "J'appelle {first} maintenant — un petit moment, s'il vous plaît.",
+}
+# When the person leaves the call and she takes the visitor back.
+BACK_LINE = {
+    "en": "Is there anything else I can help you with?",
+    "fr": "Est-ce que je peux faire autre chose pour vous ?",
+}
+BACK_LINE_BOTH = "Autre chose? Anything else?"
+# Into her history, so the next reply knows what happened while she was quiet.
+CALL_ENDED_NOTE = (
+    "{name} joined this conversation by video and talked with the visitor; you heard none of it. "
+    "{first} has now left the call and you are talking with the visitor again."
+)
+NO_ANSWER_NOTE = (
+    "System: {name} did not join the video call: nobody answered within {wait}. Tell the visitor, in "
+    "one or two short sentences, that {first} is not available right now, and offer to take a message "
+    "for {first}. If they want one, follow TAKING A MESSAGE. Do not call call_staff again unless the "
+    "visitor asks you to try again."
+)
+NO_ANSWER_PAUSED_NOTE = (
+    "While you were paused, the video call to {name} went unanswered: {first} did not join. "
+    "If the visitor asks, offer to take a message for {first}."
+)
 
 # "I've let Alexandre know you're here" with no notify_member call: a lie to
 # the visitor. Gemini did it now and then (the base branch, every time, on
@@ -656,6 +700,15 @@ class MiaAgent(Agent):
         # the visitor has answered the draft as shown.
         self._project: dict[str, str] = {}
         self._project_shown_at: int | None = None
+        # Video call to staff (#22): who she is waiting for, who is in the
+        # call (identity -> name; she is quiet while anyone is), and when the
+        # last call ended, which the session limits use (entrypoint).
+        self._call_member = None
+        self._staff: dict[str, str] = {}
+        self._calls_made = 0
+        self._call_ended_at: float | None = None
+        self._calling_shown = False  # the "calling" card is the one on screen
+        self._answer_timer: asyncio.Task | None = None
 
     @property
     def language(self) -> str:
@@ -680,6 +733,7 @@ class MiaAgent(Agent):
         the conversation goes on without it."""
         if busy_for:
             self._card_busy_until = time.monotonic() + busy_for
+        self._calling_shown = msg.get("type") == "calling"
         if self._on_screen is None:
             return
         try:
@@ -817,8 +871,8 @@ class MiaAgent(Agent):
     async def llm_node(self, chat_ctx, tools, model_settings):
         # Paused means no LLM calls at all. Turns are already dropped in
         # _plan_turn, but preemptive generation starts Gemini on the transcript
-        # before the turn is even complete.
-        if self._paused:
+        # before the turn is even complete. Same while staff are in the call.
+        if self._paused or self._staff:
             return
         messages = [i for i in chat_ctx.items if getattr(i, "type", "") == "message"]
         visitor = [i for i in messages if i.role == "user"]
@@ -1336,6 +1390,8 @@ class MiaAgent(Agent):
     async def on_exit(self) -> None:
         if self._pending_end is not None:
             self._pending_end.cancel()
+        if self._answer_timer is not None:
+            self._answer_timer.cancel()
 
     @function_tool()
     async def pause_conversation(self, context: RunContext) -> None:
@@ -1373,6 +1429,7 @@ class MiaAgent(Agent):
         if (
             self._paused
             or self._ending
+            or self._staff
             or self.session.agent_state != "listening"
             or self.session.user_state == "speaking"
         ):
@@ -1382,6 +1439,151 @@ class MiaAgent(Agent):
         lang = self._chosen_language
         self._speak_in(lang or DEFAULT_LANG)
         self.session.say(WAKE_LINE[lang] if lang else WAKE_LINE_BOTH)
+
+    # --- Video call to staff (#22, staff_call.py) ----------------------------
+    # call_staff emails someone a link into this room; while they are in it
+    # (handover) she says and hears nothing; when they leave she takes the
+    # visitor back. Nobody within CALL_ANSWER_TIMEOUT: she offers a message.
+
+    @property
+    def handover(self) -> bool:
+        """A team member is in the call: she stays quiet."""
+        return bool(self._staff)
+
+    @property
+    def call_active(self) -> bool:
+        """She is waiting for someone to join, or someone is in the call."""
+        return self._call_member is not None or bool(self._staff)
+
+    @property
+    def call_ended_at(self) -> float | None:
+        """When the last call ended (time.monotonic()), answered or not."""
+        return self._call_ended_at
+
+    @function_tool()
+    @sends_email
+    async def call_staff(self, context: RunContext, member: str, visitor_name: str) -> str | None:
+        """Call a team member listed under TEAM into this conversation by video: they get a link and join the kiosk from their phone.
+
+        Call this only after the visitor said yes to the call, and once you
+        have their name. Say nothing yourself: it tells the visitor you are
+        calling. Never say you are calling someone without it.
+
+        Args:
+            member: Who to call, as the visitor said it: a name or a role such as "the CEO".
+            visitor_name: The visitor's name, as they gave it.
+        """
+        if self._staff:
+            return "NOT CALLED: someone from the team is already in the call."
+        if self._call_member is not None:
+            first = self._call_member.first_name
+            return f"NOT CALLED: you are already calling {first}. Tell the visitor {first} has been called and to hold on a moment."
+        if self._calls_made >= MAX_CALLS_PER_SESSION:
+            return "NOT CALLED: call limit for this conversation reached. Offer to take a message instead."
+        found = find_member(member, TEAM)
+        if found is None or found.inbox:
+            return (
+                f"NOT CALLED: no single team member matches {member!r}. If it is unclear, ask who they mean. "
+                "Otherwise say you cannot reach that person directly and offer to take a message for the general inbox."
+            )
+        if not self._visitor_named(visitor_name, found):
+            return NOT_THEIR_NAME.format(name=visitor_name).replace("NOT SENT", "NOT CALLED", 1)
+        if self._is_repeat("call", found.email, visitor_name):
+            return (
+                f"NOT CALLED AGAIN: you already called {found.first_name} in this conversation. Offer to take a "
+                f"message for {found.first_name}; call again only if the visitor clearly asks you to try again."
+            )
+        if not await start_staff_call(found, visitor_name, ASSISTANT_NAME):
+            return "NOT CALLED: the call could not be placed. Say so plainly and offer to take a message instead."
+        logger.info("call_staff: calling %s for %s", found.full_name, visitor_name)
+        self._calls_made += 1
+        self._sent.add("call", found.email, visitor_name)
+        self._call_member = found
+        self._show(calling_card(found.full_name, self._chosen_language), busy_for=CALL_ANSWER_TIMEOUT)
+        self._answer_timer = self._spawn(self._await_answer(found))
+        self._speak_in(self.language)
+        self.session.say(CALLING_LINE[self.language].format(first=found.first_name), allow_interruptions=False)
+        return None  # no reply after the tool: the line above is it
+
+    async def _await_answer(self, member) -> None:
+        """Nobody joined within CALL_ANSWER_TIMEOUT: tell the visitor, offer a message."""
+        try:
+            await asyncio.sleep(CALL_ANSWER_TIMEOUT)
+            if self._call_member is not member:
+                return  # they joined
+            logger.info("call_staff: %s did not answer within %ss", member.full_name, CALL_ANSWER_TIMEOUT)
+            self._call_member = None
+            self._call_ended_at = time.monotonic()
+            self._card_busy_until = 0.0
+            if self._calling_shown:
+                self._show({"type": "dismiss"})
+            self._status_changed()
+            names = {"name": member.full_name, "first": member.first_name}
+            if self._ending:
+                return
+            if self._paused:
+                # She said she'd stop talking: no word now, but she'll know.
+                await self._remember(NO_ANSWER_PAUSED_NOTE.format(**names))
+                return
+            if (handle := self.session.current_speech) is not None:
+                await handle
+            minutes = max(1, round(CALL_ANSWER_TIMEOUT / 60))
+            wait = f"{minutes} minute{'s' if minutes > 1 else ''}"
+            self._speak_in(self.language)
+            self.session.generate_reply(
+                instructions=_reply_language_note(self.language) + " " + NO_ANSWER_NOTE.format(wait=wait, **names)
+            )
+        except Exception:
+            logger.exception("call answer timeout failed")
+
+    def staff_joined(self, identity: str, name: str) -> None:
+        """Someone from the team joined the room (staff_call.watch_staff): go quiet."""
+        self._staff[identity] = name
+        logger.info("%s joined the call (%s): handing over", name, identity)
+        if len(self._staff) > 1:
+            return
+        self._call_member = None  # answered
+        self._card_busy_until = 0.0
+        if self._calling_shown:
+            self._show({"type": "dismiss"})  # the screen shows them instead
+        self._paused = False  # quietly: the handover outranks a pause
+        self._stop_speaking()
+        self._hear_visitor(False)
+        self._status_changed()
+
+    def staff_left(self, identity: str) -> None:
+        """They left: she takes the visitor back."""
+        name = self._staff.pop(identity, None)
+        if name is None or self._staff or self._ending:
+            return
+        logger.info("%s left the call: back to the visitor", name)
+        self._call_ended_at = time.monotonic()
+        self._hear_visitor(True)
+        self._status_changed()
+        self._spawn(self._take_visitor_back(name))
+
+    async def _take_visitor_back(self, name: str) -> None:
+        try:
+            await self._remember(CALL_ENDED_NOTE.format(name=name, first=name.split()[0]))
+            if self._staff or self._ending:
+                return
+            lang = self._chosen_language
+            self._speak_in(lang or DEFAULT_LANG)
+            self.session.say(BACK_LINE[lang] if lang else BACK_LINE_BOTH)
+        except Exception:
+            logger.exception("taking the visitor back after the call failed")
+
+    def _hear_visitor(self, on: bool) -> None:
+        """Her ears on or off (nothing goes to the STT while off)."""
+        room_input = self.session.input
+        if room_input.audio is not None:
+            room_input.set_audio_enabled(on)
+
+    async def _remember(self, note: str) -> None:
+        """Add a system note to her history."""
+        ctx = self.chat_ctx.copy()
+        ctx.add_message(role="system", content=note)
+        await self.update_chat_ctx(ctx)
 
     def _language_note(self, text: str) -> str:
         """Lock, keep or switch the conversation language; the note for Gemini."""
@@ -1404,6 +1606,9 @@ class MiaAgent(Agent):
 
     def _plan_turn(self, text: str, confidence: float | None) -> TurnPlan:
         """Decide what one visitor turn gets. Updates pause and language state."""
+        if self._staff:
+            logger.info("staff in the call, ignored %r", text)
+            return TurnPlan()
         woken = False
         if self._paused:
             if wants_pause(text, ASSISTANT_NAME) or not says_name(text, ASSISTANT_NAME):
@@ -1654,7 +1859,9 @@ async def entrypoint(ctx: JobContext) -> None:
     publishing = asyncio.Lock()
 
     def screen_attributes() -> dict[str, str]:
-        if agent.paused:
+        if agent.handover:
+            state = "handover"
+        elif agent.paused:
             state = "paused"
         elif session.agent_state == "speaking":
             state = "speaking"
@@ -1683,17 +1890,34 @@ async def entrypoint(ctx: JobContext) -> None:
 
     async def end_if_still_paused() -> None:
         await asyncio.sleep(PAUSE_TIMEOUT)
+        while agent.call_active:  # a call she is waiting on outlasts the pause
+            await asyncio.sleep(5)
         # No goodbye: she said she'd stop talking.
         await end_session(f"paused {PAUSE_TIMEOUT}s without being called back")
 
+    # The idle limit is LiveKit's "away" user state, which comes only once:
+    # idle during a call (the wait for an answer, or the handover, when her
+    # ears are off) doesn't end the session, but then nothing would end it
+    # after the call either. So from the end of the call, this does.
+    after_call_idle: asyncio.Task | None = None
+
+    async def end_if_idle_after_call() -> None:
+        nonlocal after_call_idle
+        await asyncio.sleep(SESSION_IDLE_TIMEOUT)
+        after_call_idle = None
+        if session.user_state == "away" and not agent.call_active:
+            await end_session(f"idle {SESSION_IDLE_TIMEOUT}s after the call")
+
     def on_status() -> None:
-        nonlocal pause_timer
+        nonlocal pause_timer, after_call_idle
         spawn(publish_screen_state())
         if agent.paused and pause_timer is None:
             pause_timer = spawn(end_if_still_paused())
         elif not agent.paused and pause_timer is not None:
             pause_timer.cancel()
             pause_timer = None
+        if not agent.call_active and session.user_state == "away" and after_call_idle is None:
+            after_call_idle = spawn(end_if_idle_after_call())
 
     # Cards for the screen ("mia.screen", docs/screen-protocol.md), one text
     # stream each, in order. Fail-safe: a screen that can't be reached costs
@@ -1717,6 +1941,8 @@ async def entrypoint(ctx: JobContext) -> None:
         on_status=on_status,
         on_screen=lambda msg: spawn(send_screen(msg)),
     )
+    # Staff joining from a call_staff link (#22): she goes quiet, then takes the visitor back.
+    watch_staff(ctx.room, agent.staff_joined, agent.staff_left)
 
     # Taps on the screen ("mia.control"): "resume" on the paused banner, "wake"
     # on the "tap to talk" hint. Anything else, or bad JSON, is ignored.
@@ -1746,8 +1972,15 @@ async def entrypoint(ctx: JobContext) -> None:
 
     @session.on("user_state_changed")
     def _on_user_state(ev) -> None:
+        nonlocal after_call_idle
+        if ev.old_state == "away" and after_call_idle is not None:
+            after_call_idle.cancel()
+            after_call_idle = None
         if ev.new_state == "away":
-            spawn(end_session(f"idle {SESSION_IDLE_TIMEOUT}s"))
+            if agent.call_active:
+                logger.info("idle %ss during a call: the session stays open", SESSION_IDLE_TIMEOUT)
+            else:
+                spawn(end_session(f"idle {SESSION_IDLE_TIMEOUT}s"))
         elif ev.new_state == "speaking":
             agent.user_started_speaking()
         elif ev.old_state == "speaking":
@@ -1766,9 +1999,24 @@ async def entrypoint(ctx: JobContext) -> None:
     def _on_close(_ev) -> None:
         spawn(end_session("session closed"))
 
+    started_at = time.monotonic()
+
+    def length_limit() -> float:
+        """When the session must end (monotonic): SESSION_MAX_LENGTH, stretched
+        by a call (#22) — none while one is on, AFTER_CALL_S more after it —
+        never past SESSION_HARD_CAP."""
+        hard = started_at + SESSION_HARD_CAP
+        if agent.call_active:
+            return hard
+        limit = started_at + SESSION_MAX_LENGTH
+        if agent.call_ended_at is not None:
+            limit = max(limit, agent.call_ended_at + AFTER_CALL_S)
+        return min(limit, hard)
+
     async def cap_length() -> None:
-        await asyncio.sleep(SESSION_MAX_LENGTH)
-        await end_session(f"max length {SESSION_MAX_LENGTH}s", goodbye=True)
+        while (left := length_limit() - time.monotonic()) > 0:
+            await asyncio.sleep(min(left, 5.0))
+        await end_session(f"max length {time.monotonic() - started_at:.0f}s", goodbye=True)
 
     await session.start(agent=agent, room=ctx.room)
     spawn(cap_length())

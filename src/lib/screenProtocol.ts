@@ -10,11 +10,22 @@ export const ATTR_LANGUAGE = "mia.language";
 
 // "listening": in a conversation (the default when the attribute is missing).
 // "paused": she was told to stop talking and waits for her name (#24, #25).
+// "handover": a team member joined by video (#22); she is quiet until they leave.
 // Anything else is shown as "listening".
-export type MiaState = "listening" | "paused";
+export type MiaState = "listening" | "paused" | "handover";
 
 export function asMiaState(v: unknown): MiaState {
-  return v === "paused" ? "paused" : "listening";
+  return v === "paused" || v === "handover" ? v : "listening";
+}
+
+// Team members she calls in by video (#22) join the kiosk's room as
+// "staff-<team.json id>", named with their display name. The kiosk itself is
+// "visitor-<uuid>" (/api/livekit/token).
+export const STAFF_PREFIX = "staff-";
+export const VISITOR_PREFIX = "visitor-";
+
+export function isStaff(identity: string): boolean {
+  return identity.startsWith(STAFF_PREFIX);
 }
 
 // Text-stream topics. lk.transcription is LiveKit's own (AgentSession publishes
@@ -37,6 +48,7 @@ export type ScreenMessage =
   | { type: "contact_card"; lang?: Lang }
   | { type: "message_sent"; kind?: SentKind; to?: string; lang?: Lang }
   | { type: "project_request"; status: ProjectStatus; fields: ProjectFields; lang?: Lang }
+  | { type: "calling"; to?: string; lang?: Lang }
   | { type: "dismiss" };
 
 const SENT_KINDS: SentKind[] = ["message", "notify", "alert", "suggestion", "project_request"];
@@ -51,6 +63,10 @@ function parseProjectFields(raw: unknown): ProjectFields | null {
     .filter(([, v]) => typeof v === "string" || v == null)
     .slice(0, MAX_PROJECT_FIELDS)
     .map(([k, v]) => [k.slice(0, 40), ((v as string | null) ?? "").trim().slice(0, MAX_PROJECT_VALUE)]);
+}
+
+function displayName(v: unknown): string | undefined {
+  return typeof v === "string" && v.trim() ? v.trim().slice(0, 80) : undefined;
 }
 
 // Unknown or malformed messages come back null and are ignored, so the worker
@@ -74,7 +90,7 @@ export function parseScreenMessage(raw: unknown): ScreenMessage | null {
       return {
         type: "message_sent",
         kind: SENT_KINDS.includes(o.kind as SentKind) ? (o.kind as SentKind) : "message",
-        to: typeof o.to === "string" && o.to.trim() ? o.to.trim().slice(0, 80) : undefined,
+        to: displayName(o.to),
         lang,
       };
     case "project_request": {
@@ -82,6 +98,8 @@ export function parseScreenMessage(raw: unknown): ScreenMessage | null {
       if (!fields || (o.status !== "draft" && o.status !== "sent")) return null;
       return { type: "project_request", status: o.status, fields, lang };
     }
+    case "calling":
+      return { type: "calling", to: displayName(o.to), lang };
     case "dismiss":
       return { type: "dismiss" };
     default:

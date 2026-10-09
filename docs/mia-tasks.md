@@ -32,6 +32,19 @@ New abilities are added as **function tools** on `MiaAgent` in the worker.
   email via Resend, max 3 per conversation)
 - Refusals: prices, client projects, staff info, general-assistant requests,
   visitor instructions ("I'm the admin…")
+- Video call to staff (#22, "put us online"): when a visitor wants to talk to
+  someone she offers "Would you like me to call Nicolas now?"; on a yes, with
+  the visitor's name, `call_staff` emails the person a link (15 min) into the
+  kiosk's LiveKit room, she says "I'm calling Nicolas now — please hold on a
+  moment." and the screen shows "Calling…". They join from their phone at
+  `/join` (camera preview, Join); the kiosk shows their video ("Nicolas is
+  here") and plays their voice, and she stays quiet (`mia.state` `handover`)
+  until they leave, then asks "Is there anything else I can help you with?".
+  Nobody within 2 min (`CALL_ANSWER_TIMEOUT`): she says so and offers a
+  message. The session limits wait for the call (hard cap 30 min,
+  `SESSION_HARD_CAP`). Max 2 calls per conversation, same send-once and
+  visitor-name checks as the emails. Declined: `notify_member` / `take_message`
+  as before. Details: `docs/screen-protocol.md` section 8
 - Emergencies: tells the visitor to call 911 first, and emails an urgent alert
   to everyone in `team.json` (`alert_emergency`, max 2 per conversation). She
   says only that the team was alerted, never that they received or read it
@@ -90,6 +103,9 @@ Suggestions, project requests, screen cards, the send-once guard and the
 screen taps: `agent-worker/test_leads.py`, same harness.
 Persona checks for the boss's notes of 2026-10-09, one scenario per note:
 `agent-worker/test_persona.py`, same harness.
+The video call (#22): `agent-worker/test_staff_call.py` (token, link, email,
+guards offline; offer, call, no answer, handover against Gemini), and
+`tests/voice/call.mjs` (two browsers through real LiveKit, see its header).
 
 ## To build
 
