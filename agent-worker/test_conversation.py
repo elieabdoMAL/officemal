@@ -93,7 +93,7 @@ class Conversation:
                 yield chunk
 
         agent.llm_node = llm_node
-        llm = google.LLM(model="gemini-2.5-flash", thinking_config={"thinking_budget": 0})
+        llm = worker.make_llm()  # same model + fallback as production
         self.session = AgentSession(llm=llm)
         await self.session.__aenter__()
 

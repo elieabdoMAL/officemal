@@ -58,7 +58,7 @@ from livekit.agents import (
     cli,
     function_tool,
 )
-from livekit.agents.llm import ChatChunk
+from livekit.agents.llm import ChatChunk, FallbackAdapter
 from livekit.agents.stt import SpeechEventType
 from livekit.plugins import deepgram, google, simli
 
@@ -229,6 +229,38 @@ if TTS_PROVIDER == "elevenlabs":
     # Imported here, not with the other plugins, so the Deepgram path never
     # needs it. LiveKit plugins must be imported on the main thread, at load.
     from livekit.plugins import elevenlabs
+
+
+# Her brain. gemini-3.1-flash-lite: the fastest first word with her full prompt
+# (~0.8s) and Google's cheapest model. Each Gemini model has its own free-tier
+# allowance, so when one runs out (429, as gemini-2.5-flash did on 2026-10-09
+# after heavy testing) the FallbackAdapter moves to the next instead of
+# leaving her silent. Both are overridable without a rebuild.
+LLM_MODEL = os.environ.get("LLM_MODEL", "").strip() or "gemini-3.1-flash-lite"
+LLM_FALLBACK_MODELS = [
+    m.strip()
+    for m in (os.environ.get("LLM_FALLBACK_MODELS", "").strip() or "gemini-3.5-flash").split(",")
+    if m.strip() and m.strip() != LLM_MODEL
+]
+
+
+def _gemini(model: str) -> google.LLM:
+    # Thinking at its minimum: it only delays the first word. Gemini 3 models
+    # take a thinking_level, 2.5 and earlier a thinking_budget.
+    if model.startswith("gemini-3"):
+        return google.LLM(model=model, thinking_config={"thinking_level": "minimal"})
+    return google.LLM(model=model, thinking_config={"thinking_budget": 0})
+
+
+def make_llm():
+    """Linda's LLM: LLM_MODEL, falling back to LLM_FALLBACK_MODELS on errors."""
+    models = [LLM_MODEL, *LLM_FALLBACK_MODELS]
+    logger.info("LLM: %s", " -> ".join(models))
+    if len(models) == 1:
+        return _gemini(models[0])
+    # attempt_timeout is also sent to Gemini as the request deadline, and
+    # Gemini rejects anything under 10s (400 INVALID_ARGUMENT).
+    return FallbackAdapter([_gemini(m) for m in models], attempt_timeout=10.0)
 
 
 def make_tts():
@@ -1472,12 +1504,8 @@ async def entrypoint(ctx: JobContext) -> None:
 
     session = AgentSession(
         stt=stt,
-        # Thinking off. Left on, 2.5 Flash decides per turn whether to think
-        # first: plain answers rarely do with this prompt, but tool calls
-        # (take_message) spent ~90 thinking tokens, about +0.45s before she
-        # speaks, and a bare 3-word reply ~360 tokens / +1.4s. Replies were
-        # just as good without it in testing (docs/mia-tasks.md).
-        llm=google.LLM(model="gemini-2.5-flash", thinking_config={"thinking_budget": 0}),
+        # Gemini model + fallback, thinking at its minimum (see make_llm).
+        llm=make_llm(),
         tts=tts,
         # The default endpointing (min 0.5s / max 3.0s of silence before she
         # accepts the turn is over) reads as a long dead pause at a reception
