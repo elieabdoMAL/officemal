@@ -33,6 +33,7 @@ The LIVEKIT_* vars are read automatically by the agents framework.
 import asyncio
 import logging
 import os
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -118,10 +119,12 @@ MAX_EMERGENCY_ALERTS_PER_SESSION = 2
 # it means her English is unchanged by all this. The French voices are fr-FR
 # only; Aura has no fr-CA, so expect a France accent rather than a Québec one.
 VOICE_BY_LANG = {"fr": "aura-2-agathe-fr", "en": "aura-2-andromeda-en"}
+# Words the French Aura voice can't say, respelled for it (audio only).
+FRENCH_VOICE_RESPELL = re.compile(r"\bEnglish\b")
 
 # Voice for the bilingual greeting and anything said before the visitor has
-# chosen: the French voice says "hello" and "English" well enough, the English
-# one mangles "Français".
+# chosen: the French voice says "hello" well enough (and "English" respelled,
+# FRENCH_VOICE_RESPELL); the English one mangles "Français".
 DEFAULT_LANG = "fr"
 
 # Deepgram language once the visitor has chosen. A single-language model is
@@ -211,6 +214,12 @@ MIN_STT_CONFIDENCE = 0.5
 # Sub-threshold transcripts are usually 1-2 stray characters or a lone filler.
 MIN_TRANSCRIPT_CHARS = 3
 FILLER_ONLY = {"uh", "um", "hmm", "mhm", "ah", "eh", "oh", "hm", "huh"}
+
+# Before the visitor has chosen a language, "I didn't get that" would have to
+# guess one, so she asks the question again instead. Also said, once, when
+# speech gives no transcript at all: Deepgram's live stream can return nothing
+# for a lone "Français.", the likeliest answer to her greeting.
+ASK_LANGUAGE_AGAIN = "Pardon? Français ou English?"
 
 # Said once, by the worker, when the visitor asks her to stop talking (#24,
 # #25). Then she ignores everything until her name is said.
@@ -419,6 +428,8 @@ class MiaAgent(Agent):
         # still needs to reach Gemini, which offers French or English to them.
         self._last_raw_language: str = DEFAULT_LANG
         self._chosen_language: str | None = None
+        self._voice_language = DEFAULT_LANG  # the voice _speak_in last picked
+        self._asked_again = False  # ASK_LANGUAGE_AGAIN said for unheard speech
         self._paused = False
         # Visitor speech (VAD) counted, vs. the last one that gave a transcript.
         self._speech_id = 0
@@ -489,6 +500,17 @@ class MiaAgent(Agent):
         if self._unheard >= UNHEARD_BEFORE_WIDENING and self._stt_language != STT_MULTI:
             logger.info("%d utterances without a transcript: listening in both languages", self._unheard)
             self._listen_in(None)
+        elif (
+            self._chosen_language is None
+            and not self._asked_again
+            and not self._paused
+            and self.session.agent_state == "listening"
+        ):
+            # Once only: in an empty lobby, noise would have her asking forever.
+            logger.info("speech without a transcript before a language was chosen: asking again")
+            self._asked_again = True
+            self._speak_in(DEFAULT_LANG)
+            self.session.say(ASK_LANGUAGE_AGAIN)
 
     async def stt_node(self, audio, model_settings):
         async for event in super().stt_node(audio, model_settings):
@@ -534,9 +556,18 @@ class MiaAgent(Agent):
         # Gemini writes "573 2324" or "5732324" however the prompt asks, and
         # the TTS would say "five million ...". Only the audio changes: the
         # transcript (and on-screen captions) keep the digits.
-        spoken = speak_digits_stream(text, lambda: self.language)
+        spoken = speak_digits_stream(text, lambda: self._voice_language)
+        if TTS_PROVIDER == "deepgram":
+            spoken = self._french_voice_respell(spoken)
         async for frame in Agent.default.tts_node(self, spoken, model_settings):
             yield frame
+
+    async def _french_voice_respell(self, text):
+        # Aura's French voice reads "English" the French way: in her greeting
+        # ("Français ou English?") the kiosk recording was transcribed as
+        # "ambiche". Spelled "Inglish" it comes out as English.
+        async for chunk in text:
+            yield FRENCH_VOICE_RESPELL.sub("Inglish", chunk) if self._voice_language == "fr" else chunk
 
     @function_tool()
     async def take_message(
@@ -729,8 +760,10 @@ class MiaAgent(Agent):
         filler = stripped in FILLER_ONLY
         unsure = confidence is not None and confidence < MIN_STT_CONFIDENCE
         # Her name alone ("Mia?") is short and often scored low; it's still
-        # the visitor calling her back.
-        if not woken and (not text or too_short or filler or unsure):
+        # the visitor calling her back. So is a lone "English" mangled into
+        # "Engösch" (confidence 0.40 in testing).
+        choosing = self._chosen_language is None and language_choice(text) is not None
+        if not (woken or choosing) and (not text or too_short or filler or unsure):
             logger.info(
                 "rejected %r (lang=%s, confidence=%s, short=%s, filler=%s)",
                 text,
@@ -739,6 +772,8 @@ class MiaAgent(Agent):
                 too_short,
                 filler,
             )
+            if self._chosen_language is None:
+                return TurnPlan(say=ASK_LANGUAGE_AGAIN)
             return TurnPlan(say=DIDNT_GET_THAT[self.language])
 
         note = self._language_note(text)
@@ -749,6 +784,7 @@ class MiaAgent(Agent):
 
     def _speak_in(self, lang: str) -> None:
         """Point the TTS at `lang`'s voice before the next thing she says."""
+        self._voice_language = lang  # what tts_node rewrites for
         if TTS_PROVIDER == "elevenlabs":
             # Same voice for both languages. Only reconnects when it changes.
             if ELEVENLABS_MODEL in ELEVENLABS_LANGUAGE_MODELS:
@@ -765,7 +801,7 @@ class MiaAgent(Agent):
 
         # Set the voice before returning: the LLM reply is synthesized after
         # this hook, so this is what decides how the answer sounds.
-        self._speak_in(self.language)
+        self._speak_in(DEFAULT_LANG if plan.say == ASK_LANGUAGE_AGAIN else self.language)
 
         if plan.note:
             # This turn only (turn_ctx isn't saved to the conversation history).

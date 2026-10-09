@@ -148,8 +148,20 @@ def _requested(text: str, *, loose: bool) -> str | None:
     return lang
 
 
+# Deepgram's live stream is poor at one lone word: in testing "Français." came
+# back as "Franc", "Franck" or "france" (tagged English), "English." as
+# "Engösch" (tagged German). One word alone that starts like a language name is
+# taken as that answer.
+_BARE_PREFIXES = {"fr": ("fran",), "en": ("eng", "ing", "angl")}
+
+
 def language_choice(text: str) -> str | None:
     """'fr' / 'en' when the visitor's answer names a language, else None."""
+    rest = [w for w in _words(text) if w not in _CHOICE_FILLERS]
+    if len(rest) == 1:
+        for lang, prefixes in _BARE_PREFIXES.items():
+            if rest[0].startswith(prefixes):
+                return lang
     return _requested(text, loose=True)
 
 

@@ -114,6 +114,13 @@ def test_language() -> None:
         "Français ou English?": None,  # echoed the question: not a choice
         "Hi, what does your company do?": None,  # no choice word: detected language decides
         "Bonjour": None,
+        # Deepgram's live readings of a lone "Français." / "English."
+        "france": "fr",
+        "Franc": "fr",
+        "Franck.": "fr",
+        "Engösch.": "en",
+        "Inglish": "en",
+        "I'm visiting from France, what do you do?": None,
     }, "language_choice")
     check(language_switch, {
         ("Can we speak French please?", "en"): "fr",

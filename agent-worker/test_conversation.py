@@ -108,12 +108,12 @@ class Conversation:
     async def __aexit__(self, *exc) -> None:
         await self.session.__aexit__(*exc)
 
-    async def turn(self, line: str, heard_as: str) -> dict:
+    async def turn(self, line: str, heard_as: str, confidence: float = 0.95) -> dict:
         """The visitor says `line`; Deepgram reports language `heard_as`."""
         agent = self.agent
         agent._last_raw_language = heard_as
         agent._last_language = worker._normalize_lang(heard_as)
-        agent._last_confidence = 0.95
+        agent._last_confidence = confidence
         calls_before, said_before = llm_calls, len(self.said)
         turn_ctx = agent.chat_ctx.copy()
         replied = True
@@ -212,12 +212,24 @@ async def conv_pause_tool() -> None:
     print("✓ pause_conversation tool paused her, and she then ignored speech")
 
 
+async def conv_garbled_answer() -> None:
+    async with Conversation("Answer not understood before a choice: ask again; mangled lone word still counts") as c:
+        r = await c.turn("Hmm.", "fr", confidence=0.3)
+        assert r["reply"] == worker.ASK_LANGUAGE_AGAIN and r["llm_calls"] == 0, r
+        assert c.agent.chosen_language is None
+        # Deepgram's live reading of a lone "English.": tagged German, 0.40
+        r = await c.turn("Engösch.", "de", confidence=0.40)
+        assert c.agent.chosen_language == "en" and language_of(r["reply"]) == "en", r
+    print("✓ re-asked, then took \"Engösch\" as English")
+
+
 CONVERSATIONS = {
     "english": conv_choose_english,
     "first": conv_first_line_decides,
     "switch": conv_switch,
     "pause": conv_pause,
     "tool": conv_pause_tool,
+    "garbled": conv_garbled_answer,
 }
 
 
