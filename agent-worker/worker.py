@@ -7,7 +7,7 @@ LiveKit room the browser joins and runs:
 
     Deepgram STT  ->  Gemini 2.5 Flash (LLM)  ->  Deepgram TTS  ->  Simli avatar
 
-(or ElevenLabs TTS, with TTS_PROVIDER=elevenlabs). The Simli plugin renders the
+(or Cartesia or ElevenLabs TTS, with TTS_PROVIDER). The Simli plugin renders the
 Trinity face lip-synced to the TTS audio and publishes the video+audio into the
 room; the browser subscribes to it.
 
@@ -30,7 +30,9 @@ Run:
 Env (see env.example): SIMLI_API_KEY, SIMLI_FACE_ID, GOOGLE_API_KEY,
 DEEPGRAM_API_KEY, LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET.
 Optional: ASSISTANT_NAME, SESSION_IDLE_TIMEOUT, SESSION_MAX_LENGTH,
-PAUSE_TIMEOUT, LIVEKIT_AGENT_NAME, TTS_PROVIDER, ELEVENLABS_API_KEY,
+PAUSE_TIMEOUT, LIVEKIT_AGENT_NAME, TTS_PROVIDER, CARTESIA_API_KEY,
+CARTESIA_MODEL, CARTESIA_VOICE_FR, CARTESIA_VOICE_EN, CARTESIA_SPEED_FR,
+CARTESIA_SPEED_EN, CARTESIA_EMOTION_EN, ELEVENLABS_API_KEY,
 ELEVENLABS_VOICE_ID, ELEVENLABS_MODEL.
 The LIVEKIT_* vars are read automatically by the agents framework.
 """
@@ -213,14 +215,59 @@ ELEVENLABS_MODEL = os.environ.get("ELEVENLABS_MODEL", "").strip() or "eleven_fla
 ELEVENLABS_LANGUAGE_MODELS = {"eleven_flash_v2_5", "eleven_turbo_v2_5"}
 
 
+# Cartesia Sonic-3 instead of Aura: TTS_PROVIDER=cartesia plus CARTESIA_API_KEY.
+# A Québec French voice, faster and livelier than Aura's France-French Agathe
+# (#14, #11). One voice id per language, swapped per turn like Aura's; the
+# default for both is Josette, the one Cartesia voice native in fr-CA and
+# en-CA, so she is the same person in both languages. Chosen among the 23
+# fr-CA female voices, see docs/cartesia-voice.md.
+CARTESIA_API_KEY = os.environ.get("CARTESIA_API_KEY", "").strip()
+CARTESIA_MODEL = os.environ.get("CARTESIA_MODEL", "").strip() or "sonic-3"
+JOSETTE_VOICE_ID = "3b7d569e-01fc-45ef-b74b-29460956c691"  # "Josette - Frontline Helper"
+CARTESIA_VOICE_BY_LANG = {
+    "fr": os.environ.get("CARTESIA_VOICE_FR", "").strip() or JOSETTE_VOICE_ID,
+    "en": os.environ.get("CARTESIA_VOICE_EN", "").strip() or JOSETTE_VOICE_ID,
+}
+
+
+def _env_float(name: str, default: float, low: float, high: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    try:
+        value = float(raw) if raw else default
+    except ValueError:
+        logger.warning("%s=%r is not a number: using %s", name, raw, default)
+        return default
+    return min(max(value, low), high)
+
+
+# Sonic-3 speed, 0.6–1.5 (1.0 is the voice's own pace). French a little faster:
+# "her French sounds slow" was the complaint.
+CARTESIA_SPEED_BY_LANG = {
+    "fr": _env_float("CARTESIA_SPEED_FR", 1.1, 0.6, 1.5),
+    "en": _env_float("CARTESIA_SPEED_EN", 1.0, 0.6, 1.5),
+}
+# Sonic-3 emotions only work in English (Cartesia's docs), so French gets none.
+# "content" is one of its primary (most reliable) emotions, the warm, pleased
+# one. Empty leaves the voice as it is.
+CARTESIA_EMOTION_EN = os.environ.get("CARTESIA_EMOTION_EN", "content").strip()
+# The plugin sends text a sentence at a time, sentences of 20 characters at
+# least, so a short opening ("Avec plaisir!") waited for the whole next
+# sentence: ~0.2s later first audio. At 6 it came as fast as Aura's.
+CARTESIA_MIN_SENTENCE_LEN = 6
+
+
 def _tts_provider() -> str:
     wanted = os.environ.get("TTS_PROVIDER", "").strip().lower() or "deepgram"
     if wanted == "elevenlabs":
         if ELEVENLABS_API_KEY:
             return "elevenlabs"
         logger.error("TTS_PROVIDER=elevenlabs but ELEVENLABS_API_KEY is not set: using Deepgram Aura")
+    elif wanted == "cartesia":
+        if CARTESIA_API_KEY:
+            return "cartesia"
+        logger.error("TTS_PROVIDER=cartesia but CARTESIA_API_KEY is not set: using Deepgram Aura")
     elif wanted != "deepgram":
-        logger.warning("TTS_PROVIDER=%r is not deepgram or elevenlabs: using Deepgram Aura", wanted)
+        logger.warning("TTS_PROVIDER=%r is not deepgram, cartesia or elevenlabs: using Deepgram Aura", wanted)
     return "deepgram"
 
 
@@ -229,10 +276,64 @@ if TTS_PROVIDER == "elevenlabs":
     # Imported here, not with the other plugins, so the Deepgram path never
     # needs it. LiveKit plugins must be imported on the main thread, at load.
     from livekit.plugins import elevenlabs
+elif TTS_PROVIDER == "cartesia":
+    from livekit.agents import tokenize
+    from livekit.agents.tts import FallbackAdapter
+    from livekit.plugins import cartesia
+
+    class CartesiaVoice(FallbackAdapter):
+        """Cartesia, with Aura taking over when it fails (credits used up,
+        outage) so she never goes silent. Cartesia is retried in the
+        background and used again once it answers."""
+
+        def __init__(self) -> None:
+            self.cartesia = cartesia.TTS(
+                api_key=CARTESIA_API_KEY,
+                model=CARTESIA_MODEL,
+                tokenizer=tokenize.blingfire.SentenceTokenizer(min_sentence_len=CARTESIA_MIN_SENTENCE_LEN),
+                **self.settings(DEFAULT_LANG),
+            )
+            self.aura = deepgram.TTS(model=VOICE_BY_LANG[DEFAULT_LANG])
+            super().__init__([self.cartesia, self.aura])
+            self.on("tts_availability_changed", self._log_availability)
+
+        @staticmethod
+        def settings(lang: str) -> dict:
+            return {
+                "language": lang,
+                "voice": CARTESIA_VOICE_BY_LANG[lang],
+                "speed": CARTESIA_SPEED_BY_LANG[lang],
+                "emotion": (CARTESIA_EMOTION_EN or None) if lang == "en" else None,
+            }
+
+        def speak_in(self, lang: str) -> None:
+            self.cartesia.update_options(**self.settings(lang))
+            self.aura.update_options(model=VOICE_BY_LANG[lang])
+
+        @property
+        def on_aura(self) -> bool:
+            """Cartesia failed and isn't back yet: Aura is speaking."""
+            return not self._status[0].available
+
+        @staticmethod
+        def _log_availability(ev) -> None:
+            if ev.available:
+                logger.info("TTS %s is back", ev.tts.label)
+            else:
+                logger.error("TTS %s failed: Aura speaks until it is back", ev.tts.label)
 
 
 def make_tts():
     """The TTS for one session, set up for DEFAULT_LANG (the greeting)."""
+    if TTS_PROVIDER == "cartesia":
+        logger.info(
+            "TTS: Cartesia %s, voices %s, speed %s, English emotion %r (Aura if it fails)",
+            CARTESIA_MODEL,
+            CARTESIA_VOICE_BY_LANG,
+            CARTESIA_SPEED_BY_LANG,
+            CARTESIA_EMOTION_EN,
+        )
+        return CartesiaVoice()
     if TTS_PROVIDER != "elevenlabs":
         return deepgram.TTS(model=VOICE_BY_LANG[DEFAULT_LANG])
     logger.info("TTS: ElevenLabs %s, voice %s", ELEVENLABS_MODEL, ELEVENLABS_VOICE_ID)
@@ -561,7 +662,7 @@ class MiaAgent(Agent):
         on_status: Callable[[], None] | None = None,
         on_screen: Callable[[dict], None] | None = None,
     ) -> None:
-        # tts: deepgram.TTS or elevenlabs.TTS, see make_tts
+        # tts: deepgram.TTS, CartesiaVoice or elevenlabs.TTS, see make_tts
         # stt: the session's deepgram.STT, so the language lock can retune it
         super().__init__(instructions=MIA_SYSTEM_PROMPT)
         # Ends the session the way the idle limit does (entrypoint's
@@ -894,7 +995,9 @@ class MiaAgent(Agent):
         # the TTS would say "five million ...". Only the audio changes: the
         # transcript (and on-screen captions) keep the digits.
         spoken = speak_digits_stream(text, lambda: self._voice_language)
-        if TTS_PROVIDER == "deepgram":
+        # Aura only: Cartesia says "English" and one-word sentences right as
+        # written, and garbled "Inglish" (docs/cartesia-voice.md).
+        if TTS_PROVIDER == "deepgram" or (TTS_PROVIDER == "cartesia" and self._tts.on_aura):
             spoken = self._french_voice_respell(self._join_one_word_opening(spoken))
         async for frame in Agent.default.tts_node(self, spoken, model_settings):
             yield frame
@@ -1415,6 +1518,9 @@ class MiaAgent(Agent):
     def _speak_in(self, lang: str) -> None:
         """Point the TTS at `lang`'s voice before the next thing she says."""
         self._voice_language = lang  # what tts_node rewrites for
+        if TTS_PROVIDER == "cartesia":
+            self._tts.speak_in(lang)  # voice, language, speed, emotion; and Aura's voice
+            return
         if TTS_PROVIDER == "elevenlabs":
             # Same voice for both languages. Only reconnects when it changes.
             if ELEVENLABS_MODEL in ELEVENLABS_LANGUAGE_MODELS:
@@ -1461,7 +1567,7 @@ async def entrypoint(ctx: JobContext) -> None:
     #
     # The TTS is held as a local so MiaAgent gets the same instance the session
     # speaks through — that's what lets it swap the voice per turn.
-    # Deepgram Aura unless TTS_PROVIDER=elevenlabs (see make_tts).
+    # Deepgram Aura unless TTS_PROVIDER=cartesia or elevenlabs (see make_tts).
     tts = make_tts()
 
     # language="multi" until the visitor picks French or English: it hears
