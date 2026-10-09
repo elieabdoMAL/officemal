@@ -209,7 +209,18 @@ function workerLogs(since) {
 async function transcribe(audio, language) {
   if (!audio || audio.length < 2000) return { text: "", utterances: [] };
   const url = `https://api.deepgram.com/v1/listen?model=nova-3&language=${language}&utterances=true&punctuate=true`;
-  const res = await fetch(url, { method: "POST", headers: { Authorization: `Token ${ENV.DEEPGRAM_API_KEY}`, "Content-Type": "audio/webm" }, body: audio });
+  let res;
+  // Connect timeouts to Deepgram killed whole runs twice: retry before giving up.
+  for (let attempt = 1; ; attempt++) {
+    try {
+      res = await fetch(url, { method: "POST", headers: { Authorization: `Token ${ENV.DEEPGRAM_API_KEY}`, "Content-Type": "audio/webm" }, body: audio });
+      break;
+    } catch (err) {
+      if (attempt >= 3) throw err;
+      console.log(`   Deepgram listen failed (${err.cause?.code ?? err.message}); retrying in 10s`);
+      await sleep(10000);
+    }
+  }
   if (!res.ok) throw new Error(`Deepgram listen ${res.status}: ${await res.text()}`);
   const j = await res.json();
   return {

@@ -157,6 +157,10 @@ async def test_tool_guards() -> None:
     agent._visitor_lines.append("My name is David Chen.")
     out = await agent.notify_member(None, visitor_name="David Chen", member="Alex", note="meeting at two")
     check(out.startswith("NOTIFIED"), f"notify_member once the visitor said it: {out[:40]}")
+    agent._visitor_said = "I have a suggestion: you should add background music in the lobby."
+    out = await agent.send_suggestion(None, suggestion="You should add background music in the lobby.")
+    check(out.startswith("NOT SENT yet"), f"send_suggestion in the turn it was dictated, before she repeats it: {out[:50]}")
+    agent._visitor_said = "Yes, send it."
     out = await agent.send_suggestion(None, suggestion="Add music.", visitor_name="Sir")
     sent = recorded("suggestion", n)
     check(out.startswith("SENT") and sent and sent[0][3] == "", f"send_suggestion with a made-up name goes anonymous: {sent}")
@@ -193,6 +197,7 @@ async def test_screen_claim_filter() -> None:
     real = worker.Agent.default.llm_node
     worker.Agent.default.llm_node = scripted
     agent = worker.MiaAgent(tts=None)
+    agent._screen_check_turn = 1  # no session here for the follow-up reply (SCREEN_CLAIM_NOTE)
     plain = worker.MiaAgent(tts=None)
     ctx = ChatContext.empty()
     ctx.add_message(role="user", content="Nous aimerions un site web pour vendre nos bouquets, c'est notre projet.")
@@ -205,6 +210,13 @@ async def test_screen_claim_filter() -> None:
         said, calls_out = await run(agent, ctx, [text("Please take a look at the screen and let me know if everything looks right. "),
                                                  ChatChunk(id="t", delta=ChoiceDelta(role="assistant", tool_calls=[call]))])
         check(said == "" and len(calls_out) == 1, f"EN claim dropped, the tool call passes: {said!r} {len(calls_out)}")
+        # Same step, but show_project_request answers SHOWN while she talks: then it's true, and said.
+        shown_soon = asyncio.get_running_loop().call_later(0.3, setattr, agent, "_project_shown_at", 2)
+        said, _ = await run(agent, ctx, [text("Parfait. Votre demande est affichée à l'écran, pouvez-vous la vérifier ? "),
+                                         ChatChunk(id="t", delta=ChoiceDelta(role="assistant", tool_calls=[call]))])
+        shown_soon.cancel()
+        check("écran" in said and said.startswith("Parfait."), f"claim kept once the same step showed the draft: {said!r}")
+        agent._project_shown_at = None
         said, _ = await run(agent, ctx, [text("Touchez l'écran et glissez le doigt pour vous déplacer. "),
                                          text("Nos coordonnées sont aussi à l'écran. Avez-vous un projet en tête ?")])
         check("Touchez l'écran" in said and "coordonnées" in said, f"other uses of the screen kept: {said!r}")
@@ -345,11 +357,14 @@ async def conv_suggestion() -> None:
 ASKS = [
     ("budget", ("budget",)),
     ("timeline", ("timeline", "when would", "when do you", "time frame", "timeframe", "deadline",
-                  "échéancier", "échéance", "délai", "quand ")),
+                  "échéancier", "échéance", "délai", "quand ", "période", "calendrier")),
     ("contact", ("email", "e-mail", "phone", "reach you", "contact you", "courriel", "téléphone", "joindre", "numéro")),
     ("company", ("company", "business", "bakery called", "name of your bakery", "entreprise", "société", "compagnie")),
     ("name", ("your name", "votre nom", "vous appelez")),
-    ("description", ("project", "describe", "app to do", "projet", "décrire")),
+    # Not every sentence with "project" in it: "une demande de projet, c'est bien ça ?" is a yes/no.
+    ("description", ("describe", "décri", "app to do", "tell me about your project", "tell me more about your project",
+                     "what is your project", "what's your project", "quel est votre projet", "parlez-moi de votre projet",
+                     "en quelques mots", "what kind of", "quel type de", "quel genre de")),
 ]
 
 

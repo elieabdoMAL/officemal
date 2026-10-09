@@ -684,6 +684,13 @@ class MiaAgent(Agent):
                 return False
         return True
 
+    def _just_dictated(self, text: str) -> bool:
+        """True when `text` is mostly the visitor's latest words: they have
+        only just said it, so she hasn't repeated it for them to confirm."""
+        latest = set(_norm(self._visitor_said).split())
+        words = [w for w in _norm(text).split() if len(w) > 2]
+        return bool(words) and sum(w in latest for w in words) >= 0.7 * len(words)
+
     def _is_repeat(self, kind: str, recipient: str, content: str) -> bool:
         if self._sent.is_repeat(kind, recipient, content, self._visitor_said):
             logger.info("%s to %s: same content already sent, refused", kind, recipient)
@@ -805,12 +812,15 @@ class MiaAgent(Agent):
                 yield chunk
             return
         # A project request may be under way and isn't on the screen yet: her
-        # text is passed on one sentence at a time, so that one claiming it is
-        # on the screen can be dropped (SCREEN_CLAIM_NOTE). Tool calls pass
-        # straight through.
+        # text is passed on one sentence at a time, and one claiming it is on
+        # the screen is held back until the end of this step. If she called
+        # show_project_request in the same step and it answered SHOWN, the
+        # sentence is true by then and is said; otherwise it is dropped
+        # (SCREEN_CLAIM_NOTE). Tool calls pass straight through.
         turn = self._visitor_turns
         pending = ""
-        dropped = False
+        held: list[str] = []
+        shows = False
         async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
             if isinstance(chunk, str):
                 text, chunk = chunk, None
@@ -819,20 +829,35 @@ class MiaAgent(Agent):
                 chunk = chunk.model_copy(update={"delta": chunk.delta.model_copy(update={"content": None})})
             else:
                 text = ""
+            if isinstance(chunk, ChatChunk) and chunk.delta and chunk.delta.tool_calls:
+                shows = shows or any(c.name == "show_project_request" for c in chunk.delta.tool_calls)
             pending += text
             while match := SENTENCE_END.search(pending):
                 sentence, pending = pending[: match.end()], pending[match.end() :]
                 if self._early_screen_claim(sentence):
-                    dropped = True
+                    held.append(sentence)
                     continue
                 yield sentence
             if chunk is not None:
                 yield chunk
-        if pending and not self._early_screen_claim(pending):
-            yield pending
+        if pending and self._early_screen_claim(pending):
+            held.append(pending)
         elif pending:
-            dropped = True
-        if dropped and self._screen_check_turn != turn:
+            yield pending
+        if not held:
+            return
+        if shows:
+            # Tools run as soon as they are called, while she is still talking.
+            for _ in range(10):
+                if self._project_shown_at is not None:
+                    break
+                await asyncio.sleep(0.1)
+        if self._project_shown_at is not None:
+            for sentence in held:
+                yield sentence
+            return
+        logger.warning("dropped, the project request is not on the screen yet: %r", "".join(held))
+        if self._screen_check_turn != turn:
             self._screen_check_turn = turn
             self._spawn(self._check_screen_claim(turn))
 
@@ -841,10 +866,7 @@ class MiaAgent(Agent):
         if self._project_shown_at is not None:
             return False
         s = fold(sentence)
-        if SCREEN_WORDS.search(s) and DRAFT_WORDS.search(s) and not NOT_DRAFT_WORDS.search(s):
-            logger.warning("dropped, the project request is not on the screen yet: %r", sentence)
-            return True
-        return False
+        return bool(SCREEN_WORDS.search(s) and DRAFT_WORDS.search(s) and not NOT_DRAFT_WORDS.search(s))
 
     async def _check_screen_claim(self, turn: int) -> None:
         """A sentence about the request on the screen was dropped: once this
@@ -1097,6 +1119,12 @@ class MiaAgent(Agent):
             return "NOT SENT: suggestion limit for this conversation reached. Give the contact details instead."
         if not suggestion.strip():
             return "NOT SENT: the suggestion is empty. Ask the visitor what they would like to suggest."
+        if self._just_dictated(suggestion):
+            # "C'est exact ? Votre suggestion est envoyée" in one breath, in testing.
+            return (
+                "NOT SENT yet: the visitor has only just said it. Repeat it in a few words and ask whether "
+                "to send it; call this again once they say yes."
+            )
         if visitor_name.strip() and not self._visitor_named(visitor_name):
             visitor_name = ""  # "the visitor", or a name they never gave: anonymous it is
         if self._is_repeat("suggestion", INBOX.email, suggestion):

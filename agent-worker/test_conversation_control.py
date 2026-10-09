@@ -147,6 +147,7 @@ def test_language() -> None:
         # Going back to a language (missed before 2026-10-09).
         ("Hmm, est-ce qu'on peut revenir au français ?", "en"): "fr",
         ("est-ce qu'on peut revenir au français", "en"): "fr",
+        ("Est-ce qu'on peut revenir aux français?", "en"): "fr",  # as the STT wrote it, 2026-10-09
         ("On peut revenir en anglais ?", "fr"): "en",
         ("On revient en français, s'il vous plaît.", "en"): "fr",
         ("Can we go back to French?", "en"): "fr",

@@ -67,8 +67,11 @@ New abilities are added as **function tools** on `MiaAgent` in the worker.
   thanks, bye!") ends only if the visitor then says nothing for 6 s
   (`END_AFTER_SEND_S`), so they hear the confirmation and can still correct it
 - "It's on the screen" is never said about a project request before the draft
-  is shown: such a sentence is dropped before the TTS, and she is asked to show
-  it or to ask for what is missing
+  is shown: such a sentence is held back until the end of her LLM step, said
+  if `show_project_request` answered SHOWN meanwhile, otherwise dropped before
+  the TTS, and she is asked to show it or to ask for what is missing
+- A suggestion is sent only after she has repeated it: `send_suggestion`
+  refuses in the turn the visitor dictated it
 - Session limits: ends after 2 min silence or 10 min total; she then rests
   with "Tap to talk to {name}" on screen (no session billed) until a tap on it
   or on the AI button starts a new one

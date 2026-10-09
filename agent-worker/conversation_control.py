@@ -209,7 +209,7 @@ _SWITCH_VERBS = {
 # Allowed between that verb and the language: "switch back to", "parler en",
 # "passer à l'", "continue this in", "parlez-moi en".
 _SWITCH_LINKS = {
-    "in", "into", "to", "en", "au", "a", "the", "le", "la", "l'", "back", "over", "with", "me", "us", "avec",
+    "in", "into", "to", "en", "au", "aux", "a", "the", "le", "la", "l'", "back", "over", "with", "me", "us", "avec",
     "moi", "nous", "it", "that", "this", "ca", "cela", "again", "only", "just", "juste", "seulement", "plutot",
     "rather", "please", "svp", "now", "maintenant", "on", "conversation", "discussion", "pas", "not", "bien",
 }
