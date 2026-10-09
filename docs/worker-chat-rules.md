@@ -21,6 +21,14 @@ merges your branch. Read this file, `docs/feedback-2026-10-09.md`, and
   `C:\Users\user\Desktop\officemal\agent-worker\.env`.
 
 ## Never
+- Talk to production from a test. The 3DVista tour (`public/3dvista`) loads
+  Linda's frame from the absolute production URL
+  (`https://officemal.mobileappslabs.ca/receptionist-embed`), so a local test
+  of the full kiosk page talks to the LIVE Linda, whose emails reach real
+  staff (this happened on 2026-10-09). Any test that loads `/` must block or
+  reroute requests to `officemal.mobileappslabs.ca` (Playwright `page.route`)
+  and verify the AIWEB frame is the local one before speaking. Testing
+  `/receptionist-embed` directly on localhost is safe.
 - Deploy: no `build-and-push.sh`, `push-keys.sh`, `vercel`, `docker push`,
   `ssh`, and never retag `simli-worker:latest`.
 - Email real people. Mount the sandbox team file
