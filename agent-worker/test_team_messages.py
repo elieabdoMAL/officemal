@@ -35,13 +35,35 @@ def test_find_member() -> None:
         "Marc Dupont": None,
         "Al": None,  # partial words don't count
         "": None,
+        # How speech recognition has spelled them (#15).
+        "Alexander": "Alexandre Joset",
+        "Alexandra": "Alexandre Joset",
+        "Nic": "Nicolas Bastien",
+        "Nicholas": "Nicolas Bastien",
+        # The general inbox (#2); a named person always wins over it.
+        "info": "the general inbox",
+        "info at mobileappslabs dot com": "the general inbox",
+        "the team": "the general inbox",
+        "l'équipe": "the general inbox",
+        "Mobile Apps Labs": "the general inbox",
+        "Nicolas at Mobile Apps Labs": "Nicolas Bastien",
+        "Alex from the team": "Alexandre Joset",
+        "Nicolas and Alexandre": None,
     }
     for said, expected in cases.items():
         got = find_member(said, TEAM)
         assert (got.full_name if got else None) == expected, f"{said!r}: {got}"
     section = team_prompt_section(TEAM)
     assert "@" not in section, "emails must never reach the prompt"
-    print(f"✓ find_member: {len(cases)} cases; TEAM prompt section has no emails")
+    for block in ("TEAM\n", "TEAM ABOUT", "GENERAL INBOX", "Alexander", "the person to let know is Nicolas Bastien"):
+        assert block in section, f"TEAM prompt section is missing {block!r}"
+
+    # Bios (#1): rendered only when team.json has them, never invented.
+    with_bio = Member("Ada", "Test", "CTO", "Directrice technique", "x@example.com", (), bio_en="Ada loves maps.", bio_fr="Ada adore les cartes.")
+    rendered = team_prompt_section([with_bio])
+    assert "Ada loves maps." in rendered and "Ada adore les cartes." in rendered, rendered
+    assert "Ada loves maps." not in team_prompt_section([Member("Ada", "Test", "CTO", "CTO", "x@example.com", ())])
+    print(f"✓ find_member: {len(cases)} cases; TEAM prompt section has no emails, has bios only when given")
 
 
 async def test_resend_delivery() -> None:
@@ -65,6 +87,12 @@ def kinds(*kind: str) -> list[tuple]:
     return [c for c in calls if c[0] in kind]
 
 
+def use_assistant_name(worker) -> None:
+    """Fill in {ASSISTANT_NAME} if this worker doesn't yet (it does it at load)."""
+    if "{ASSISTANT_NAME}" in worker.MIA_SYSTEM_PROMPT:
+        worker.MIA_SYSTEM_PROMPT = worker.MIA_SYSTEM_PROMPT.replace("{ASSISTANT_NAME}", "Mia")
+
+
 def install_recorders(worker) -> None:
     """Swap every email for a recorder. The tools look these up in worker's globals."""
 
@@ -85,7 +113,8 @@ def install_recorders(worker) -> None:
     worker.send_emergency_email = emergency
 
 
-async def converse(lang: str, lines: list[str]) -> None:
+async def converse(lang: str, lines: list[str]) -> list[str]:
+    """Play `lines` as one conversation; return her reply to each."""
     from livekit.agents import AgentSession
     from livekit.plugins import google
 
@@ -122,6 +151,7 @@ async def converse(lang: str, lines: list[str]) -> None:
     agent.llm_node = llm_node
     # Same LLM settings as worker.entrypoint (thinking off).
     llm = google.LLM(model="gemini-2.5-flash", thinking_config={"thinking_budget": 0})
+    replies = []
     async with AgentSession(llm=llm) as session:
         await session.start(agent)
         for line in lines:
@@ -136,6 +166,8 @@ async def converse(lang: str, lines: list[str]) -> None:
             )
             tools = "".join(f" [{c[0]} recorded]" for c in calls[before:])
             print(f"  VISITOR: {line}\n  MIA:     {reply}{tools}")
+            replies.append(reply)
+    return replies
 
 
 async def conv_message() -> None:
@@ -158,18 +190,21 @@ async def conv_message() -> None:
 
 async def conv_notify() -> None:
     print("— English, here to see the COO, name not given yet:")
-    await converse("en", [
+    replies = await converse("en", [
         "Hi, I'm here to see Alex, I have a meeting with him at two.",
         "My name is David Chen.",
     ])
+    # Seen in testing: "I've let Alex know you're here" with no name and no tool call.
+    assert not any(w in replies[0].lower() for w in ("i've let", "i have let", "let alex")), f"claimed to notify before having the name: {replies[0]!r}"
     notified = kinds("notify")
     assert len(notified) == 1, f"expected one notification: {calls}"
     assert notified[0][1] == "Alexandre Joset" and "Chen" in notified[0][2], notified
     print(f"✓ one notification recorded: {notified[0]}")
 
     print("— French, here to see someone not on the team:")
-    await converse("fr", ["Bonjour, je suis Sophie Martin, j'ai rendez-vous avec Marc Dupont."])
+    replies = await converse("fr", ["Bonjour, je suis Sophie Martin, j'ai rendez-vous avec Marc Dupont."])
     assert len(kinds("notify")) == 1, f"nobody outside team.json may be notified: {calls}"
+    assert "prévenu" not in replies[0].lower(), f"claimed to notify someone: {replies[0]!r}"
     print("✓ nobody notified for someone not in team.json")
 
 
@@ -214,6 +249,7 @@ async def main() -> None:
 
     import worker
 
+    use_assistant_name(worker)
     install_recorders(worker)
     for name in sys.argv[1:] or CONVERSATIONS:
         await CONVERSATIONS[name]()
