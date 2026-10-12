@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ASSISTANT_NAME, pick, type Lang } from "@/lib/assistant";
+import { LAYOUT } from "@/lib/screenLayout";
 
 // Live captions (#16): what she says, and smaller above it what she heard.
 // Fed from LiveKit's lk.transcription text streams by SimliLiveKitPanel.
@@ -101,53 +102,77 @@ export default function MiaCaptions({
   const visitor = showVisitor ? captions.visitor : null;
   const mia = captions.mia;
   const you = pick(lang, YOU).join(" / ");
+  // Her caption sits low in the frame, over her chest and the desk: her face
+  // is in the upper half. The visitor's echo floats at the top of the frame,
+  // above her head, unless LAYOUT stacks it above hers (#3,
+  // src/lib/screenLayout.ts). aria-live so a screen reader (or any assistive
+  // tech on the kiosk) gets them too; "polite" so it waits for a pause
+  // instead of reading every word as it lands.
+  const visitorOnTop = LAYOUT.captions.visitorTop !== undefined;
+  const visitorLine = visitor && (
+    <CaptionLine
+      key={`v-${visitor.id}`}
+      caption={visitor}
+      label={you}
+      fontSize={LAYOUT.captions.visitor.fontSize}
+      color="rgba(255,255,255,0.85)"
+      background="rgba(20,20,30,0.6)"
+      italic
+      lines={LAYOUT.captions.visitor.lines}
+    />
+  );
 
   return (
-    // Captions sit low in the frame, over her chest and the desk: her face is
-    // in the upper half of the frame. aria-live so a screen reader (or any
-    // assistive tech on the kiosk) gets them too; "polite" so it waits for a
-    // pause instead of reading every word as it lands.
-    <div
-      aria-live="polite"
-      style={{
-        position: "absolute",
-        left: "50%",
-        bottom,
-        transform: "translateX(-50%)",
-        width: "min(88%, 62em)",
-        display: "flex",
-        flexDirection: "column",
-        alignItems: "center",
-        gap: "0.5vw",
-        pointerEvents: "none",
-        textAlign: "center",
-      }}
-    >
-      {visitor && (
-        <CaptionLine
-          key={`v-${visitor.id}`}
-          caption={visitor}
-          label={you}
-          fontSize="clamp(13px, 1.8vw, 30px)"
-          color="rgba(255,255,255,0.85)"
-          background="rgba(20,20,30,0.6)"
-          italic
-          lines={2}
-        />
+    <>
+      {visitorOnTop && (
+        <div
+          aria-live="polite"
+          style={{
+            position: "absolute",
+            left: "50%",
+            top: LAYOUT.captions.visitorTop,
+            transform: "translateX(-50%)",
+            width: LAYOUT.captions.visitorTopWidth,
+            display: "flex",
+            justifyContent: "center",
+            pointerEvents: "none",
+            textAlign: "center",
+          }}
+        >
+          {visitorLine}
+        </div>
       )}
-      {mia && (
-        <CaptionLine
-          key={`m-${mia.id}`}
-          caption={mia}
-          label={ASSISTANT_NAME}
-          fontSize="clamp(16px, 2.5vw, 42px)"
-          color="#fff"
-          background="rgba(0,0,0,0.78)"
-          // Two lines keep the box below her chin at the frame's usual size.
-          lines={2}
-        />
-      )}
-    </div>
+      <div
+        aria-live="polite"
+        style={{
+          position: "absolute",
+          left: "50%",
+          bottom,
+          transform: "translateX(-50%)",
+          width: LAYOUT.captions.width,
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          gap: LAYOUT.captions.gap,
+          pointerEvents: "none",
+          textAlign: "center",
+        }}
+      >
+        {!visitorOnTop && visitorLine}
+        {mia && (
+          <CaptionLine
+            key={`m-${mia.id}`}
+            caption={mia}
+            label={ASSISTANT_NAME}
+            fontSize={LAYOUT.captions.mia.fontSize}
+            color="#fff"
+            background="rgba(0,0,0,0.78)"
+            // Few lines keep the box below her chin at the frame's usual size.
+            lines={LAYOUT.captions.mia.lines}
+          />
+        )}
+      </div>
+    </>
   );
 }
 

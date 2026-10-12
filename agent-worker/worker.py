@@ -87,12 +87,14 @@ from leads import (
 )
 from screen_cards import (
     DRAFT_CARD_S,
+    PRESS_BUTTONS,
     SENT_CARD_S,
     TOPIC_CONTROL,
     TOPIC_SCREEN,
     contact_card,
     gives_contact_details,
     message_sent,
+    press,
     project_request,
 )
 from staff_call import (
@@ -1604,6 +1606,72 @@ class MiaAgent(Agent):
         lang = self._chosen_language
         self._speak_in(lang or DEFAULT_LANG)
         self.session.say(WAKE_LINE[lang] if lang else WAKE_LINE_BOTH)
+
+    # --- Screen buttons (#2, press_button) — Chat U, kept in its own block ---
+    # The kiosk's on-screen buttons she can press for the visitor. The names
+    # must match the screen side (PRESS_BUTTONS, src/lib/screenProtocol.ts);
+    # the kiosk then triggers the same action as a tap (docs/screen-protocol.md,
+    # sections 3 and 5). Pressing vr or mute takes her off the screen, so the
+    # prompt (SCREEN BUTTONS) has her warn the visitor and get a yes first,
+    # and those two answer nothing: whatever she said next would be cut off.
+
+    # What Gemini is told after each press. None: no reply after the tool.
+    _PRESS_ANSWERS = {
+        "contact": "PRESSED: the contact card is now on the screen. Tell the visitor in a few words to look at it.",
+        "unmute": "PRESSED. If the sound was off it is back on; say so in a few words.",
+        "vr": None,
+        "mute": None,
+        "recenter": "PRESSED: the view is recentered. Say so in a few words.",
+        "meeting_room": (
+            "PRESSED: the meeting room is opening over the whole screen. Tell the visitor it is on the screen "
+            "and that the X at the top right closes it."
+        ),
+        "public_meeting": (
+            "PRESSED: the public meeting room is opening over the whole screen. Tell the visitor it is on the "
+            "screen and that the X at the top right closes it."
+        ),
+    }
+
+    # A few spellings Gemini falls into, folded to the canonical names.
+    _PRESS_ALIASES = {
+        "contact_card": "contact",
+        "vr_mode": "vr",
+        "virtual_reality": "vr",
+        "sound": "mute",
+        "recenter_camera": "recenter",
+        "public_meeting_room": "public_meeting",
+        "meeting": "meeting_room",
+        "private_meeting_room": "meeting_room",
+    }
+
+    @function_tool()
+    async def press_button(self, context: RunContext, button: str) -> str | None:
+        """Press one of the kiosk screen's buttons for the visitor, as if they had tapped it.
+
+        Call it only when the visitor asked for that button, or just agreed
+        when you offered to press it. Never press anything on your own. For
+        vr and mute, first warn the visitor as SCREEN BUTTONS says and press
+        only after they agree.
+
+        Args:
+            button: Exactly one of: contact (open the contact card), mute
+                (silence the kiosk; this also suspends you), unmute, vr (turn
+                on the virtual reality view; your video disappears), recenter
+                (recenter the view), meeting_room (open the private meeting
+                room), public_meeting (open the public meeting room).
+        """
+        name = re.sub(r"[^a-z]+", "_", button.strip().lower()).strip("_")
+        name = self._PRESS_ALIASES.get(name, name)
+        if name not in PRESS_BUTTONS:
+            logger.info("press_button: unknown button %r", button)
+            return (
+                f"NOT PRESSED: there is no {button} button you can press. Your buttons are contact, mute, "
+                "unmute, vr, recenter, meeting_room and public_meeting. Tell the visitor you cannot press "
+                "that one and describe what is on the screen instead."
+            )
+        logger.info("press_button: %s", name)
+        self._show(press(name))
+        return self._PRESS_ANSWERS[name]
 
     # --- Video call to staff (#22, staff_call.py) ----------------------------
     # call_staff opens a call room and emails someone a link to it; the kiosk

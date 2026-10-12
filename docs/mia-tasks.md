@@ -111,6 +111,14 @@ New abilities are added as **function tools** on `MiaAgent` in the worker.
   send-once checks as the emails. Off until `GOOGLE_CALENDAR_ID` and the
   service account key are set (setup: `agent-worker/README.md`, "Meeting
   calendar"); she then offers a message instead. `agent-worker/meetings.py`
+- Screen buttons (#2): she knows the kiosk's on-screen buttons (the prompt's
+  SCREEN BUTTONS section) and presses an allow-list of them herself when the
+  visitor asks or agrees (`press_button` → `{"type": "press"}` on
+  `mia.screen`): the contact card, mute/unmute, VR, recenter, both meeting
+  rooms. She warns and waits for a yes before VR and mute, which take her off
+  the screen. The layout of captions, Contact button and cards is tuned in
+  one place, `src/lib/screenLayout.ts` (#3), with before/after screenshots
+  from `tests/screen/shots.mjs`. `docs/screen-protocol.md` sections 3, 5, 9
 
 Tests for all the team tools and goodbye: `agent-worker/test_team_messages.py`
 (text conversations against the real Gemini, emails replaced by recorders).

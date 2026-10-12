@@ -78,6 +78,8 @@ await ctx.room.local_participant.send_text(
 | `contact_card` | `lang?` | Card on the right of the frame: phone, email, address, website, QR code to the website. Closes after 45 s or on ×. Same card as the panel's Contact button. | When her words give the office's phone, email, address or website (`gives_contact_details`, checked in `transcription_node`, so only for speech that is actually played; once per reply). The visitor's own 514 number or email read back doesn't count. Skipped while another card of hers is up (a `message_sent` for 10 s, a draft `project_request` for 180 s), so "you can also call us at…" never replaces them. |
 | `message_sent` | `kind?`, `to?`, `lang?` | Green ✓ card, closes after 10 s. Text by `kind`: `message` "Message sent to {to}", `notify` "{to} has been told you're here", `alert` "The team has been alerted", `suggestion` "Suggestion sent — thank you!", `project_request` "Project request sent", `meeting` "Meeting booked: {to}" (`to` is "{who} · {when}" in her language, e.g. "Nicolas Bastien · Wednesday October 14, 2:30 PM"). Without `to`: "Message sent" / "The team has been told you're here". | When the tool succeeds, before she says so (#3): `take_message` → SENT (`kind` `message`, `to` the person's name, or the general inbox's name in her language: "the general inbox" / "la boîte de réception générale"), `notify_member` → NOTIFIED (`notify`, `to` the person), `alert_emergency` → ALERTED (`alert`, no `to`), `send_suggestion` → SENT (`suggestion`), `book_meeting` → BOOKED (`meeting`). Again when a tool refuses a repeat send ("already sent"), since it is. A project request uses its own card (below), not `kind: project_request`. |
 | `project_request` | `status`, `fields`, `lang?` | The project request form (#20), see below. | `show_project_request` (`draft`) and `submit_project_request` (`sent`). |
+| `directions` | `address`, `maps_url`, `lang?` | Directions card (#7): 📍 the office address and "Scan for directions" with a QR code to `maps_url`, generated client-side (no external QR service at runtime). Same box as the contact card; closes after 45 s or on ×. `maps_url` must be https and ≤ 500 chars or the message is ignored. | The directions tool (Chat B) when the visitor asks where the office is. |
+| `press` | `button` | Mia presses an on-screen button (#2), as if the visitor had tapped it: see section 9. A `button` outside the allow-list is ignored. | `press_button`, only when the visitor asked for it or agreed to it. |
 | `call_open`, `call_close`, `call_answered` | see section 8 | A video call to staff (#22): not a card, the call window on the top page. `call_open` clears the current card. | `call_staff` and the call's outcome, section 8. |
 | `dismiss` | – | Closes the current card. | Not sent today (it closed the old "Calling…" card). |
 
@@ -148,6 +150,7 @@ messages (#22) are in section 8.
 | `{type: "receptionist-visible", visible}` / `{type: "receptionist-mute", muted}` | page → embed | AIWEB shown/hidden. The current tour unloads the frame when hidden, so this matters only for builds that keep it loaded. Shown again also wakes her from resting. |
 | `{type: "receptionist-start"}` | page → embed | AI button tapped while she rests: start a session. |
 | `{type: "receptionist-ended"}` | embed → page | Her session ended on its own (idle / max length / network). She rests: frame stays up with "Tap to talk to {name}", no room. |
+| `{type: "receptionist-press", button}` | embed → page | Mia pressed an on-screen button (#2, section 9) that lives on the top page. The page triggers the same action as a tap: `Controls` handles `mute`, `unmute`, `vr` and `recenter`; `MiaPressRouter` opens the meeting rooms by re-posting the tour's own `hotspot-trigger` message. Same origin only. |
 | `{type: "receptionist-ended", reason: "call"}` | embed → page | Her session ended because a video call to staff was answered (#22): the AI button hides AIWEB instead. |
 | `{type: "receptionist-started"}` | embed → page | A session started (any route). |
 
@@ -163,14 +166,24 @@ Set it in Vercel and redeploy (it is inlined at build time). The name she
 ## 7. Testing without the worker's help
 
 - **Dev server only** (`next dev`): the embed page exposes `window.miaDev`:
-  `miaDev.screen({type: "contact_card"})`, `miaDev.caption("mia", "Bonjour")`,
+  `miaDev.screen({type: "contact_card"})` (any section-3 message: also
+  `directions`, `press`), `miaDev.caption("mia", "Bonjour")`,
   `miaDev.state("paused")`, `miaDev.language("en")`, `miaDev.end()` (ends the
   session as the worker would → resting). Stripped from production builds.
+  Dev builds also read card timeouts from the URL (`?cardMs=1500`,
+  `devTimeout`), so a test need not wait 45 s for a card to close.
 - **Through LiveKit** (any build): `scripts/mia-screen-push.py` joins a kiosk
   room as an extra participant, pushes `mia.screen` messages, sets `mia.*`
   attributes on itself, and prints the `mia.control` taps it receives. The room
   name is in the browser console (`[SimliLK] in room kiosk-…`). Usage in the
   script's docstring.
+- **The screen-test kit** (`tests/screen/`): `run.mjs` checks every
+  `press` button and the directions card, through `miaDev` on the embed alone,
+  then on the full kiosk page (production blocked, the tour's AIWEB frame
+  rewritten to the local site), and with `--livekit` through a real LiveKit
+  room. `shots.mjs` takes the layout screenshots (#3) before/after a change to
+  `src/lib/screenLayout.ts` — the one place the captions', cards' and Contact
+  button's positions live.
 
 ## 8. Video call to staff (#22)
 
@@ -270,3 +283,32 @@ call ends her session, so no limit needs to cover it. Simli's own limits are
 the usual backstop, 30 s behind ours (idle: the longer of the idle timeout and
 `CALL_ANSWER_TIMEOUT`, since she is silent while it rings). One call at a
 time, two per session, once per person unless the visitor asks to try again.
+
+## 9. Screen buttons (#2): `press`
+
+Mia knows the kiosk's on-screen buttons (her prompt's SCREEN BUTTONS section)
+and can press the ones below for the visitor — only when they asked or agreed.
+Her worker's `press_button` tool sends `{"type": "press", "button": …}` on
+`mia.screen`; the embed handles `contact` itself and forwards the rest to the
+top page as `{type: "receptionist-press", button}` (section 5), where the same
+code path as a tap runs. The allow-list lives in `PRESS_BUTTONS`
+(`src/lib/screenProtocol.ts` and `agent-worker/screen_cards.py`, kept equal):
+
+| `button` | The button | A press does | Handled by |
+|---|---|---|---|
+| `contact` | "☎ Contact" on her frame | Opens the contact card (its × or timeout closes it). | The embed itself (no forwarding). |
+| `mute` / `unmute` | Speaker, top of the bottom-left column | Mutes/unmutes all kiosk audio. **Muting also suspends her** (the mute broadcast hides the embed, which ends her session), so her prompt makes her warn and get a yes first; `unmute` can in practice never be pressed by her (muted = she is already gone), but it stays in the list in case mute ever stops suspending her. | `Controls`, absolute (a `mute` while muted does nothing). |
+| `vr` | VR headset, bottom-left column | Enters VR. **3DVista hides web frames in VR**, so her video disappears: she warns and gets a yes first. There is no `vr_exit` — in VR she is unloaded and could never send it. | `Controls` (enter only). |
+| `recenter` | Camera, bottom-left column | Recenters the panorama view. | `Controls`. |
+| `meeting_room` | Meeting-room hotspot in the tour | Opens the private Meeting Room pop-up over the whole screen (its × closes it). | `MiaPressRouter` → the tour's own `hotspot-trigger` `meeting-room` message, so `MeetingModal` needs no change. |
+| `public_meeting` | Public-meeting-room hotspot | Opens the Public Meeting Room pop-up (LiveKit video call) the same way. | `MiaPressRouter` → `hotspot-trigger` `public-meeting`. |
+
+Not pressable, by design: the AI button (bottom right — pressing it would hide
+or wake herself), the tour's website frame ("mal" hotspot), the cards' ×
+buttons, and the banners. She can still *describe* everything a visitor sees;
+what she says about the buttons comes from the prompt's SCREEN BUTTONS section
+— change the screen and that section together.
+
+Where things sit over her video (captions, the Contact button, the cards) is
+tuned in ONE place: `src/lib/screenLayout.ts` (#3). Layout screenshots to
+compare a change: `tests/screen/shots.mjs`.

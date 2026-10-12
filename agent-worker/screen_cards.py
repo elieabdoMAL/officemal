@@ -44,6 +44,18 @@ def project_request(status: str, fields: dict[str, str], lang: str | None) -> di
     return _with_lang({"type": "project_request", "status": status, "fields": fields}, lang)
 
 
+# The on-screen buttons Mia can press herself (#2, worker.py's press_button).
+# Must match PRESS_BUTTONS in src/lib/screenProtocol.ts: the screen ignores a
+# press with any other name.
+PRESS_BUTTONS = ("contact", "mute", "unmute", "vr", "recenter", "meeting_room", "public_meeting")
+
+
+def press(button: str) -> dict:
+    """Mia presses an on-screen button for the visitor (#2): the kiosk then
+    triggers the same action as a tap (docs/screen-protocol.md, section 3)."""
+    return {"type": "press", "button": button}
+
+
 # The office's own details as she says them (mia_prompt.txt, COMPANY
 # KNOWLEDGE), never a visitor's: their 514 number or gmail address read back
 # must not bring up our card.
