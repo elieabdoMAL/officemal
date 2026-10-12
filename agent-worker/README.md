@@ -199,6 +199,55 @@ journalctl -u simli-worker -f
 
 ---
 
+## Meeting calendar
+
+Mia books meetings on **one shared Google Calendar** that the team adds to
+their own calendars (`meetings.py`, tools `check_calendar` / `book_meeting`).
+She never reads anyone's personal calendar: she sees only what is on this one.
+Without the two settings below, booking is off and she offers a message instead.
+
+**1. A Google service account** (Mia's own Google identity). In
+[console.cloud.google.com](https://console.cloud.google.com): pick or create a
+project → APIs & Services → Library → enable **Google Calendar API** →
+IAM & Admin → Service Accounts → Create (name it `mia-calendar`, no roles) →
+open it → Keys → Add key → JSON. Save the file as
+`agent-worker/google-service-account.json` (git- and docker-ignored, never
+commit it). Note its email, `mia-calendar@<project>.iam.gserviceaccount.com`.
+
+**2. The calendar — owned by the service account.** Mobile Apps Labs'
+Workspace does not let staff give an outside account edit rights on their own
+calendars (the menu offers only "See event details"), so a calendar created in
+Google Calendar and shared with Mia does **not** work. Instead the service
+account creates the calendar and shares it into the company, which is allowed:
+`create_calendar.py` (usage in its header) with `you@…=owner` and the team as
+`…=writer`. Everyone listed gets Google's email to add it; writers can move or
+cancel what she booked. It prints the Calendar ID.
+
+The live one (2026-10-12): "Mobile Apps Labs – Meetings",
+`552f6e7a98af8dfd5230c17e53f454458dea10d4cd0039234258da2abfc988c8@group.calendar.google.com`,
+owners mia-calendar and Elie Abdo, writers Alexandre Joset and Nicolas Bastien.
+To add someone later: an owner adds them in Google Calendar (Settings and
+sharing), or run the script again with their address.
+
+**3. Settings.** In `agent-worker/.env`: `GOOGLE_CALENDAR_ID=<the ID>`. Locally
+(`docker run`), mount the key: `-v <path>\google-service-account.json:/app/google-service-account.json:ro`.
+On the server, upload the key next to `docker-compose.yml` in
+`/var/www/officeMal` (the compose file mounts it), add `GOOGLE_CALENDAR_ID` to
+the server `.env`, then `docker compose up -d`.
+
+**How it behaves.** Weekdays 09:00–17:00 Eastern (`OFFICE_HOURS`,
+`CALENDAR_TIMEZONE`), 30-minute meetings by default, nothing sooner than an
+hour from now or more than 60 days ahead. A meeting she books blocks only that
+person (or everyone, for a meeting with the team); **any event the team adds
+by hand blocks everyone**, so to close a slot or a day, just put an event on
+the calendar. Each event she books says who the visitor is, how to reach them,
+who it is with and what it is about. Max 2 bookings per conversation.
+
+Tests: `test_meetings.py` (offline logic, and conversations against the real
+Gemini with a fake calendar — no Google account needed).
+
+---
+
 ## Notes
 
 - The worker reads `LIVEKIT_URL/API_KEY/API_SECRET` from the environment

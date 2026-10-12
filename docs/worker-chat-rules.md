@@ -22,9 +22,9 @@ merges your branch. Read this file, `docs/feedback-2026-10-09.md`, and
 
 ## Never
 - Talk to production from a test. The 3DVista tour (`public/3dvista`) loads
-  Linda's frame from the absolute production URL
+  Mia's frame from the absolute production URL
   (`https://officemal.mobileappslabs.ca/receptionist-embed`), so a local test
-  of the full kiosk page talks to the LIVE Linda, whose emails reach real
+  of the full kiosk page talks to the LIVE Mia, whose emails reach real
   staff (this happened on 2026-10-09). Any test that loads `/` must block or
   reroute requests to `officemal.mobileappslabs.ca` (Playwright `page.route`)
   and verify the AIWEB frame is the local one before speaking. Testing

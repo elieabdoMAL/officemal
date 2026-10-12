@@ -143,6 +143,11 @@ const SENT: Record<SentKind, { to: (n: string) => Bilingual; plain: Bilingual }>
     to: () => ({ fr: "Demande de projet envoyée", en: "Project request sent" }),
     plain: { fr: "Demande de projet envoyée", en: "Project request sent" },
   },
+  // `to` is "{who} · {when}", already in her language (worker's book_meeting).
+  meeting: {
+    to: (n) => ({ fr: `Rendez-vous réservé : ${n}`, en: `Meeting booked: ${n}` }),
+    plain: { fr: "Rendez-vous réservé", en: "Meeting booked" },
+  },
 };
 
 function MessageSentCard({

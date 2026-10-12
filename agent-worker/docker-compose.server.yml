@@ -19,6 +19,11 @@ services:
     env_file: .env
     restart: unless-stopped
     pull_policy: always
+    volumes:
+      # Mia's meeting calendar (meetings.py): the Google service account key,
+      # uploaded next to this file. Upload it BEFORE `up -d`: if it is missing,
+      # Docker creates an empty folder here and booking stays off.
+      - ./google-service-account.json:/app/google-service-account.json:ro
     labels:
       # Only containers with this label are managed by Watchtower below, so it
       # will NEVER touch looking4-api / l4-api-db or anything else on the host.
