@@ -18,6 +18,14 @@ TOPIC_CONTROL = "mia.control"  # screen -> worker
 # call us at ..." mustn't replace "Message sent" or the project form.
 SENT_CARD_S = 10.0
 DRAFT_CARD_S = 180.0
+# The directions card (#7, round 2) stays up like the contact card; saying the
+# address while it shows must not have the contact card replace it.
+DIRECTIONS_CARD_S = 45.0
+
+# What the directions card shows (#7): the address and a QR code to Google
+# Maps, drawn by the screen (docs/screen-protocol.md section 3).
+OFFICE_ADDRESS = "74 rue Turgeon, Sainte-Thérèse, QC"
+OFFICE_MAPS_URL = "https://www.google.com/maps/search/?api=1&query=74+rue+Turgeon+Sainte-Th%C3%A9r%C3%A8se+QC"
 
 
 def _with_lang(msg: dict, lang: str | None) -> dict:
@@ -42,6 +50,11 @@ def message_sent(kind: str, lang: str | None, to: str = "") -> dict:
 def project_request(status: str, fields: dict[str, str], lang: str | None) -> dict:
     """status: draft (for the visitor to check) | sent."""
     return _with_lang({"type": "project_request", "status": status, "fields": fields}, lang)
+
+
+def directions_card(lang: str | None) -> dict:
+    """The way to the office (#7): the address and a QR code to Google Maps."""
+    return _with_lang({"type": "directions", "address": OFFICE_ADDRESS, "maps_url": OFFICE_MAPS_URL}, lang)
 
 
 # The office's own details as she says them (mia_prompt.txt, COMPANY

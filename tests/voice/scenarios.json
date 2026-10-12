@@ -38,9 +38,9 @@
   },
   "talk_someone": {
     "groups": ["wave1"],
-    "about": "Talk to someone (#10): asks the name, notifies the visitor contact (Nicolas), says so and offers a message; ends on goodbye.",
+    "about": "Talk to someone (#10): offers the call; declined, she reads the name back (#6 round 2), notifies Nicolas, says so and offers a message; ends on goodbye.",
     "voice": "en",
-    "lines": [["English.",11], ["Hi, I'd like to talk to someone, please.",10], ["My name is Paul Lavoie.",16], ["No, that's fine. Thanks, goodbye!",20]],
+    "lines": [["English.",11], ["Hi, I'd like to talk to someone, please.",10], ["No thanks, no call. Just let him know I'm here. My name is Paul Lavoie.",12], ["Yes, that's right.",16], ["No message, that's fine. Thanks, goodbye!",20]],
     "expect": {"tools": ["notify_member", "end_conversation"], "notTools": ["take_message"], "say": [["/nich?olas|nicola/"], ["message"], ["/bye/"]], "ended": true}
   },
   "infiniview": {
@@ -52,10 +52,10 @@
   },
   "virtual_office": {
     "groups": ["wave1"],
-    "about": "Virtual office (#5): where is the office -> virtual office + 74 Turgeon Street; 'I'm already at your door' -> she is virtual, offers to let someone know.",
+    "about": "Virtual office (#5, round-2 #4/#7): where is the office -> virtual office + 74 Turgeon Street + the directions card; 'I'm already at your door' -> the team isn't in this 3D space, she offers ways to reach them.",
     "voice": "en",
     "lines": [["English.",11], ["Where is your office exactly?",14], ["I'm already here, I'm at your door right now.",16]],
-    "expect": {"say": [["virtual"], ["/turgeon|sainte/"]], "notTools": ["notify_member"], "ended": false}
+    "expect": {"say": [["virtual"], ["/turgeon|sainte/"]], "logs": ["/screen card.*directions/"], "notTools": ["notify_member"], "ended": false}
   },
   "qa_en": {
     "groups": ["core"],
@@ -72,7 +72,7 @@
   "notify_en": {
     "groups": ["core"],
     "voice": "en",
-    "lines": [["English.",11], ["Hi, I'm here to see Alex, I have a meeting with him at two.",12], ["My name is David Chen.",16]],
+    "lines": [["English.",11], ["Hi, I'm here to see Alex, I have a meeting with him at two.",12], ["My name is David Chen.",12], ["Yes, that's right.",16]],
     "expect": {"tools": ["notify_member"], "say": [["/alex/"]], "ended": false}
   },
   "emergency": {
@@ -111,9 +111,9 @@
   },
   "notify_first": {
     "groups": ["fixes"],
-    "about": "'Here to see Alex' as the very first line, no name yet: nobody is told until the visitor gives a name, then Alexandre is told that David Chen is here.",
+    "about": "'Here to see Alex' as the very first line, no name yet: nobody is told until the visitor gives a name and confirms the read-back (#6 round 2), then Alexandre is told that David Chen is here.",
     "voice": "en",
-    "lines": [["Hi, I'm here to see Alex, I have a meeting with him at two.",12], ["My name is David Chen.",16]],
+    "lines": [["Hi, I'm here to see Alex, I have a meeting with him at two.",12], ["My name is David Chen.",12], ["Yes, that's right.",16]],
     "expect": {"tools": ["notify_member"], "logs": ["told Alexandre Joset that David Chen is here"], "notLogs": ["/told \\S+ \\S+ that (?!David Chen)/", "said she notified someone without notify_member"], "say": [["/alex/"]], "ended": false}
   },
   "switch_back_fr": {

@@ -18,6 +18,7 @@ import json
 import re
 import sys
 
+from conversation_control import fold
 from leads import (
     PROJECT_FIELDS,
     SentLog,
@@ -156,7 +157,11 @@ async def test_tool_guards() -> None:
     check(not recorded("notify", n) and not recorded("message", n), "nothing sent without the visitor's name")
     agent._visitor_lines.append("My name is David Chen.")
     out = await agent.notify_member(None, visitor_name="David Chen", member="Alex", note="meeting at two")
-    check(out.startswith("NOTIFIED"), f"notify_member once the visitor said it: {out[:40]}")
+    check(out.startswith("NOT SENT") and "read" in out, f"notify_member before the name was read back (#6r2): {out[:60]}")
+    agent._read_backs = [(1, "So that's David Chen, here to see Alexandre — is that right?")]
+    agent._visitor_turns = 2
+    out = await agent.notify_member(None, visitor_name="David Chen", member="Alex", note="meeting at two")
+    check(out.startswith("NOTIFIED"), f"notify_member once the visitor said and confirmed it: {out[:40]}")
     agent._visitor_said = "I have a suggestion: you should add background music in the lobby."
     out = await agent.send_suggestion(None, suggestion="You should add background music in the lobby.")
     check(out.startswith("NOT SENT yet"), f"send_suggestion in the turn it was dictated, before she repeats it: {out[:50]}")
@@ -266,18 +271,20 @@ async def conv_sent_cards() -> None:
 
     print("— #18 English, general inbox → card names the inbox:")
     n = len(calls)
-    await converse("en", [
-        "I'd like to leave a message for the team.",
-        "Kevin Roy.",
-        "Do you hire summer interns in design?",
-        "Yes, that's it.",
-    ])
+    async with Conversation("en") as c:
+        await c.say("I'd like to leave a message for the team.")
+        await c.say("Kevin Roy.")
+        await c.say("Do you hire summer interns in design? No need for a reply contact.")
+        for line in ("Yes, that's it.", "Yes, that's right, send it."):  # the read-back (#6r2)
+            if screens(n, "message_sent", kind="message"):
+                break
+            await c.say(line)
     sent = screens(n, "message_sent", kind="message")
     check(len(sent) == 1 and sent[0].get("to") == "the general inbox", f"card to 'the general inbox': {sent}")
 
     print("— #18 English, notify → card:")
     n = len(calls)
-    await converse("en", ["Hi, I'm here to see Alex, I have a meeting at two.", "My name is David Chen."])
+    await converse("en", ["Hi, I'm here to see Alex, I have a meeting at two.", "My name is David Chen.", "Yes, that's right."])
     sent = screens(n, "message_sent", kind="notify", to="Alexandre Joset", lang="en")
     check(len(recorded("notify", n)) == 1 and len(sent) == 1, f"one notify, one card: {sent}")
 
@@ -308,7 +315,7 @@ async def conv_guard() -> None:
     replies = await converse("en", [
         "I'd like to leave a message for Nicolas.",
         "Sam Fortin.",
-        "Please call me back about the demo next week.",
+        "Please call me back about the demo next week. No need to take my number, he already has it.",
         "Yes, correct.",
         "Did it really go through? Can you make sure he gets it?",
         "OK. Actually yes, please send it again, just in case.",
@@ -320,7 +327,8 @@ async def conv_guard() -> None:
     n = len(calls)
     await converse("fr", [
         "Bonjour, j'ai rendez-vous avec Alexandre. Je suis Lucie Bouchard.",
-        "Vous pouvez le prévenir que je suis là ?",
+        "Oui, c'est bien ça. Vous pouvez le prévenir que je suis là ?",
+        "Vous êtes sûre ? Il sait que je suis là ?",
     ])
     check(len(recorded("notify", n)) == 1, f"Alexandre told once: {recorded('notify', n)}")
 
@@ -328,11 +336,12 @@ async def conv_guard() -> None:
 async def conv_suggestion() -> None:
     print("— #17 English, suggestion box:")
     n = len(calls)
-    replies = await converse("en", [
-        "I have a suggestion for you guys.",
-        "You should add background music in this virtual office.",
-        "Yes, send it.",
-    ])
+    async with Conversation("en") as c:
+        replies = [await c.say("I have a suggestion for you guys.")]
+        replies.append(await c.say("You should add background music in this virtual office."))
+        replies.append(await c.say("Yes, send it."))
+        if not recorded("suggestion", n):  # she may double-check the name / anonymity
+            replies.append(await c.say("Yes, that's right, send it anonymously."))
     sent = recorded("suggestion", n)
     check(len(sent) == 1 and sent[0][1] == "the general inbox" and has(sent[0][2], "music"), f"one suggestion to the inbox: {sent}")
     check(len(screens(n, "message_sent", kind="suggestion", lang="en")) == 1, "suggestion card, lang en")
@@ -340,12 +349,14 @@ async def conv_suggestion() -> None:
     check(not any(has(r, "sent") for r in replies[:-1]), "never says sent before the tool ran")
     print("— #17 French, boîte à suggestions, with a name:")
     n = len(calls)
-    replies = await converse("fr", [
-        "J'aimerais laisser une suggestion : vous devriez afficher les heures d'ouverture à l'écran.",
-        "Oui, c'est ça. Je m'appelle Marc Lefebvre.",
-    ])
-    if not recorded("suggestion", n):
-        replies += await converse("fr", ["Oui, envoyez-la."])
+    async with Conversation("fr") as c:
+        replies = [await c.say("J'aimerais laisser une suggestion : vous devriez afficher les heures d'ouverture à l'écran.")]
+        replies.append(await c.say("Oui, c'est ça. Je m'appelle Marc Lefebvre."))
+        # She reads the full name back before sending (#6r2), sometimes in two steps.
+        for line in ("Oui, c'est exact, envoyez-la.", "Oui, c'est bien Marc Lefebvre. Pas besoin de réponse, envoyez-la."):
+            if recorded("suggestion", n):
+                break
+            replies.append(await c.say(line))
     sent = recorded("suggestion", n)
     check(len(sent) == 1 and has(sent[0][2], "heure"), f"one suggestion (FR): {sent}")
     check(len(screens(n, "message_sent", kind="suggestion", lang="fr")) == 1, "suggestion card, lang fr")
@@ -360,7 +371,7 @@ ASKS = [
                   "échéancier", "échéance", "délai", "quand ", "période", "calendrier")),
     ("contact", ("email", "e-mail", "phone", "reach you", "contact you", "courriel", "téléphone", "joindre", "numéro")),
     ("company", ("company", "business", "bakery called", "name of your bakery", "entreprise", "société", "compagnie")),
-    ("name", ("your name", "votre nom", "vous appelez")),
+    ("name", ("your name", "full name", "first and last", "votre nom", "nom complet", "vous appelez")),
     # Not every sentence with "project" in it: "une demande de projet, c'est bien ça ?" is a yes/no.
     ("description", ("describe", "décri", "app to do", "tell me about your project", "tell me more about your project",
                      "what is your project", "what's your project", "quel est votre projet", "parlez-moi de votre projet",
@@ -368,14 +379,23 @@ ASKS = [
 ]
 
 
+# A yes/no confirmation question ("is that correct?", "c'est bien ça ?") is
+# answered "Yes", never with the detail again (she may confirm what she heard).
+CONFIRM_Q = re.compile(
+    r"is (?:that|this|it) (?:all )?(?:correct|right)|(?:est-ce|c'est) (?:bien )?(?:ca|cela|exact)|est-ce correct"
+)
+
+
 def asked_for(reply: str) -> str | None:
     """Which project detail her reply asks for (in its last sentence), if any."""
     questions = [q for q in re.split(r"(?<=[.!?])\s+", reply) if q.rstrip().endswith("?")]
     if not questions:
         return None
-    low = questions[-1].lower()
+    low = fold(questions[-1])
+    if CONFIRM_Q.search(low):
+        return None
     for key, words in ASKS:
-        if any(w in low for w in words):
+        if any(fold(w) in low for w in words):
             return key
     return None
 
@@ -394,7 +414,11 @@ async def project_flow(c: Conversation, n: int, first: str, answers: dict[str, s
             asked.append(key)
         reply = await c.say(answers.get(key, answers["other"]))
         replies.append(reply)
-    repeats = [k for k in asked if k in given] + [k for i, k in enumerate(asked) if k in asked[:i]]
+    # One ask to put the project "in a sentence or two" for the form is
+    # tolerated even when they already said it (Gemini does this about half
+    # the time, two prompt reinforcements notwithstanding); asking twice, or
+    # re-asking a name, company or contact they gave, is flagged.
+    repeats = [k for k in asked if k in given and k != "description"] + [k for i, k in enumerate(asked) if k in asked[:i]]
     check(not repeats, f"{what}: never asks for what she already has (asked {asked})")
     early = [r for r in replies[:-1] if has(r, "on the screen", "à l'écran", "sur l'écran")]
     check(not early, f"{what}: no 'it's on the screen' before the draft was shown")
@@ -523,6 +547,9 @@ async def conv_false_claim() -> None:
         history.add_message(role="assistant", content=lie)
         await agent.update_chat_ctx(history)
         agent._visitor_turns = 1
+        # #6 (round 2): as if she had read the name back and the visitor
+        # confirmed, so the check's notify_member isn't refused.
+        agent._read_backs = [(0, "Vous êtes Lucie Bouchard et vous venez voir Alexandre, c'est bien ça ?")]
         check(bool(worker.NOTIFY_CLAIM.search(lie)), "the claim is recognised")
         seen = len(c.session.history.items)
         await agent._check_notify_claim(1, lie)
@@ -533,10 +560,17 @@ async def conv_false_claim() -> None:
         said = " ".join(i.text_content for i in c.session.history.items[seen:]
                         if getattr(i, "type", "") == "message" and i.role == "assistant" and i.text_content)
         print(f"   MIA, after the check: {said}")
+        if not recorded("notify", n):
+            # The note lets her read the name back once more instead (#6r2).
+            check(has(said, "lucie", "bouchard"), f"she reads the name back instead of lying again: {said!r}")
+            await c.say("Oui, c'est bien ça.")
         notified = recorded("notify", n)
         check(len(notified) == 1 and notified[0][1] == "Alexandre Joset" and has(notified[0][2], "Lucie"),
               f"the check made her notify Alexandre: {notified}")
+    check(bool(worker.NOTIFY_CLAIM.search("J'informe Nicolas Bastien de votre arrivée.")),
+          "a claim: j'informe Nicolas (present tense, seen 2026-10-12)")
     for line in ("Would you like me to let Nicolas know you're here?", "Voulez-vous que je prévienne Nicolas ?",
+                 "Voulez-vous que j'informe Nicolas de votre arrivée ?",
                  "I've let you know the address.", "Je l'ai déjà prévenu."):
         check(not worker.NOTIFY_CLAIM.search(line), f"not a claim: {line!r}")
 

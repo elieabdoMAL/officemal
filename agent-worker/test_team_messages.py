@@ -269,13 +269,18 @@ async def conv_notify() -> None:
     replies = await converse("en", [
         "Hi, I'm here to see Alex, I have a meeting with him at two.",
         "My name is David Chen.",
+        "Yes, that's right.",
     ])
     # Seen in testing: "I've let Alex know you're here" with no name and no tool call.
     assert not any(w in replies[0].lower() for w in ("i've let", "i have let", "let alex")), f"claimed to notify before having the name: {replies[0]!r}"
+    # #6 (round 2): the name is read back and confirmed before anyone is told.
+    assert "chen" in replies[1].lower(), f"the name must be read back before sending: {replies[1]!r}"
     notified = kinds("notify")
     assert len(notified) == 1, f"expected one notification: {calls}"
     assert notified[0][1] == "Alexandre Joset" and "Chen" in notified[0][2], notified
-    print(f"✓ one notification recorded: {notified[0]}")
+    # Never a promise on Alexandre's behalf (boss, 2026-10-12).
+    assert not any(w in replies[2].lower() for w in ("will get back", "will call you back", "va vous revenir")), f"promised on his behalf: {replies[2]!r}"
+    print(f"✓ one notification recorded, after a read-back: {notified[0]}")
 
     print("— French, here to see someone not on the team:")
     replies = await converse("fr", ["Bonjour, je suis Sophie Martin, j'ai rendez-vous avec Marc Dupont."])

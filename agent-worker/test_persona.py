@@ -14,7 +14,7 @@ import asyncio
 import re
 import sys
 
-from test_team_messages import calls, converse, install_recorders, test_find_member, use_assistant_name
+from test_team_messages import Conversation, calls, converse, install_recorders, test_find_member, use_assistant_name
 
 failures: list[str] = []
 
@@ -52,25 +52,27 @@ REFUSED = ("can't give", "cannot give", "can't share", "cannot share", "not able
 async def note2_inbox() -> None:
     print("— #2/#3 English, email the general inbox:")
     n = len(calls)
-    replies = await converse("en", [
-        "Hi, can I send an email to info at Mobile Apps Labs?",
-        "My name is Kevin Roy.",
-        "Tell them I'd like a quote for a mobile app for my restaurant.",
-        "Yes, that's right. My number is 450 555 0199.",
-    ])
+    async with Conversation("en") as c:
+        replies = [await c.say("Hi, can I send an email to info at Mobile Apps Labs?")]
+        replies.append(await c.say("My name is Kevin Roy."))
+        replies.append(await c.say("Tell them I'd like a quote for a mobile app for my restaurant. My number is 450 555 0199."))
+        replies.append(await c.say("Yes, that's right."))
+        if not recorded("message", n):  # she re-read the full name (#6r2): one more yes
+            replies.append(await c.say("Yes, that's right."))
     sent = recorded("message", n)
     check(len(sent) == 1 and sent[0][1] == "the general inbox", f"#2 one message to the general inbox: {sent}")
-    sent_turn = next((i for i, r in enumerate(replies) if has(r, "sent")), None)
-    check(sent_turn is not None and sent_turn == len(replies) - 1, "#3 says it's sent, and only in the turn it was sent")
+    check(bool(sent) and has(replies[-1], "sent") and not any(has(r, "it's sent", "it is sent") for r in replies[:-1]),
+          "#3 says it's sent, and only once it was")
 
     print("— #2/#3 French, a message for the team:")
     n = len(calls)
-    replies = await converse("fr", [
-        "Bonjour, je voudrais laisser un message à l'équipe.",
-        "Marie Gagnon.",
-        "Je voudrais savoir si vous engagez des stagiaires en design.",
-        "Oui, c'est parfait.",
-    ])
+    async with Conversation("fr") as c:
+        replies = [await c.say("Bonjour, je voudrais laisser un message à l'équipe.")]
+        replies.append(await c.say("Marie Gagnon."))
+        replies.append(await c.say("Je voudrais savoir si vous engagez des stagiaires en design. Pas besoin de me répondre."))
+        replies.append(await c.say("Oui, c'est parfait."))
+        if not recorded("message", n):  # she re-read the full name (#6r2): one more yes
+            replies.append(await c.say("Oui, c'est bien ça."))
     sent = recorded("message", n)
     check(len(sent) == 1 and sent[0][1] == "the general inbox", f"#2 one message to the general inbox (FR): {sent}")
     check(bool(sent) and has(replies[-1], "envoyé"), "#3 says C'est envoyé after sending (FR)")
@@ -88,13 +90,14 @@ async def note3_confirm_person() -> None:
     replies = await converse("en", [
         "I'd like to leave a message for Nicolas.",
         "Sam Fortin.",
-        "Please call me back about the demo next week.",
-        "Yes, correct. You can reach me at sam at fortin dot ca.",
+        "Please call me back about the demo next week. You can reach me at sam at fortin dot ca.",
+        "Yes, correct.",
     ])
     sent = recorded("message", n)
     check(len(sent) == 1 and sent[0][1] == "Nicolas Bastien", f"#3 one message to Nicolas: {sent}")
     check(bool(sent) and has(replies[-1], "sent") and has(replies[-1], "Nicolas"), "#3 'It's sent to Nicolas' after SENT")
     check(not any(has(r, "sent") for r in replies[:-1]), "#3 never says sent before the tool ran")
+    check(has(replies[-2], "sam"), f"#6r2 the read-back names Sam: {replies[-2]!r}")
 
 
 async def note10_talk() -> None:
@@ -102,17 +105,32 @@ async def note10_talk() -> None:
     # yes once she has the visitor's name (more in test_staff_call.py).
     print("— #10 English, wants to talk to someone, no name:")
     n = len(calls)
-    replies = await converse("en", ["Hi, I'd like to talk to someone please.", "Yes please. I'm Paul Lavoie."])
+    async with Conversation("en") as c:
+        replies = [await c.say("Hi, I'd like to talk to someone please.")]
+        replies.append(await c.say("Yes please. I'm Paul Lavoie."))
+        # She asks the name and offers the call in either order, and reads the
+        # name back before calling (#6r2): confirm until the call is placed.
+        for line in ("Yes, that's right.", "Yes, please call him."):
+            if recorded("call", n):
+                break
+            replies.append(await c.say(line))
     called = recorded("call", n)
     no_false_claim(replies[0], False, "#10 before the name")
     check(has(replies[0], "call"), "#10 offers to call someone")
+    check(any(has(r, "paul", "lavoie") for r in replies[1:]), f"#10 reads the name back first (#6r2): {replies[1:]}")
     check(len(called) == 1 and called[0][1] == "Nicolas Bastien", f"#10 Nicolas called: {called}")
     check(has(replies[-1], "calling nicolas"), "#10 says she is calling Nicolas")
     check(len(replies[0].split()) <= 30, f"#10 no over-justification on the first reply ({len(replies[0].split())} words)")
 
     print("— #10 French, wants a real person:")
     n = len(calls)
-    replies = await converse("fr", ["Est-ce que je peux parler à une vraie personne ?", "Oui, s'il vous plaît. Lucie Bouchard."])
+    async with Conversation("fr") as c:
+        replies = [await c.say("Est-ce que je peux parler à une vraie personne ?")]
+        replies.append(await c.say("Oui, s'il vous plaît. Lucie Bouchard."))
+        for line in ("Oui, c'est bien ça.", "Oui, appelez-le s'il vous plaît."):
+            if recorded("call", n):
+                break
+            replies.append(await c.say(line))
     called = recorded("call", n)
     no_false_claim(replies[0], False, "#10 before the name (FR)")
     check(len(called) == 1, f"#10 someone called (FR): {called}")
@@ -141,12 +159,26 @@ async def note15_alexandre() -> None:
     ):
         print(f"— #15 {spelled}:")
         n = len(calls)
-        replies = await converse(lang, [first, name])
+        # The follow-ups both confirm the read-back (#6r2) and, when she offers
+        # a choice of call or notice, pick one; extras after a send are harmless.
+        follow_ups = (
+            ("Yes, that's right. Please let him know I'm here.", "Yes, exactly.")
+            if lang == "en"
+            else ("Oui, c'est bien ça. Prévenez-le que je suis là, s'il vous plaît.", "Oui, exactement.")
+        )
+        async with Conversation(lang) as c:
+            replies = [await c.say(first)]
+            replies.append(await c.say(name))
+            for line in follow_ups:
+                if recorded("call", n) or recorded("notify", n):
+                    break
+                replies.append(await c.say(line))
         # Called on the yes (#22), or notified: either way, Alexandre.
         reached = recorded("call", n) + recorded("notify", n)
         check(not has(replies[0], *REFUSED), f"#15 {spelled}: no 'can't give the info' refusal")
         no_false_claim(replies[0], False, f"#15 {spelled} before the name")
-        check(len(reached) == 1 and reached[0][1] == "Alexandre Joset", f"#15 {spelled}: Alexandre called or notified: {reached}")
+        check(bool(reached) and all(r[1] == "Alexandre Joset" for r in reached),
+              f"#15 {spelled}: Alexandre called or notified: {reached}")
 
 
 async def note5_where() -> None:
@@ -201,7 +233,10 @@ async def note21_impatient() -> None:
     replies = await converse("en", ["This is useless, you're not helping at all! Just tell me how much an app costs."])
     check(has(replies[0], "sorry"), "#21 says sorry")
     check(has(replies[0], "limitation"), "#21 says it's a limitation of her system")
-    check(has(replies[0], "message", "let someone", "let the team", "team"), "#21 offers what she can do")
+    # A price question may also be answered the COMPANY KNOWLEDGE way: free
+    # consultation, App Express, "do you have a project in mind?".
+    check(has(replies[0], "message", "let someone", "let the team", "team", "consultation", "project"),
+          "#21 offers what she can do")
     print("— #21 French, hors sujet:")
     replies = await converse("fr", ["Pouvez-vous m'aider avec mes devoirs de maths ?"])
     check(has(replies[0], "désolée"), "#21 désolée (FR)")

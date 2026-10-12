@@ -7,6 +7,7 @@ her text goes through before the TTS.
     language_choice(text)             "English please" at the start: which language they chose
     language_switch(text, current)    "je veux parler en anglais" later: which language to switch to
     visitor_said_name(name, lines)    a visitor_name a tool is given is one the visitor actually said
+    contact_read_back(contact, texts) a phone or email was read back in one of her replies (#6)
     speak_digits(text, lang)          "514 573 2324" -> "five one four, five seven three, ..."
 
 Everything here is pure (no LiveKit), so test_conversation_control.py checks it
@@ -367,6 +368,51 @@ def visitor_said_name(name: str, visitor_lines: list[str], assistant_name: str =
         or (len(w) > 2 and any(difflib.SequenceMatcher(None, w, h).ratio() >= NAME_MATCH_RATIO for h in heard))
         for w in words
     )
+
+
+# ---------------------------------------------------------------------------
+# Read-backs (#6, round 2): a phone number or email she is about to send must
+# have been read back to the visitor first. Whether a name was read back is
+# visitor_said_name over her replies; this checks the contact.
+# ---------------------------------------------------------------------------
+
+# "sam at fortin dot ca" (and French "arobase" / "point") said out loud.
+_CONTACT_AT = re.compile(r"\b(?:at|arobase|arrobase)\b")
+_CONTACT_DOT = re.compile(r"\b(?:dot|point)\b")
+
+
+def _squash_email(text: str) -> str:
+    """Fold an email however it was said or written: "Sam at Fortin dot CA"
+    and "sam@fortin.ca" both become "sam@fortin.ca"."""
+    t = _CONTACT_AT.sub("@", fold(text))
+    t = _CONTACT_DOT.sub(".", t)
+    return re.sub(r"[\s,;:]+", "", t)
+
+
+def _contact_digits(text: str) -> str:
+    """Every digit of `text`, written as digits or as digit words (EN/FR)."""
+    by_word = {w: str(d) for words in DIGIT_WORDS.values() for d, w in enumerate(words)}
+    by_word["oh"] = "0"  # "five oh one"
+    out = []
+    for w in re.findall(r"[a-z]+|\d+", fold(text)):
+        if w.isdigit():
+            out.append(w)
+        elif w in by_word:
+            out.append(by_word[w])
+    return "".join(out)
+
+
+def contact_read_back(contact: str, texts: list[str]) -> bool:
+    """True when `contact` (a phone number or email) was said in one of
+    `texts`: written out, spoken digit by digit, or spelled "at ... dot".
+    Something too short or odd to check reliably counts as read back."""
+    squashed = _squash_email(contact)
+    if "@" in squashed:
+        return any(squashed in _squash_email(t) for t in texts)
+    digits = _contact_digits(contact)
+    if len(digits) < 5:
+        return True  # an extension or a street number: not worth a loop
+    return any(digits in _contact_digits(t) for t in texts)
 
 
 # ---------------------------------------------------------------------------
