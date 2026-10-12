@@ -214,14 +214,20 @@ open it → Keys → Add key → JSON. Save the file as
 `agent-worker/google-service-account.json` (git- and docker-ignored, never
 commit it). Note its email, `mia-calendar@<project>.iam.gserviceaccount.com`.
 
-**2. The calendar.** In Google Calendar, Other calendars → + → Create new
-calendar, e.g. "Mobile Apps Labs – Meetings", time zone Eastern (Toronto).
-Then its Settings and sharing:
-- Share with specific people → add the service account's email with
-  **Make changes to events**. That is all Mia needs.
-- Add Alexandre and Nicolas (**Make changes to events** too, so they can move
-  or cancel what she booked). They get an email to add it to their calendar.
-- Integrate calendar → copy the **Calendar ID** (`…@group.calendar.google.com`).
+**2. The calendar — owned by the service account.** Mobile Apps Labs'
+Workspace does not let staff give an outside account edit rights on their own
+calendars (the menu offers only "See event details"), so a calendar created in
+Google Calendar and shared with Mia does **not** work. Instead the service
+account creates the calendar and shares it into the company, which is allowed:
+`create_calendar.py` (usage in its header) with `you@…=owner` and the team as
+`…=writer`. Everyone listed gets Google's email to add it; writers can move or
+cancel what she booked. It prints the Calendar ID.
+
+The live one (2026-10-12): "Mobile Apps Labs – Meetings",
+`552f6e7a98af8dfd5230c17e53f454458dea10d4cd0039234258da2abfc988c8@group.calendar.google.com`,
+owners mia-calendar and Elie Abdo, writers Alexandre Joset and Nicolas Bastien.
+To add someone later: an owner adds them in Google Calendar (Settings and
+sharing), or run the script again with their address.
 
 **3. Settings.** In `agent-worker/.env`: `GOOGLE_CALENDAR_ID=<the ID>`. Locally
 (`docker run`), mount the key: `-v <path>\google-service-account.json:/app/google-service-account.json:ro`.
