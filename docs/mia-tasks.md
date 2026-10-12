@@ -98,6 +98,19 @@ New abilities are added as **function tools** on `MiaAgent` in the worker.
   notice, alert or suggestion is sent; the project request draft and "sent"
   card. Tapping the "say my name" banner resumes her like her name does;
   tapping the "tap to talk" hint gets a short "Yes? How can I help?"
+- Book a meeting (#8): on ONE shared Google Calendar the team subscribes to,
+  never anyone's personal calendar. `check_calendar` gives her the free times
+  for a day ("tomorrow", "jeudi", "October 14") and a person or the team; she
+  offers two or three, collects the visitor's name and email or phone and an
+  optional topic, reads it all back (and asks for a spelling when unsure of a
+  name), and on their yes `book_meeting` creates the event (who, contact,
+  topic in its description) and shows a "Meeting booked" card. Weekdays
+  09:00–17:00 Eastern, 30 min by default, at least an hour ahead, at most 60
+  days; a meeting blocks that person (the team: everyone), an event added by
+  hand blocks everyone. Max 2 per conversation, same visitor-name and
+  send-once checks as the emails. Off until `GOOGLE_CALENDAR_ID` and the
+  service account key are set (setup: `agent-worker/README.md`, "Meeting
+  calendar"); she then offers a message instead. `agent-worker/meetings.py`
 
 Tests for all the team tools and goodbye: `agent-worker/test_team_messages.py`
 (text conversations against the real Gemini, emails replaced by recorders).
@@ -105,6 +118,9 @@ Suggestions, project requests, screen cards, the send-once guard and the
 screen taps: `agent-worker/test_leads.py`, same harness.
 Persona checks for the boss's notes of 2026-10-09, one scenario per note:
 `agent-worker/test_persona.py`, same harness.
+Meetings (#8): `agent-worker/test_meetings.py` (day/time reading and free
+slots offline; booking conversations against the real Gemini with a fake
+calendar).
 The video call (#22): `agent-worker/test_staff_call.py` (call room, tokens,
 link, email, call states and guards offline; offer, call, no answer, cancel,
 answered against Gemini), and `tests/voice/call.mjs` (the full kiosk page and
@@ -160,8 +176,10 @@ Mia would receive the state from the kiosk and react only to it. Standby after
 20 seconds of silence (today: 2 minutes, `SESSION_IDLE_TIMEOUT`).
 
 ### 8. Book a meeting / open the door
-Calendar booking, and remote door control. Both need decisions on systems and
-permissions first.
+Booking: *done* on a shared meeting calendar (see Works today). Later: check
+the team's real availability (task 3) instead of only this calendar, and email
+the person a notice when she books. Remote door control still needs decisions
+on systems and permissions first.
 
 ### 9. Mia in VR — *built, parked*
 3DVista hides web frames (AIWEB) in VR, but draws video hotspots. The code is

@@ -31,7 +31,7 @@ def contact_card(lang: str | None) -> dict:
 
 
 def message_sent(kind: str, lang: str | None, to: str = "") -> dict:
-    """kind: message | notify | alert | suggestion | project_request.
+    """kind: message | notify | alert | suggestion | project_request | meeting.
     to: a display name ("Nicolas Bastien"), never an address."""
     msg = {"type": "message_sent", "kind": kind}
     if to:

@@ -199,6 +199,49 @@ journalctl -u simli-worker -f
 
 ---
 
+## Meeting calendar
+
+Mia books meetings on **one shared Google Calendar** that the team adds to
+their own calendars (`meetings.py`, tools `check_calendar` / `book_meeting`).
+She never reads anyone's personal calendar: she sees only what is on this one.
+Without the two settings below, booking is off and she offers a message instead.
+
+**1. A Google service account** (Mia's own Google identity). In
+[console.cloud.google.com](https://console.cloud.google.com): pick or create a
+project → APIs & Services → Library → enable **Google Calendar API** →
+IAM & Admin → Service Accounts → Create (name it `mia-calendar`, no roles) →
+open it → Keys → Add key → JSON. Save the file as
+`agent-worker/google-service-account.json` (git- and docker-ignored, never
+commit it). Note its email, `mia-calendar@<project>.iam.gserviceaccount.com`.
+
+**2. The calendar.** In Google Calendar, Other calendars → + → Create new
+calendar, e.g. "Mobile Apps Labs – Meetings", time zone Eastern (Toronto).
+Then its Settings and sharing:
+- Share with specific people → add the service account's email with
+  **Make changes to events**. That is all Mia needs.
+- Add Alexandre and Nicolas (**Make changes to events** too, so they can move
+  or cancel what she booked). They get an email to add it to their calendar.
+- Integrate calendar → copy the **Calendar ID** (`…@group.calendar.google.com`).
+
+**3. Settings.** In `agent-worker/.env`: `GOOGLE_CALENDAR_ID=<the ID>`. Locally
+(`docker run`), mount the key: `-v <path>\google-service-account.json:/app/google-service-account.json:ro`.
+On the server, upload the key next to `docker-compose.yml` in
+`/var/www/officeMal` (the compose file mounts it), add `GOOGLE_CALENDAR_ID` to
+the server `.env`, then `docker compose up -d`.
+
+**How it behaves.** Weekdays 09:00–17:00 Eastern (`OFFICE_HOURS`,
+`CALENDAR_TIMEZONE`), 30-minute meetings by default, nothing sooner than an
+hour from now or more than 60 days ahead. A meeting she books blocks only that
+person (or everyone, for a meeting with the team); **any event the team adds
+by hand blocks everyone**, so to close a slot or a day, just put an event on
+the calendar. Each event she books says who the visitor is, how to reach them,
+who it is with and what it is about. Max 2 bookings per conversation.
+
+Tests: `test_meetings.py` (offline logic, and conversations against the real
+Gemini with a fake calendar — no Google account needed).
+
+---
+
 ## Notes
 
 - The worker reads `LIVEKIT_URL/API_KEY/API_SECRET` from the environment

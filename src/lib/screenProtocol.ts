@@ -37,7 +37,7 @@ export const TOPIC_CONTROL = "mia.control"; // screen -> worker, JSON ControlMes
 export const ATTR_TRANSCRIPTION_FINAL = "lk.transcription_final";
 export const ATTR_SEGMENT_ID = "lk.segment_id";
 
-export type SentKind = "message" | "notify" | "alert" | "suggestion" | "project_request";
+export type SentKind = "message" | "notify" | "alert" | "suggestion" | "project_request" | "meeting";
 
 // The project request form (#20), field key -> value, in the order the worker
 // sent them (its PROJECT_FIELDS, agent-worker/leads.py). Empty = not given.
@@ -53,7 +53,7 @@ export type ScreenMessage =
   | { type: "call_answered" }
   | { type: "dismiss" };
 
-const SENT_KINDS: SentKind[] = ["message", "notify", "alert", "suggestion", "project_request"];
+const SENT_KINDS: SentKind[] = ["message", "notify", "alert", "suggestion", "project_request", "meeting"];
 
 // Visitor-dictated text: keep the card's size sane whatever arrives.
 const MAX_PROJECT_FIELDS = 12;

@@ -47,6 +47,7 @@ import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -106,6 +107,7 @@ from staff_call import (
     call_open_message,
 )
 from staff_call import open_call as start_staff_call
+import meetings
 from team_messages import (
     _norm,
     find_member,
@@ -167,6 +169,9 @@ MAX_EMERGENCY_ALERTS_PER_SESSION = 2
 # Both go to the general inbox. A second allows for a correction after sending.
 MAX_SUGGESTIONS_PER_SESSION = 2
 MAX_PROJECT_REQUESTS_PER_SESSION = 2
+# Meetings on the shared calendar (meetings.py). A second allows for "and one
+# with Alex too"; more fills the team's week from an open kiosk.
+MAX_MEETINGS_PER_SESSION = 2
 
 # The general inbox (info@, team.json), where suggestions and project requests go.
 INBOX = next((m for m in TEAM if m.inbox), None)
@@ -568,6 +573,17 @@ NOT_THEIR_NAME = (
     "have their name yet. Ask for it in one short question, then call this again with the name they say."
 )
 
+# check_calendar / book_meeting when the calendar isn't set up (meetings.configured)
+# or Google can't be reached: she falls back on what she can do without it.
+CALENDAR_UNAVAILABLE = (
+    "UNAVAILABLE: booking meetings is not set up yet. Say in a few words that you cannot book it "
+    "from here, then offer to take a message for the person, or give the contact details."
+)
+CALENDAR_UNREADABLE = (
+    "NOT BOOKED: the meeting calendar could not be read just now. Say so plainly, then offer to take "
+    "a message for the person, or give the contact details."
+)
+
 
 def _assistant_texts(handle) -> list[str]:
     """What she has said so far in this turn (one entry per LLM step)."""
@@ -680,6 +696,7 @@ class MiaAgent(Agent):
         self._emergency_alerts_sent = 0
         self._suggestions_sent = 0
         self._project_requests_sent = 0
+        self._meetings_booked = 0
         self._sent = SentLog()
         # The visitor's latest words, as Gemini sees them (llm_node): the
         # repeat guard lets a send through again only if they asked for it.
@@ -1288,6 +1305,155 @@ class MiaAgent(Agent):
         )
         logger.info("project request sent: %s", fields)
         return "SENT to the team's general inbox."
+
+    def _meeting_with(self, said: str):
+        """(member, calendar key, name to say) for who a meeting is with, or
+        the NOT ... answer to give when that isn't one person or the team.
+        Nobody named: the person TEAM gives for a visitor who names nobody."""
+        member = find_member(said, TEAM) if said.strip() else next((m for m in TEAM if m.visitor_contact), None)
+        if member is None:
+            return (
+                f"no single team member matches {said!r}. If it is unclear, ask who they mean. Otherwise "
+                "say you cannot book with that person and offer a meeting with the team or a message instead."
+            )
+        if member.inbox:
+            return member, meetings.TEAM_KEY, "the team"
+        return member, member.email, member.full_name
+
+    @function_tool()
+    async def check_calendar(
+        self,
+        context: RunContext,
+        day: str,
+        member: str = "",
+        minutes: int = meetings.DEFAULT_MINUTES,
+    ) -> str:
+        """See the free meeting times on the Mobile Apps Labs meeting calendar for one day.
+
+        Call this before offering or booking any meeting time, as described
+        under MEETINGS. It answers with the free times only.
+
+        Args:
+            day: The day as the visitor said it: today, tomorrow, a weekday such as Thursday, a date such as October 14, or 2026-10-14.
+            member: Who the meeting is with, as the visitor said it: a name, a role such as "the CEO", or "the team". Empty if they named nobody.
+            minutes: How long the meeting is, only if the visitor said. Otherwise 30.
+        """
+        if not meetings.configured():
+            return CALENDAR_UNAVAILABLE
+        who = self._meeting_with(member)
+        if isinstance(who, str):
+            return "NOT CHECKED: " + who
+        _, key, name = who
+        minutes = min(max(int(minutes or meetings.DEFAULT_MINUTES), meetings.MIN_MINUTES), meetings.MAX_MINUTES)
+        now = meetings.now_local()
+        today = meetings.say_day(now.date())
+        d = meetings.parse_day(day, now.date())
+        if d is None:
+            return f"NOT CHECKED: {day!r} is not a day. Ask the visitor which day suits them. Today is {today}."
+        if why := meetings.why_not_bookable(d, now):
+            return (
+                f"CLOSED: no meeting is possible on {meetings.say_day(d)}: {why}. Meetings are on weekdays "
+                f"from {meetings.clock(meetings.OPEN)} to {meetings.clock(meetings.CLOSE)}. Today is {today}. "
+                "Say so in a few words and ask which other day suits them."
+            )
+        busy = await meetings.busy_between(*meetings.day_bounds(d))
+        if busy is None:
+            return CALENDAR_UNREADABLE
+        windows = meetings.free_windows(d, key, minutes, busy, now)
+        logger.info("check_calendar %s with %s (%s min): %s", d, name, minutes, windows)
+        if not windows:
+            return (
+                f"FULL: nothing is free with {name} on {meetings.say_day(d)}. Today is {today}. "
+                "Say so in a few words and ask which other day suits them."
+            )
+        spans = ", ".join(f"{meetings.clock(a)} to {meetings.clock(b)}" for a, b in windows)
+        return (
+            f"FREE on {meetings.say_day(d)} for a {minutes} minute meeting with {name}: {spans}. A meeting "
+            "can start on any hour or half hour inside these and must end by the end of one. "
+            f"Today is {today}. Offer the visitor two or three of these times in one short sentence, never "
+            "the whole list, and never say anything about what else is on the calendar."
+        )
+
+    @function_tool()
+    @sends_email
+    async def book_meeting(
+        self,
+        context: RunContext,
+        visitor_name: str,
+        member: str,
+        day: str,
+        start_time: str,
+        contact: str,
+        topic: str = "",
+        minutes: int = meetings.DEFAULT_MINUTES,
+    ) -> str:
+        """Book a meeting on the Mobile Apps Labs meeting calendar.
+
+        Call this only after check_calendar showed the time free, and after
+        you repeated the day, time, who it is with, the visitor's name and
+        contact, and they said it is right. Tell them it is booked only if this
+        returns BOOKED.
+
+        Args:
+            visitor_name: The visitor's name, as they gave it.
+            member: Who the meeting is with, as the visitor said it: a name, a role such as "the CEO", or "the team". Empty if they named nobody.
+            day: The day, as you passed it to check_calendar.
+            start_time: The start time in 24 hour form, for example 14:30.
+            contact: The visitor's email or phone number, written the usual way: jean.tremblay@gmail.com, or 514 555 1234.
+            topic: What the meeting is about, in a few words, only if the visitor said. Empty otherwise.
+            minutes: How long the meeting is, as you passed it to check_calendar.
+        """
+        if not meetings.configured():
+            return CALENDAR_UNAVAILABLE
+        if self._meetings_booked >= MAX_MEETINGS_PER_SESSION:
+            return "NOT BOOKED: meeting limit for this conversation reached. Give the contact details instead."
+        who = self._meeting_with(member)
+        if isinstance(who, str):
+            return "NOT BOOKED: " + who
+        found, key, name = who
+        if not self._visitor_named(visitor_name, found):
+            return NOT_THEIR_NAME.format(name=visitor_name).replace("NOT SENT", "NOT BOOKED", 1)
+        contact = contact.strip()[:120]
+        if not contact:
+            return "NOT BOOKED: ask the visitor for an email or a phone number so the team can reach them."
+        minutes = min(max(int(minutes or meetings.DEFAULT_MINUTES), meetings.MIN_MINUTES), meetings.MAX_MINUTES)
+        now = meetings.now_local()
+        d = meetings.parse_day(day, now.date())
+        t = meetings.parse_time(start_time)
+        if d is None or t is None:
+            return (
+                f"NOT BOOKED: could not read the day {day!r} or the time {start_time!r}. Pass the day as you "
+                "gave it to check_calendar and the time in 24 hour form, for example 14:30."
+            )
+        if why := meetings.why_not_bookable(d, now):
+            return f"NOT BOOKED: no meeting is possible on {meetings.say_day(d)}: {why}. Ask which other day suits them."
+        start = datetime.combine(d, t, meetings.TZ)
+        busy = await meetings.busy_between(*meetings.day_bounds(d))
+        if busy is None:
+            return CALENDAR_UNREADABLE
+        if not meetings.is_free(start, minutes, key, busy, now):
+            return (
+                f"NOT BOOKED: {meetings.clock(start)} on {meetings.say_day(d)} is not free for a {minutes} "
+                "minute meeting. Call check_calendar for that day and offer the visitor the free times."
+            )
+        if self._is_repeat("meeting", key, start.isoformat()):
+            return (
+                f"NOT BOOKED AGAIN: this meeting with {name} is already booked in this conversation. "
+                "Tell the visitor it is already booked."
+            )
+        topic = topic.strip()[:300]
+        if not await meetings.create_meeting(start, minutes, key, name, visitor_name.strip(), contact, topic, ASSISTANT_NAME):
+            return CALENDAR_UNREADABLE.replace("could not be read", "did not accept the booking")
+        self._meetings_booked += 1
+        self._sent.add("meeting", key, start.isoformat())
+        self._show_sent("meeting", f"{name} · {meetings.say_when(start, self._chosen_language)}")
+        first = "the team" if found.inbox else found.first_name
+        return (
+            f"BOOKED: {meetings.say_day(d)} at {meetings.clock(start)}, {minutes} minutes, with {name}, for "
+            f"{visitor_name}. Now tell the visitor, in their language and in one or two sentences, that the "
+            f"meeting with {first} is booked for that day and time, and that it is on the team's calendar. "
+            "Never promise that anyone has seen it. Then ask whether there is anything else."
+        )
 
     @function_tool()
     async def end_conversation(self, context: RunContext) -> str | None:
