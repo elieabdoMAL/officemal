@@ -157,5 +157,18 @@
     "voice": "fr",
     "lines": [["Français.",11], ["Mon collègue parle anglais, il viendra demain.",14]],
     "expect": {"lang": "fr", "notTools": ["switch"], "ended": false}
+  },
+  "press_screen": {
+    "groups": ["screen"],
+    "about": "Screen buttons (#2): names where the sound button is without pressing anything, then presses public_meeting when asked to open the public meeting room.",
+    "voice": "en",
+    "lines": [["English.",10], ["Where is the sound button on this screen?",13], ["Great. Can you open the public meeting room for me?",15]],
+    "expect": {
+      "tools": ["press_button"],
+      "say": [["/bottom left/"], ["/meeting|screen/"]],
+      "logs": ["press_button: public_meeting"],
+      "notLogs": ["/press_button: (?!public_meeting)/"],
+      "ended": false
+    }
   }
 }

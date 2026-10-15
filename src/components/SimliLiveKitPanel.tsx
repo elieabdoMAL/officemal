@@ -12,6 +12,8 @@ import {
 } from "livekit-client";
 import { applyChromaKey } from "@/lib/chromaKey";
 import { asLang, type Lang } from "@/lib/assistant";
+import { devTimeout } from "@/lib/devTimeout";
+import { LAYOUT } from "@/lib/screenLayout";
 import {
   ATTR_LANGUAGE,
   ATTR_SEGMENT_ID,
@@ -132,7 +134,7 @@ const IDLE_HINT_MS = 12000;
 // corrections (each update restarts the wait); the worker's screen_cards.py
 // keeps the same times.
 function cardMs(card: Card): number {
-  if (card.type === "contact_card") return 45000;
+  if (card.type === "contact_card" || card.type === "directions") return 45000;
   if (card.type === "project_request") return card.status === "draft" ? 180000 : 15000;
   return 10000;
 }
@@ -261,7 +263,14 @@ export default function SimliLiveKitPanel({
   const showScreenMessage = useCallback((m: ScreenMessage) => {
     console.log("[SimliLK] screen message:", m.type);
     if (m.type === "dismiss") setCard(null);
-    else if (m.type === "call_open") {
+    else if (m.type === "press") {
+      // Mia pressed an on-screen button for the visitor (#2). The Contact
+      // button lives on this panel; everything else belongs to the top page,
+      // which triggers the same action as a tap (Controls, MiaPressRouter).
+      console.log("[SimliLK] press:", m.button);
+      if (m.button === "contact") setCard({ type: "contact_card", lang: langRef.current });
+      else tellTop({ type: "receptionist-press", button: m.button });
+    } else if (m.type === "call_open") {
       // Video call to staff (#22): the call window opens on the top page.
       callAnsweredRef.current = false;
       setInCall(true);
@@ -281,6 +290,8 @@ export default function SimliLiveKitPanel({
     else if (m.type === "contact_card") setCard({ type: "contact_card", lang: m.lang ?? langRef.current });
     else if (m.type === "project_request")
       setCard({ type: "project_request", status: m.status, fields: m.fields, lang: m.lang ?? langRef.current });
+    else if (m.type === "directions")
+      setCard({ type: "directions", address: m.address, maps_url: m.maps_url, lang: m.lang ?? langRef.current });
     else
       setCard({
         type: "message_sent",
@@ -292,7 +303,9 @@ export default function SimliLiveKitPanel({
 
   useEffect(() => {
     if (!card) return;
-    const timer = window.setTimeout(() => setCard(null), cardMs(card));
+    // devTimeout: a Playwright check can shorten the auto-close from the URL
+    // (?cardMs=1500); production always uses the real times.
+    const timer = window.setTimeout(() => setCard(null), devTimeout("cardMs", cardMs(card)));
     return () => window.clearTimeout(timer);
   }, [card]);
 
@@ -654,6 +667,8 @@ export default function SimliLiveKitPanel({
   // console of /receptionist-embed:
   //   miaDev.screen({ type: "contact_card" })
   //   miaDev.screen({ type: "message_sent", to: "Nicolas Bastien" })
+  //   miaDev.screen({ type: "press", button: "public_meeting" })
+  //   miaDev.screen({ type: "directions", address: "74, rue Turgeon…", maps_url: "https://maps.google.com/…" })
   //   miaDev.caption("mia", "Bonjour !")      miaDev.caption("visitor", "Hi")
   //   miaDev.state("paused")   miaDev.language("en")   miaDev.end()
   //   miaDev.screen({ type: "call_open", url: "wss://…", token: "…", to: "Nicolas Bastien" })
@@ -696,8 +711,13 @@ export default function SimliLiveKitPanel({
   const showPill = inSession && listening && !banner;
   // Scaled from her feet, as below.
   const avatarTransform = `scale(${AVATAR_SCALE})`;
-  // Captions stack above whatever holds the bottom edge.
-  const captionBottom = banner === "paused" ? "9vw" : banner ? "6vw" : "4.2vw";
+  // Captions stack above whatever holds the bottom edge (src/lib/screenLayout.ts).
+  const captionBottom =
+    banner === "paused"
+      ? LAYOUT.captions.bottomOverPausedBanner
+      : banner
+        ? LAYOUT.captions.bottomOverBanner
+        : LAYOUT.captions.bottomOverPill;
 
   return (
     <div

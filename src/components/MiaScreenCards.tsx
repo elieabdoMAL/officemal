@@ -1,31 +1,37 @@
 "use client";
 
+import { useEffect, useState } from "react";
+import QRCode from "qrcode";
 import { ASSISTANT_NAME, CONTACT, pick, type Bilingual, type Lang } from "@/lib/assistant";
+import { LAYOUT } from "@/lib/screenLayout";
 import type { ProjectFields, ProjectStatus, SentKind } from "@/lib/screenProtocol";
 
 // Cards shown on the kiosk panel (#18): the contact card (Contact button, or
 // the worker's "contact_card" message), the "message sent" confirmation (the
 // worker's "message_sent"), the project request form (#20, the worker's
-// "project_request"). See docs/screen-protocol.md. A video call to staff
-// (#22) opens its own window on the top page (StaffCallModal), not a card.
+// "project_request"), the directions card (#7, the worker's "directions").
+// See docs/screen-protocol.md. A video call to staff (#22) opens its own
+// window on the top page (StaffCallModal), not a card.
 //
 // Sizes are in vw, i.e. fractions of the Web Frame's own width (1280 CSS px in
 // the tour, drawn ~0.7x on the 1080p kiosk), so they read the same whatever
-// size the frame is published at.
+// size the frame is published at. Positions and widths come from
+// src/lib/screenLayout.ts — the one place to tune them.
 
 export type Card =
   | { type: "contact_card"; lang: Lang | null }
   | { type: "message_sent"; kind: SentKind; to?: string; lang: Lang | null }
-  | { type: "project_request"; status: ProjectStatus; fields: ProjectFields; lang: Lang | null };
+  | { type: "project_request"; status: ProjectStatus; fields: ProjectFields; lang: Lang | null }
+  | { type: "directions"; address: string; maps_url: string; lang: Lang | null };
 
 // The card sits to her left (the visitor's right), over the panorama, so it
 // doesn't cover her face; it may overlap her shoulder.
 const cardBox: React.CSSProperties = {
   position: "absolute",
-  right: "2.5%",
-  top: "50%",
-  transform: "translateY(-55%)",
-  width: "31%",
+  right: LAYOUT.card.right,
+  top: LAYOUT.card.top,
+  transform: `translateY(${LAYOUT.card.translateY})`,
+  width: LAYOUT.card.width,
   boxSizing: "border-box",
   padding: "1.6vw 1.8vw",
   borderRadius: "1.2vw",
@@ -44,6 +50,8 @@ const L = {
   address: { fr: "Adresse", en: "Address" },
   website: { fr: "Site web", en: "Website" },
   scan: { fr: "Balayez pour visiter notre site", en: "Scan to visit our website" },
+  directions: { fr: "Itinéraire", en: "Directions" },
+  scanDirections: { fr: "Scannez pour l'itinéraire", en: "Scan for directions" },
   close: { fr: "Fermer", en: "Close" },
 };
 
@@ -114,6 +122,78 @@ function ContactCard({ lang, onClose }: { lang: Lang | null; onClose: () => void
         />
         <div style={{ fontSize: "0.8em", color: "#5b6b8c" }}>
           {pick(lang, L.scan).map((t) => (
+            <div key={t}>{t}</div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// The directions card's QR (#7), generated in the browser from the maps URL
+// the worker sent — no external QR service at runtime, so the request never
+// leaves the kiosk. ~0.5 KB of canvas work, done once per card.
+function useQrDataUrl(text: string): string | null {
+  const [url, setUrl] = useState<string | null>(null);
+  useEffect(() => {
+    let stale = false;
+    QRCode.toDataURL(text, { errorCorrectionLevel: "M", margin: 1, width: 512 })
+      .then((u) => {
+        if (!stale) setUrl(u);
+      })
+      .catch((e) => console.warn("[MiaScreenCards] QR generation failed:", e));
+    return () => {
+      stale = true;
+    };
+  }, [text]);
+  return url;
+}
+
+// #7: the office address and a QR straight to Google Maps directions. Same
+// box as the contact card; closes after 45 s or on ×.
+function DirectionsCard({
+  address,
+  mapsUrl,
+  lang,
+  onClose,
+}: {
+  address: string;
+  mapsUrl: string;
+  lang: Lang | null;
+  onClose: () => void;
+}) {
+  const qr = useQrDataUrl(mapsUrl);
+  return (
+    <div role="dialog" aria-label={label(lang, L.directions)} data-card="directions" style={cardBox}>
+      <CloseButton lang={lang} onClose={onClose} />
+      <div style={{ fontSize: "1.25em", fontWeight: 800, paddingRight: "3vw" }}>
+        <span aria-hidden>📍 </span>
+        {label(lang, L.directions)}
+      </div>
+      <div style={{ marginTop: "0.7vw" }}>
+        <div
+          style={{
+            fontSize: "0.72em",
+            fontWeight: 700,
+            textTransform: "uppercase",
+            letterSpacing: "0.06em",
+            color: "#5b6b8c",
+          }}
+        >
+          {label(lang, L.address)}
+        </div>
+        <div style={{ fontWeight: 600 }}>{address}</div>
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: "1.2vw", marginTop: "1.1vw" }}>
+        {qr && (
+          <img
+            src={qr}
+            alt={`QR: ${mapsUrl}`}
+            style={{ width: "12vw", height: "12vw", minWidth: 88, minHeight: 88, borderRadius: "0.4vw" }}
+          />
+        )}
+        <div style={{ fontSize: "0.9em", fontWeight: 600, color: "#14213d" }}>
+          {pick(lang, L.scanDirections).map((t) => (
             <div key={t}>{t}</div>
           ))}
         </div>
@@ -248,7 +328,7 @@ function ProjectRequestCard({
       data-project-status={status}
       style={{
         ...cardBox,
-        width: "38%",
+        width: LAYOUT.card.projectWidth,
         fontSize: "clamp(11px, 1.35vw, 22px)",
         borderTop: `0.45vw solid ${sent ? "#16a34a" : "#f59e0b"}`,
       }}
@@ -348,10 +428,12 @@ export default function MiaScreenCard({ card, onClose }: { card: Card; onClose: 
   if (card.type === "contact_card") return <ContactCard lang={card.lang} onClose={onClose} />;
   if (card.type === "project_request")
     return <ProjectRequestCard status={card.status} fields={card.fields} lang={card.lang} onClose={onClose} />;
+  if (card.type === "directions")
+    return <DirectionsCard address={card.address} mapsUrl={card.maps_url} lang={card.lang} onClose={onClose} />;
   return <MessageSentCard kind={card.kind} to={card.to} lang={card.lang} onClose={onClose} />;
 }
 
-// Contact button, bottom right of the frame (the turn pill holds the middle).
+// Contact button. Where it sits is LAYOUT.contactButton (top OR bottom).
 export function ContactButton({ onClick, active }: { onClick: () => void; active: boolean }) {
   return (
     <button
@@ -359,8 +441,9 @@ export function ContactButton({ onClick, active }: { onClick: () => void; active
       aria-pressed={active}
       style={{
         position: "absolute",
-        right: "2.5%",
-        bottom: "1.2vw",
+        right: LAYOUT.contactButton.right,
+        top: LAYOUT.contactButton.top,
+        bottom: LAYOUT.contactButton.bottom,
         padding: "0.6vw 1.3vw",
         borderRadius: 999,
         border: "2px solid rgba(255,255,255,0.85)",

@@ -37,6 +37,7 @@ const TOOL_LOGS = {
   pause: /^pause requested|^pause_conversation called|^stop request heard while speaking/,
   wake: /^called back by name/,
   switch: /^visitor asked to switch to/,
+  press_button: /^press_button: /,
 };
 const RATE_LIMITED = /\b429\b|too many requests|rate.?limit/i;
 

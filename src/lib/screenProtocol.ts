@@ -39,6 +39,27 @@ export const ATTR_SEGMENT_ID = "lk.segment_id";
 
 export type SentKind = "message" | "notify" | "alert" | "suggestion" | "project_request" | "meeting";
 
+// The on-screen buttons Mia can press herself (#2, the worker's press_button
+// tool — keep PRESSABLE_BUTTONS in agent-worker/worker.py in step):
+//   contact        the Contact button on her frame (opens the contact card)
+//   mute / unmute  the kiosk's sound button (muting also suspends her)
+//   vr             the VR button (entering VR hides her video)
+//   recenter       recenter the panorama view
+//   meeting_room   the private Meeting Room pop-up
+//   public_meeting the Public Meeting Room pop-up
+// "contact" is handled inside the embed; the rest are forwarded to the top
+// page as a "receptionist-press" window message (section 5 of the protocol).
+export const PRESS_BUTTONS = [
+  "contact",
+  "mute",
+  "unmute",
+  "vr",
+  "recenter",
+  "meeting_room",
+  "public_meeting",
+] as const;
+export type PressButton = (typeof PRESS_BUTTONS)[number];
+
 // The project request form (#20), field key -> value, in the order the worker
 // sent them (its PROJECT_FIELDS, agent-worker/leads.py). Empty = not given.
 export type ProjectFields = [key: string, value: string][];
@@ -48,6 +69,8 @@ export type ScreenMessage =
   | { type: "contact_card"; lang?: Lang }
   | { type: "message_sent"; kind?: SentKind; to?: string; lang?: Lang }
   | { type: "project_request"; status: ProjectStatus; fields: ProjectFields; lang?: Lang }
+  | { type: "directions"; address: string; maps_url: string; lang?: Lang }
+  | { type: "press"; button: PressButton }
   | { type: "call_open"; url: string; token: string; to?: string; lang?: Lang }
   | { type: "call_close" }
   | { type: "call_answered" }
@@ -100,6 +123,16 @@ export function parseScreenMessage(raw: unknown): ScreenMessage | null {
       if (!fields || (o.status !== "draft" && o.status !== "sent")) return null;
       return { type: "project_request", status: o.status, fields, lang };
     }
+    case "directions": {
+      // The QR is generated client-side from maps_url, so only an https URL
+      // of sane length ever becomes a code on the kiosk screen.
+      if (typeof o.address !== "string" || !o.address.trim()) return null;
+      if (typeof o.maps_url !== "string" || !/^https:\/\/\S+$/.test(o.maps_url) || o.maps_url.length > 500) return null;
+      return { type: "directions", address: o.address.trim().slice(0, 200), maps_url: o.maps_url, lang };
+    }
+    case "press":
+      if (!PRESS_BUTTONS.includes(o.button as PressButton)) return null;
+      return { type: "press", button: o.button as PressButton };
     case "call_open":
       if (typeof o.url !== "string" || !/^wss?:\/\//.test(o.url) || typeof o.token !== "string" || !o.token) return null;
       return { type: "call_open", url: o.url, token: o.token, to: displayName(o.to), lang };
@@ -121,7 +154,13 @@ export function parseScreenMessage(raw: unknown): ScreenMessage | null {
 export type ControlMessage = { type: "resume" } | { type: "wake" } | { type: "call_cancel" };
 
 // Window messages between the kiosk's top page and the receptionist embed
-// (docs/screen-protocol.md, section 5), for a video call to staff (#22). Same
+// (docs/screen-protocol.md, section 5). Same origin only.
+//   embed -> page: Mia pressed an on-screen button for the visitor (#2). The
+//   top page triggers the same action as a tap: Controls handles mute,
+//   unmute, vr and recenter; MiaPressRouter opens the meeting rooms.
+export type PressMessage = { type: "receptionist-press"; button: PressButton };
+
+// For a video call to staff (#22). Same
 // origin only: the kiosk token rides in "receptionist-call".
 //   embed -> page: open the call window and join the call room.
 export type CallOpenMessage = { type: "receptionist-call"; url: string; token: string; to?: string; lang?: Lang };

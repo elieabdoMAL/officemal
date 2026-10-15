@@ -8,6 +8,7 @@ import InfiniViewModal from "@/components/InfiniViewModal";
 import MalModal from "@/components/MalModal";
 import Controls from "@/components/Controls";
 import AiToggle from "@/components/AiToggle";
+import MiaPressRouter from "@/components/MiaPressRouter";
 import KioskLock from "@/components/KioskLock";
 import KioskHeartbeat from "@/components/KioskHeartbeat";
 
@@ -33,6 +34,7 @@ export default function Page() {
       <MalModal />
       <Controls />
       <AiToggle />
+      <MiaPressRouter />
       <KioskLock />
       <KioskHeartbeat />
     </div>
