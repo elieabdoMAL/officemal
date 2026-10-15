@@ -1,10 +1,14 @@
 "use client";
 
 import MeetingModal from "@/components/MeetingModal";
+import PublicMeetingModal from "@/components/PublicMeetingModal";
+import StaffCallModal from "@/components/StaffCallModal";
 import PasscodeModal from "@/components/PasscodeModal";
 import InfiniViewModal from "@/components/InfiniViewModal";
 import MalModal from "@/components/MalModal";
 import Controls from "@/components/Controls";
+import AiToggle from "@/components/AiToggle";
+import MiaPressRouter from "@/components/MiaPressRouter";
 import KioskLock from "@/components/KioskLock";
 import KioskHeartbeat from "@/components/KioskHeartbeat";
 
@@ -23,10 +27,14 @@ export default function Page() {
         allow="vr; gyroscope; accelerometer; autoplay; microphone; camera"
       />
       <MeetingModal />
+      <PublicMeetingModal />
+      <StaffCallModal />
       <PasscodeModal />
       <InfiniViewModal />
       <MalModal />
       <Controls />
+      <AiToggle />
+      <MiaPressRouter />
       <KioskLock />
       <KioskHeartbeat />
     </div>

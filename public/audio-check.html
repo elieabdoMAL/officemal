@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kiosk audio check</title>
+<!--
+  Boss notes #4 / #19: "she gets quieter after a while", "the sound lowers and
+  comes back". Mia's audio is steady when it leaves LiveKit (measured), so this
+  checks the kiosk itself: does playback get quieter while a page has the mic
+  open? Causes it catches: Windows "communications activity" ducking, a
+  Bluetooth speaker switching to hands-free when the mic opens, a speakerphone's
+  half-duplex, driver "voice" effects.
+
+  It plays a steady beep through the same path as Mia's voice (a WebRTC track
+  played by an <audio> element), and opens/closes the mic every 10 s with the
+  constraints livekit-client uses by default. Listen, or hold a phone sound-level
+  meter app near the speaker: the level must be the same in MIC ON and MIC OFF.
+  Served at /audio-check.html; standalone, nothing else on the site uses it.
+-->
+<style>
+  :root { --bg: #111; --fg: #eee; --muted: #9a9a9a; --on: #d93b3b; --off: #2f7d4f; --card: #1d1d1d; }
+  @media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) { --bg: #f6f6f6; --fg: #111; --muted: #555; --card: #fff; } }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg); font: 16px/1.45 system-ui, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 8px; }
+  p, li { color: var(--muted); }
+  .card { background: var(--card); border-radius: 10px; padding: 14px 16px; margin: 12px 0; }
+  #phase { font-size: 44px; font-weight: 700; text-align: center; padding: 18px; border-radius: 10px; background: var(--card); }
+  #phase.on { background: var(--on); color: #fff; }
+  #phase.off { background: var(--off); color: #fff; }
+  button { font-size: 18px; padding: 10px 18px; border-radius: 8px; border: 0; cursor: pointer; }
+  label { display: inline-block; margin-right: 14px; }
+  code, pre { font-size: 13px; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Kiosk audio check</h1>
+  <p>Run this on the kiosk, in the same Chrome, with the speakers and mic Mia uses.
+     A beep plays the whole time; the mic opens and closes every 10 seconds.
+     <b>The beep must stay exactly as loud when the mic is on.</b> If it drops in
+     MIC ON, the kiosk is lowering playback while the mic is open — see the checklist.</p>
+
+  <div class="card">
+    <label><input type="checkbox" id="aec" checked> echoCancellation</label>
+    <label><input type="checkbox" id="ns" checked> noiseSuppression</label>
+    <label><input type="checkbox" id="agc" checked> autoGainControl</label>
+    <label><input type="checkbox" id="vi" checked> voiceIsolation</label>
+    <p>All on = what Mia's page asks for (livekit-client defaults). Change them only between runs.</p>
+    <label>Mic device <select id="dev"><option value="default">default</option></select></label>
+  </div>
+
+  <p><button id="start">Start test</button> <button id="stop" disabled>Stop</button></p>
+  <div id="phase">—</div>
+
+  <div class="card"><pre id="log">Devices appear here after Start (Chrome only shows names once the mic is allowed).</pre></div>
+</main>
+<script>
+const PHASE_MS = 10000;
+const $ = id => document.getElementById(id);
+let ctx, pcs = [], audioEl, micStream = null, timer = null, micOn = false, next = 0;
+
+function log(line) { $("log").textContent += "\n" + new Date().toLocaleTimeString() + "  " + line; }
+
+// Beep 0.8 s on / 0.2 s off at a fixed level, sent through a local WebRTC
+// connection so Chrome plays it the way it plays Mia (remote track -> <audio>).
+async function startTone() {
+  ctx = new AudioContext();
+  const osc = ctx.createOscillator(), gain = ctx.createGain(), dest = ctx.createMediaStreamDestination();
+  osc.frequency.value = 440;
+  gain.gain.value = 0;
+  for (let t = ctx.currentTime + 0.1; t < ctx.currentTime + 3600; t += 1) {
+    gain.gain.setValueAtTime(0.25, t);
+    gain.gain.setValueAtTime(0, t + 0.8);
+  }
+  osc.connect(gain).connect(dest);
+  osc.start();
+  const a = new RTCPeerConnection(), b = new RTCPeerConnection();
+  pcs = [a, b];
+  a.onicecandidate = e => e.candidate && b.addIceCandidate(e.candidate);
+  b.onicecandidate = e => e.candidate && a.addIceCandidate(e.candidate);
+  b.ontrack = e => { audioEl = new Audio(); audioEl.srcObject = e.streams[0]; audioEl.play(); };
+  dest.stream.getTracks().forEach(t => a.addTrack(t, dest.stream));
+  await a.setLocalDescription(await a.createOffer());
+  await b.setRemoteDescription(a.localDescription);
+  await b.setLocalDescription(await b.createAnswer());
+  await a.setRemoteDescription(b.localDescription);
+}
+
+async function setMic(on) {
+  micOn = on;
+  if (on) {
+    const audio = {
+      deviceId: { ideal: $("dev").value },
+      echoCancellation: $("aec").checked, noiseSuppression: $("ns").checked,
+      autoGainControl: $("agc").checked, voiceIsolation: $("vi").checked,
+    };
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({ audio });
+      log("MIC ON  — " + micStream.getAudioTracks()[0].label + "  " + JSON.stringify(micStream.getAudioTracks()[0].getSettings()));
+    } catch (e) { log("MIC failed: " + e.message); }
+  } else {
+    micStream?.getTracks().forEach(t => t.stop());
+    micStream = null;
+    log("MIC OFF");
+  }
+  $("phase").className = on ? "on" : "off";
+}
+
+async function listDevices() {
+  const devs = await navigator.mediaDevices.enumerateDevices();
+  const sel = $("dev"), keep = sel.value;
+  sel.innerHTML = "";
+  for (const d of devs.filter(d => d.kind === "audioinput")) sel.add(new Option(d.label || d.deviceId, d.deviceId));
+  sel.value = keep;
+  const warn = /hands-?free|headset|bluetooth|bt |communications|speakerphone/i;
+  log("Devices:\n" + devs.filter(d => d.kind !== "videoinput").map(d =>
+    `  ${d.kind.padEnd(11)} ${d.label}${warn.test(d.label) ? "   <-- check: hands-free / communications device" : ""}`).join("\n"));
+}
+
+function tick() {
+  const left = Math.max(0, Math.ceil((next - Date.now()) / 1000));
+  $("phase").textContent = (micOn ? "MIC ON" : "MIC OFF") + " · " + left + "s";
+  if (Date.now() >= next) { next = Date.now() + PHASE_MS; setMic(!micOn); }
+}
+
+$("start").onclick = async () => {
+  $("start").disabled = true; $("stop").disabled = false;
+  $("log").textContent = "Started.";
+  // Ask once so device names are visible, then release before the test starts.
+  try { (await navigator.mediaDevices.getUserMedia({ audio: true })).getTracks().forEach(t => t.stop()); } catch {}
+  await listDevices();
+  await startTone();
+  micOn = true; // first tick switches to OFF: the test starts with a clean MIC OFF phase
+  next = 0;
+  timer = setInterval(tick, 250);
+};
+
+$("stop").onclick = async () => {
+  clearInterval(timer);
+  await setMic(false);
+  pcs.forEach(pc => pc.close());
+  audioEl?.pause();
+  await ctx?.close();
+  $("phase").className = ""; $("phase").textContent = "—";
+  $("start").disabled = false; $("stop").disabled = true;
+};
+</script>
+</body>
+</html>

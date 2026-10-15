@@ -1,0 +1,9 @@
+.venv/
+.env
+test_*.py
+__pycache__/
+*.pyc
+README.md
+requirements.lock.txt
+# The calendar key is mounted at run time (docker-compose.server.yml), never baked in.
+*service-account*.json

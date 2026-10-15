@@ -136,6 +136,27 @@ export default function Controls() {
     trigger(CONTAINER_NAMES.recenter);
   }, []);
 
+  // Mia can press these buttons for the visitor (#2): her worker's press
+  // arrives from the receptionist embed as a "receptionist-press" window
+  // message (docs/screen-protocol.md, section 5) and triggers the same action
+  // as a tap. mute/unmute and vr are absolute, not toggles, so a press when
+  // the kiosk is already in that state does nothing. Entering VR (or muting,
+  // which suspends her) is still just the tap's behaviour — she warns the
+  // visitor first, per her prompt.
+  useEffect(() => {
+    const onMessage = (e: MessageEvent) => {
+      if (e.origin !== window.location.origin) return;
+      const { type, button } = (e.data ?? {}) as { type?: string; button?: string };
+      if (type !== "receptionist-press") return;
+      if (button === "mute" && !isMuted) toggleMute();
+      else if (button === "unmute" && isMuted) toggleMute();
+      else if (button === "vr" && !isVRActive) toggleVR();
+      else if (button === "recenter") recenter();
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, [isMuted, isVRActive, toggleMute, toggleVR, recenter]);
+
   useEffect(() => {
     const resetTimer = () => {
       if (idleTimer.current) clearTimeout(idleTimer.current);
