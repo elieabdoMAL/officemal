@@ -99,6 +99,19 @@ from screen_cards import (
     message_sent,
     press,
     project_request,
+    recording_card,
+)
+from voice_message import (
+    VM_MAX_S,
+    VM_MIN_S,
+    VM_SILENCE_S,
+    VM_START_TIMEOUT_S,
+    MAX_ATTACHMENT_BYTES,
+    Recorder,
+    VoiceMessage,
+    encode_voice_audio,
+    send_voice_message_email,
+    strip_done,
 )
 from staff_call import (
     AFTER_CALL_S,
@@ -209,7 +222,10 @@ STT_MULTI = "multi"
 # testing, "Mia, vous êtes là?" came back as "Vous êtes là?" and "Tais-toi" as
 # "Qu'est-toi". The language names let a locked STT still catch "French
 # please" said in English, and the reverse.
-STT_KEYTERMS = [ASSISTANT_NAME, "assistante", "tais-toi", "English", "anglais", "French", "français"]
+STT_KEYTERMS = [ASSISTANT_NAME, "assistante", "tais-toi", "English", "anglais", "French", "français",
+                # The voice-message stop words (#5, round 2): a lone "Done." is
+                # exactly the kind of short utterance the live stream mangles.
+                "done", "c'est tout"]
 
 # A French-locked STT still writes out English, roughly; an English-locked one
 # returns nothing at all for French. So when speech produces no transcript this
@@ -503,27 +519,65 @@ NO_ANSWER_PAUSED_NOTE = (
     "If the visitor asks, offer to take a message for {first}."
 )
 
+# Voice messages (#5, round 2, voice_message.py). The recording line is said by
+# the worker, not Gemini: the same words every time, and only once the recorder
+# is really about to arm. While it records she stays silent (llm_node and
+# on_user_turn_completed drop every turn), and the dictation never reaches
+# Gemini or the logs: only the recorder and its transcript keep it.
+RECORD_LINE = {
+    "en": "I'm recording your message for {first} now — go ahead. Say 'done' when you're finished.",
+    "fr": "J'enregistre votre message pour {first} maintenant — allez-y. Dites « c'est tout » quand vous avez terminé.",
+}
+VM_DONE_NOTE = (
+    "System: the voice message for {name} is recorded, about {seconds} seconds. You never heard it: "
+    "its audio will be attached to the email, so never repeat, guess or make up what it says. Now, in "
+    "one or two short sentences: say the message is recorded and about how long it is, read back the "
+    "visitor's full name (and any phone or email they gave) as CONFIRM BEFORE SENDING says, and ask "
+    "whether to send it. They can also re-record it (record_voice_message again) or drop it. Call "
+    "send_voice_message only after they say yes."
+)
+VM_EMPTY_NOTE = (
+    "System: nothing was recorded — the visitor said nothing, or too little to keep. Tell them in a "
+    "few words that you did not catch a message, and ask whether they want to try recording again "
+    "(record_voice_message) or dictate the message to you instead."
+)
+VM_FAILED_NOTE = (
+    "System: the recording could not be saved. Apologize in a few words and offer to take a dictated "
+    "message instead, as TAKING A MESSAGE says."
+)
+
 # "I've let Alexandre know you're here" with no notify_member call: a lie to
 # the visitor. Gemini did it now and then (the base branch, every time, on
-# "J'ai rendez-vous avec Alexandre. Je suis Lucie Bouchard."), so the worker
-# checks what she said and has her make it true (or take it back) at once.
+# "J'ai rendez-vous avec Alexandre. Je suis Lucie Bouchard."), and once in six
+# runs as "I'll let Alexandre know…" (future tense, which the first version of
+# this didn't match — the 2026-10-12 merge tests). Such a sentence is now held
+# back in llm_node until notify_member has answered NOTIFIED in that turn, and
+# dropped otherwise (_early_notify_claim), so it can never be spoken untrue;
+# the transcription check below stays as a backstop.
 NOTIFY_CLAIM = re.compile(
-    r"\bI(?:'ve| have) (?:let (?!you\b)\w+ know|notified|informed)\b"
+    r"\bI(?:'ve| have)(?: already| just| now)? (?:let (?!you\b)\w+ know|notified|informed|told (?!you\b)\w+)\b"
     r"|\bI(?:'m| am) (?:letting (?!you\b)\w+ know|notifying|informing)\b"
-    r"|\bj'ai (?:prévenu|informé|avisé)\b"
+    r"|\bI(?:'ll| will|'m going to| am going to)(?: go ahead and)? (?:let (?!you\b)\w+ know|notify|inform)\b"
+    r"|\b(?:has|have) been (?:notified|informed|told)\b|\bwill be (?:notified|informed|told)\b"
+    r"|\bj'ai (?:déjà )?(?:prévenu|informé|avisé)\b"
+    r"|\bje viens (?:de prévenir|d'informer|d'aviser)\b"
     r"|\bje (?:préviens|vais prévenir|l'informe|vais l'informer|l'avise)\b"
     # "J'informe Nicolas de votre arrivée" (seen 2026-10-12); "voulez-vous que
     # j'informe Nicolas ?" is an offer, not a claim.
     r"|(?<!que )\bj'(?:informe|avise|avertis)\b"
-    r"|\bje vais (?:informer|aviser|avertir)\b",
+    r"|\bje vais (?:informer|aviser|avertir)\b"
+    r"|\b(?:a|sera) (?:été )?(?:prévenu|informé|avisé)\b",
     re.IGNORECASE,
 )
+# Worded so her correction can't trip the claim patterns itself ("I haven't
+# let Alexandre know yet" still says "let Alexandre know").
 NOTIFY_CLAIM_NOTE = (
-    "System check: in your last reply you told the visitor you let someone know they are here, "
-    "but notify_member was not called, so nobody was told. If you have the visitor's name, read "
-    "back and confirmed, and know who they came to see, call notify_member now, then confirm it "
-    "as its answer says. Otherwise say in a few words that you have not told anyone yet, and read "
-    "their name back or ask for what is missing."
+    "System check: in your last reply you told the visitor someone was told they are here, but "
+    "notify_member was not called, so nobody was told. If you have the visitor's name, read back "
+    "and confirmed, and know who they came to see, call notify_member now, then confirm it as its "
+    "answer says. Otherwise ask for what is missing in one short question, and never say that "
+    "anyone was told, notified or informed — or that you will tell them — until notify_member "
+    "answers NOTIFIED."
 )
 
 # "Please check your request on the screen" before show_project_request has
@@ -743,6 +797,21 @@ class MiaAgent(Agent):
         self._read_backs: list[tuple[int, str]] = []
         # The visitor turn in which notify_member last answered NOTIFIED (NOTIFY_CLAIM).
         self._notify_turn = -1
+        # The visitor turn whose false notify claim was dropped and checked.
+        self._notify_check_turn = -1
+        # Voice message (#5, round 2): the flow is active from the tool call to
+        # the done-note (turns are swallowed meanwhile); the recorder captures
+        # mic frames only while armed (stt_node); the transcript collects the
+        # dictation's final transcripts while _vm_collecting; _vm_done is set
+        # when the visitor says a stop word. The finished recording waits in
+        # _voice_message for their yes, and is dropped the moment it is sent.
+        self._vm_active = False
+        self._vm_collecting = False
+        self._vm_done = False
+        self._vm_transcript: list[str] = []
+        self._vm_recorder: Recorder | None = None
+        self._voice_message: VoiceMessage | None = None
+        self._voice_sent_to = ""  # who the last one went to (the repeat answer)
         # The visitor turn in which a tool last tried to send an email
         # (sends_email), and the end that waits on the visitor after it.
         self._send_turn = -1
@@ -909,7 +978,21 @@ class MiaAgent(Agent):
             self.session.say(ASK_LANGUAGE_AGAIN)
 
     async def stt_node(self, audio, model_settings):
-        async for event in super().stt_node(audio, model_settings):
+        # While a voice message records, the same frames the STT hears are
+        # captured for the recording (#5): the mic is teed, never rerouted, so
+        # the transcript and the stop words keep working.
+        async def frames():
+            async for frame in audio:
+                rec = self._vm_recorder
+                if rec is not None:
+                    try:
+                        rec.add_frame(frame)
+                    except Exception:
+                        logger.exception("voice message: capturing a frame failed; recording stopped")
+                        self._vm_recorder = None
+                yield frame
+
+        async for event in super().stt_node(frames(), model_settings):
             alternatives = getattr(event, "alternatives", None)
             if alternatives:
                 confidence = getattr(alternatives[0], "confidence", None)
@@ -924,6 +1007,15 @@ class MiaAgent(Agent):
                 if text.strip() and kind == SpeechEventType.FINAL_TRANSCRIPT:
                     self._heard_speech_id = self._speech_id
                     self._unheard = 0
+                    if self._vm_collecting:
+                        # The dictation, for the email's transcript. Only its
+                        # length is logged: the message is the visitor's.
+                        kept, done = strip_done(text)
+                        if kept:
+                            self._vm_transcript.append(kept)
+                        if done and not self._vm_done:
+                            logger.info("voice message: stop word heard")
+                            self._vm_done = True
                 # "Stop talking" cuts her off on the first interim transcript
                 # that has it, not when the turn ends ~1s later. (Any speech
                 # over half a second interrupts her anyway; a short "Stop!"
@@ -939,10 +1031,11 @@ class MiaAgent(Agent):
             yield event
 
     async def llm_node(self, chat_ctx, tools, model_settings):
-        # Paused means no LLM calls at all. Turns are already dropped in
-        # _plan_turn, but preemptive generation starts Gemini on the transcript
-        # before the turn is even complete.
-        if self._paused:
+        # Paused, or taking a voice message (#5), means no LLM calls at all.
+        # Turns are already dropped before Gemini sees them, but preemptive
+        # generation starts Gemini on the transcript before the turn is even
+        # complete.
+        if self._paused or self._vm_active:
             return
         messages = [i for i in chat_ctx.items if getattr(i, "type", "") == "message"]
         visitor = [i for i in messages if i.role == "user"]
@@ -963,20 +1056,39 @@ class MiaAgent(Agent):
         project_talk = bool(self._project) or any(
             re.search(r"\bproje[ct]t?\b", fold(i.text_content or "")) for i in messages
         )
-        if not project_talk or self._project_shown_at is not None:
+        # Sentences that must not be said untrue, each held back until its tool
+        # has made it true in this same step, and dropped otherwise:
+        #   * "check your request on the screen" before show_project_request
+        #     answered SHOWN (SCREEN_CLAIM_NOTE);
+        #   * "I've let Alexandre know" (or "I'll let…") before notify_member
+        #     answered NOTIFIED (#10 hardening, NOTIFY_CLAIM_NOTE) — said once
+        #     in six runs in the 2026-10-12 merge tests, where the after-the-
+        #     fact check could only correct it after it had already played.
+        watch_project = project_talk and self._project_shown_at is None
+        watch_notify = not self._notifications_sent
+        if not (watch_project or watch_notify):
             async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
                 yield chunk
             return
-        # A project request may be under way and isn't on the screen yet: her
-        # text is passed on one sentence at a time, and one claiming it is on
-        # the screen is held back until the end of this step. If she called
-        # show_project_request in the same step and it answered SHOWN, the
-        # sentence is true by then and is said; otherwise it is dropped
-        # (SCREEN_CLAIM_NOTE). Tool calls pass straight through.
+        # Her text is passed on one sentence at a time; tool calls pass
+        # straight through (and run as soon as they are called, while she is
+        # still talking).
         turn = self._visitor_turns
         pending = ""
-        held: list[str] = []
+        held_project: list[str] = []
+        held_notify: list[str] = []
         shows = False
+        notifies = False
+
+        def hold(sentence: str) -> bool:
+            if watch_project and self._early_screen_claim(sentence):
+                held_project.append(sentence)
+                return True
+            if watch_notify and self._early_notify_claim(sentence):
+                held_notify.append(sentence)
+                return True
+            return False
+
         async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
             if isinstance(chunk, str):
                 text, chunk = chunk, None
@@ -986,36 +1098,46 @@ class MiaAgent(Agent):
             else:
                 text = ""
             if isinstance(chunk, ChatChunk) and chunk.delta and chunk.delta.tool_calls:
-                shows = shows or any(c.name == "show_project_request" for c in chunk.delta.tool_calls)
+                names = {c.name for c in chunk.delta.tool_calls}
+                shows = shows or "show_project_request" in names
+                notifies = notifies or "notify_member" in names
             pending += text
             while match := SENTENCE_END.search(pending):
                 sentence, pending = pending[: match.end()], pending[match.end() :]
-                if self._early_screen_claim(sentence):
-                    held.append(sentence)
-                    continue
-                yield sentence
+                if not hold(sentence):
+                    yield sentence
             if chunk is not None:
                 yield chunk
-        if pending and self._early_screen_claim(pending):
-            held.append(pending)
-        elif pending:
+        if pending and not hold(pending):
             yield pending
-        if not held:
-            return
-        if shows:
-            # Tools run as soon as they are called, while she is still talking.
-            for _ in range(10):
-                if self._project_shown_at is not None:
-                    break
-                await asyncio.sleep(0.1)
-        if self._project_shown_at is not None:
-            for sentence in held:
-                yield sentence
-            return
-        logger.warning("dropped, the project request is not on the screen yet: %r", "".join(held))
-        if self._screen_check_turn != turn:
-            self._screen_check_turn = turn
-            self._spawn(self._check_screen_claim(turn))
+        if held_project:
+            if shows:
+                for _ in range(10):
+                    if self._project_shown_at is not None:
+                        break
+                    await asyncio.sleep(0.1)
+            if self._project_shown_at is not None:
+                for sentence in held_project:
+                    yield sentence
+            else:
+                logger.warning("dropped, the project request is not on the screen yet: %r", "".join(held_project))
+                if self._screen_check_turn != turn:
+                    self._screen_check_turn = turn
+                    self._spawn(self._check_screen_claim(turn))
+        if held_notify:
+            if notifies:
+                for _ in range(10):
+                    if self._notifications_sent:
+                        break
+                    await asyncio.sleep(0.1)
+            if self._notifications_sent:
+                for sentence in held_notify:
+                    yield sentence
+            else:
+                logger.warning("dropped, nobody was notified: %r", "".join(held_notify))
+                if self._notify_check_turn != turn:
+                    self._notify_check_turn = turn
+                    self._spawn(self._check_notify_claim(turn, "".join(held_notify)))
 
     def _early_screen_claim(self, sentence: str) -> bool:
         """True for "check your request on the screen" while it isn't there."""
@@ -1023,6 +1145,17 @@ class MiaAgent(Agent):
             return False
         s = fold(sentence)
         return bool(SCREEN_WORDS.search(s) and DRAFT_WORDS.search(s) and not NOT_DRAFT_WORDS.search(s))
+
+    def _early_notify_claim(self, sentence: str) -> bool:
+        """True for "I've let Alexandre know" (or that she will) while nobody
+        was notified. A question is an offer ("Would you like me to let him
+        know?"), never a claim."""
+        if self._notifications_sent:
+            return False
+        s = sentence.strip()
+        if s.endswith("?"):
+            return False
+        return bool(NOTIFY_CLAIM.search(s))
 
     async def _check_screen_claim(self, turn: int) -> None:
         """A sentence about the request on the screen was dropped: once this
@@ -1081,17 +1214,25 @@ class MiaAgent(Agent):
             self._spawn(self._check_notify_claim(self._visitor_turns, said))
 
     async def _check_notify_claim(self, turn: int, said: str) -> None:
-        """She said she told someone the visitor is here: once this turn is
-        over (its tools included), make sure notify_member actually ran."""
+        """She said (or llm_node dropped her saying) that someone was told the
+        visitor is here: once this turn is over (its tools included), make
+        sure notify_member actually ran, and have her recover otherwise."""
         try:
             handle = self.session.current_speech
             if handle is not None:
                 await handle
             await asyncio.sleep(0.3)
-            if self._notify_turn == turn or self._notifications_sent or self._paused or self._ending:
+            if (
+                self._notify_turn == turn
+                or self._notifications_sent
+                or self._visitor_turns != turn
+                or self._paused
+                or self._vm_active
+                or self._ending
+            ):
                 return
             logger.warning("said she notified someone without notify_member: %r", said)
-            self.session.generate_reply(instructions=NOTIFY_CLAIM_NOTE)
+            self.session.generate_reply(instructions=_reply_language_note(self.language) + " " + NOTIFY_CLAIM_NOTE)
         except Exception:
             logger.exception("notify claim check failed")
 
@@ -1174,6 +1315,190 @@ class MiaAgent(Agent):
         self._sent.add("message", member.email, message)
         self._show_sent("message", self._display_name(member))
         return f"SENT to {member.full_name}."
+
+    # --- Voice messages (#5, round 2, voice_message.py) -----------------------
+    # record_voice_message starts the recorder: the worker says the recording
+    # line itself, then captures the kiosk mic while she stays silent, until a
+    # stop word ("done", "c'est tout"), VM_SILENCE_S of silence, or VM_MAX_S.
+    # The finished recording waits in _voice_message for the visitor's yes;
+    # send_voice_message emails it (audio attached, with the transcript, after
+    # the usual read-back) and drops the audio the moment it is sent.
+
+    @function_tool()
+    async def record_voice_message(self, context: RunContext, recipient: str, visitor_name: str) -> str | None:
+        """Record a voice message in the visitor's own voice for a team member listed under TEAM, or for the general inbox.
+
+        Call this only when the visitor asked for a voice message, or said yes
+        when you offered one, and only once you have their name and who it is
+        for. Say nothing yourself: it tells the visitor when to speak. While it
+        records you stay silent; the system tells you when it is done. Calling
+        it again replaces the previous recording, to re-record.
+
+        Args:
+            recipient: Who the message is for, as the visitor said it: a name or a role such as "the CEO".
+            visitor_name: The visitor's name, as they gave it.
+        """
+        if self._vm_active:
+            return "NOT RECORDED: a recording is already running."
+        if self._call is not None:
+            return "NOT RECORDED: a call is ringing. Offer to record once the call is over."
+        if self._messages_sent >= MAX_MESSAGES_PER_SESSION:
+            return "NOT RECORDED: message limit for this conversation reached. Give the contact details instead."
+        member = find_member(recipient, TEAM)
+        if member is None:
+            return (
+                f"NOT RECORDED: no single team member matches {recipient!r}. If it is unclear, ask who "
+                "they mean. Otherwise say you cannot reach that person from here and offer the general inbox."
+            )
+        if not self._visitor_named(visitor_name, member):
+            return NOT_THEIR_NAME.format(name=visitor_name).replace("NOT SENT", "NOT RECORDED", 1)
+        logger.info("record_voice_message: recording for %s", member.full_name)
+        self._vm_active = True
+        self._vm_done = False
+        self._vm_transcript = []
+        self._speak_in(self.language)
+        first = self._display_name(member) if member.inbox else member.first_name
+        handle = self.session.say(RECORD_LINE[self.language].format(first=first), allow_interruptions=False)
+        self._spawn(self._run_voice_recording(member, handle))
+        return None  # no reply after the tool: the line above is it
+
+    async def _capture_voice_message(self, member) -> tuple[bytes, int, float, str]:
+        """Capture the kiosk mic until a stop word, silence or the max length:
+        (mono PCM, sample rate, seconds kept, why it stopped). The frames come
+        through stt_node's tee; the text tests, which have no microphone, swap
+        this method out."""
+        rec = Recorder()
+        self._vm_recorder = rec
+        self._vm_collecting = True
+        try:
+            t0 = time.monotonic()
+            last_voice = None
+            why = "max length"
+            while True:
+                await asyncio.sleep(0.2)
+                now = time.monotonic()
+                if self._ending:
+                    why = "session ending"
+                    break
+                if self._vm_recorder is None:  # capturing failed in stt_node
+                    why = "failed"
+                    break
+                if self.session.user_state == "speaking":
+                    last_voice = now
+                    rec.mark_voice()
+                if self._vm_done:
+                    why = "stop word"
+                    break
+                if now - t0 >= VM_MAX_S:
+                    break
+                if last_voice is None:
+                    if now - t0 >= VM_START_TIMEOUT_S:
+                        why = "no speech"
+                        break
+                elif now - last_voice >= VM_SILENCE_S:
+                    why = "silence"
+                    break
+            # The last phrase's final transcript may still be in flight.
+            await asyncio.sleep(0.8)
+            pcm = rec.finalize()
+            return pcm, rec.rate, len(pcm) / 2 / rec.rate, why
+        finally:
+            self._vm_recorder = None
+            self._vm_collecting = False
+
+    async def _run_voice_recording(self, member, handle) -> None:
+        """The flow around _capture_voice_message: wait out the recording
+        line, show the recording card, capture and encode, then have her read
+        back and offer to send (VM_DONE_NOTE)."""
+        why = "failed"
+        pcm, rate, seconds = b"", 48000, 0.0
+        try:
+            with contextlib.suppress(Exception):
+                await handle  # her "I'm recording…" line must finish first
+            self._show(recording_card("on", self._chosen_language), busy_for=VM_MAX_S + 30)
+            pcm, rate, seconds, why = await self._capture_voice_message(member)
+        except Exception:
+            logger.exception("voice message recording failed")
+        finally:
+            self._vm_active = False
+            self._card_busy_until = 0.0
+            self._show(recording_card("off", self._chosen_language))
+        try:
+            transcript = " ".join(self._vm_transcript).strip()
+            self._vm_transcript = []
+            # Only sizes in the logs, never the message (privacy).
+            logger.info("voice message: stopped (%s), %.1f s kept, transcript %d chars", why, seconds, len(transcript))
+            if self._ending or why == "session ending":
+                return
+            self._speak_in(self.language)
+            if not pcm or seconds < VM_MIN_S:
+                self._voice_message = None
+                self.session.generate_reply(instructions=_reply_language_note(self.language) + " " + VM_EMPTY_NOTE)
+                return
+            audio, ext, mime = await encode_voice_audio(pcm, rate)
+            if not audio or len(audio) > MAX_ATTACHMENT_BYTES:
+                logger.error("voice message: encoding gave %d bytes, not sendable", len(audio))
+                self._voice_message = None
+                self.session.generate_reply(instructions=_reply_language_note(self.language) + " " + VM_FAILED_NOTE)
+                return
+            self._voice_message = VoiceMessage(
+                member=member, audio=audio, ext=ext, mime=mime, seconds=seconds, transcript=transcript
+            )
+            logger.info("voice message: ready for %s — %s, %d KB, %.0f s", member.full_name, ext, len(audio) // 1024, seconds)
+            name = "the general inbox" if member.inbox else member.full_name
+            self.session.generate_reply(
+                instructions=_reply_language_note(self.language)
+                + " "
+                + VM_DONE_NOTE.format(name=name, seconds=max(1, round(seconds)))
+            )
+        except Exception:
+            logger.exception("finishing the voice message failed")
+            self._voice_message = None
+            with contextlib.suppress(Exception):
+                self.session.generate_reply(instructions=_reply_language_note(self.language) + " " + VM_FAILED_NOTE)
+
+    @function_tool()
+    @sends_email
+    async def send_voice_message(self, context: RunContext, visitor_name: str, reply_contact: str = "") -> str:
+        """Email the recorded voice message, the visitor's recording attached, to the person it was recorded for.
+
+        Call this only after the system said the recording is done, you read
+        the visitor's name (and any phone or email they gave) back, and they
+        said yes. Tell the visitor it was sent only if this returns SENT.
+
+        Args:
+            visitor_name: The visitor's name, as they gave it.
+            reply_contact: A phone number or email for a reply, only if the visitor wants one. Empty otherwise.
+        """
+        vm = self._voice_message
+        if vm is None:
+            if self._voice_sent_to:
+                return (
+                    f"NOT SENT AGAIN: the voice message was already sent to {self._voice_sent_to}, and the "
+                    "recording was deleted right after sending, so it cannot be sent twice. Tell the visitor "
+                    "it is already sent; to add something, offer to record a new message."
+                )
+            return "NOT SENT: there is no recording. Offer to record one with record_voice_message, or take a dictated message."
+        if self._vm_active:
+            return "NOT SENT: the recording is still running. Wait for the system to say it is done."
+        if self._messages_sent >= MAX_MESSAGES_PER_SESSION:
+            return "NOT SENT: message limit for this conversation reached. Give the contact details instead."
+        if not self._visitor_named(visitor_name, vm.member):
+            return NOT_THEIR_NAME.format(name=visitor_name)
+        if (unconfirmed := self._send_confirmed(visitor_name, reply_contact)) is not None:
+            return unconfirmed
+        if not await send_voice_message_email(vm.member, visitor_name, reply_contact, vm):
+            return "NOT SENT: the email could not be delivered. Say so plainly and give the contact details."
+        # Privacy: the audio goes with the email and nowhere else.
+        self._voice_message = None
+        self._voice_sent_to = vm.member.full_name
+        self._messages_sent += 1
+        self._show_sent("message", self._display_name(vm.member))
+        logger.info("send_voice_message: sent to %s (%d KB, %.0f s)", vm.member.full_name, len(vm.audio) // 1024, vm.seconds)
+        return (
+            f"SENT to {vm.member.full_name}, with the recording attached. Tell the visitor, in their "
+            "language, that their voice message is sent, then ask whether there is anything else."
+        )
 
     @function_tool()
     @sends_email
@@ -1685,6 +2010,7 @@ class MiaAgent(Agent):
         if (
             self._paused
             or self._ending
+            or self._vm_active  # a tap mustn't talk over a recording
             or self.session.agent_state != "listening"
             or self.session.user_state == "speaking"
         ):
@@ -1984,6 +2310,12 @@ class MiaAgent(Agent):
         self._tts.update_options(model=VOICE_BY_LANG[lang])
 
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
+        if self._vm_active:
+            # The visitor is dictating a voice message (#5): never a
+            # conversation turn, never the LLM, never saved — stt_node already
+            # kept the transcript for the email. Only its size is logged.
+            logger.info("voice message: turn captured (%d chars)", len(new_message.text_content or ""))
+            raise StopResponse()
         text = (new_message.text_content or "").strip()
         confidence = self._last_confidence
         self._last_confidence = None  # don't carry a stale score into next turn

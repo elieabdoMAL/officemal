@@ -136,6 +136,9 @@ const IDLE_HINT_MS = 12000;
 function cardMs(card: Card): number {
   if (card.type === "contact_card" || card.type === "directions") return 45000;
   if (card.type === "project_request") return card.status === "draft" ? 180000 : 15000;
+  // The worker takes the recording card down itself when the recording stops
+  // ("recording" with status "off"); this is only the backstop (#5, round 2).
+  if (card.type === "recording") return 90000;
   return 10000;
 }
 
@@ -287,7 +290,12 @@ export default function SimliLiveKitPanel({
       setInCall(false);
       tellTop({ type: "receptionist-call-close" });
     } else if (m.type === "call_answered") callAnsweredRef.current = true;
-    else if (m.type === "contact_card") setCard({ type: "contact_card", lang: m.lang ?? langRef.current });
+    else if (m.type === "recording") {
+      // A voice message is being recorded (#5): show the state while the
+      // visitor dictates; "off" only removes this card, never another.
+      if (m.status === "on") setCard({ type: "recording", lang: m.lang ?? langRef.current });
+      else setCard((c) => (c?.type === "recording" ? null : c));
+    } else if (m.type === "contact_card") setCard({ type: "contact_card", lang: m.lang ?? langRef.current });
     else if (m.type === "project_request")
       setCard({ type: "project_request", status: m.status, fields: m.fields, lang: m.lang ?? langRef.current });
     else if (m.type === "directions")

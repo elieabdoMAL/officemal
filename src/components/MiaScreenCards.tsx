@@ -22,7 +22,8 @@ export type Card =
   | { type: "contact_card"; lang: Lang | null }
   | { type: "message_sent"; kind: SentKind; to?: string; lang: Lang | null }
   | { type: "project_request"; status: ProjectStatus; fields: ProjectFields; lang: Lang | null }
-  | { type: "directions"; address: string; maps_url: string; lang: Lang | null };
+  | { type: "directions"; address: string; maps_url: string; lang: Lang | null }
+  | { type: "recording"; lang: Lang | null };
 
 // The card sits to her left (the visitor's right), over the panorama, so it
 // doesn't cover her face; it may overlap her shoulder.
@@ -194,6 +195,50 @@ function DirectionsCard({
         )}
         <div style={{ fontSize: "0.9em", fontWeight: 600, color: "#14213d" }}>
           {pick(lang, L.scanDirections).map((t) => (
+            <div key={t}>{t}</div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// A voice message is being recorded (#5, round 2): a red pulsing dot and how
+// to finish. No ×: it is a state, not content — the worker takes it down when
+// the recording stops.
+const RECORDING_TEXT = {
+  title: { fr: "Enregistrement", en: "Recording" },
+  hint: {
+    fr: "Dites « c'est tout » quand vous avez terminé",
+    en: "Say “done” when you're finished",
+  },
+};
+
+function RecordingCard({ lang }: { lang: Lang | null }) {
+  return (
+    <div
+      role="status"
+      data-card="recording"
+      style={{ ...cardBox, display: "flex", alignItems: "center", gap: "1.2vw", borderTop: "0.45vw solid #dc2626" }}
+    >
+      <style>{"@keyframes miaRecPulse{0%,100%{opacity:1}50%{opacity:0.25}}"}</style>
+      <div
+        aria-hidden
+        style={{
+          flex: "none",
+          width: "2.6vw",
+          height: "2.6vw",
+          minWidth: 22,
+          minHeight: 22,
+          borderRadius: "50%",
+          background: "#dc2626",
+          animation: "miaRecPulse 1.6s ease-in-out infinite",
+        }}
+      />
+      <div>
+        <div style={{ fontWeight: 800, fontSize: "1.15em", color: "#b91c1c" }}>{label(lang, RECORDING_TEXT.title)}</div>
+        <div style={{ fontWeight: 600, fontSize: "0.9em", marginTop: "0.3vw" }}>
+          {pick(lang, RECORDING_TEXT.hint).map((t) => (
             <div key={t}>{t}</div>
           ))}
         </div>
@@ -430,6 +475,7 @@ export default function MiaScreenCard({ card, onClose }: { card: Card; onClose: 
     return <ProjectRequestCard status={card.status} fields={card.fields} lang={card.lang} onClose={onClose} />;
   if (card.type === "directions")
     return <DirectionsCard address={card.address} mapsUrl={card.maps_url} lang={card.lang} onClose={onClose} />;
+  if (card.type === "recording") return <RecordingCard lang={card.lang} />;
   return <MessageSentCard kind={card.kind} to={card.to} lang={card.lang} onClose={onClose} />;
 }
 

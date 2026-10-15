@@ -146,12 +146,17 @@ def install_recorders(worker) -> None:
         fake_calls.append(FakeCall(member))
         return fake_calls[-1]
 
+    async def voice(member, visitor_name, reply_contact, vm):
+        calls.append(("voice", member.full_name, visitor_name, reply_contact, vm))
+        return True
+
     worker.start_staff_call = call
     worker.send_message_email = message
     worker.send_visitor_waiting_email = notify
     worker.send_emergency_email = emergency
     worker.send_suggestion_email = suggestion
     worker.send_project_request_email = project
+    worker.send_voice_message_email = voice
 
 
 class Conversation:

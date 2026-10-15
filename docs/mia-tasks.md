@@ -142,6 +142,26 @@ New abilities are added as **function tools** on `MiaAgent` in the worker.
   the screen. The layout of captions, Contact button and cards is tuned in
   one place, `src/lib/screenLayout.ts` (#3), with before/after screenshots
   from `tests/screen/shots.mjs`. `docs/screen-protocol.md` sections 3, 5, 9
+- Voice messages (round 2, #5): a message for someone in `team.json` or the
+  general inbox can be recorded in the visitor's own voice instead of dictated
+  (`record_voice_message`). The worker says the recording line itself, shows a
+  "● Recording — say 'done' when finished" card (`mia.screen`,
+  `docs/screen-protocol.md` section 3), captures the kiosk mic while she stays
+  silent — the dictation never reaches her LLM, the history or the logs — and
+  stops on "done"/"c'est tout", ~2.5 s of silence, or 60 s
+  (`VOICE_MESSAGE_MAX_S`). She reads back the visitor's name and the length
+  and, on their yes (confirm-before-sending, as for every send),
+  `send_voice_message` emails it: OGG/Opus attached (WAV if ffmpeg fails),
+  with the speech-recognition transcript. The audio lives only in memory and
+  is deleted the moment it is sent; re-record replaces it; it cannot be sent
+  twice. `agent-worker/voice_message.py`
+- No false "I've let X know" (round 2, #5 hardening): a sentence claiming
+  someone was — or will be — told the visitor is here is held back in
+  `llm_node` until `notify_member` has answered NOTIFIED in that turn, and
+  dropped otherwise (she then recovers and asks for what is missing). The old
+  after-the-fact check (`NOTIFY_CLAIM`, which also missed future tense and
+  passives) could only correct the lie after it had played; it stays as a
+  backstop
 
 Tests for all the team tools and goodbye: `agent-worker/test_team_messages.py`
 (text conversations against the real Gemini, emails replaced by recorders).
@@ -160,6 +180,12 @@ The round-2 notes (#1, #4, #6, #7): `agent-worker/test_round2.py`, same
 harness (read-back guards and the directions card offline; small talk,
 emotions once, the virtual office, the "Debriel" correction and directions
 against Gemini, in English and French).
+Voice messages (#5): `agent-worker/test_voice_message.py` (the recorder, stop
+words, encoders and the notify-claim hold offline with synthetic audio; the
+EN/FR flows, cancel, re-record and someone not in team.json against Gemini
+with a stubbed microphone), and the `voice_message` scenario in
+`tests/voice/scenarios.json` (the real kiosk: dictate, "done", read-back,
+send — the email reaches the Resend sandbox with the OGG attached).
 
 ## To build
 

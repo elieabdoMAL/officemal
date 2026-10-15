@@ -158,6 +158,36 @@
     "lines": [["Français.",11], ["Mon collègue parle anglais, il viendra demain.",14]],
     "expect": {"lang": "fr", "notTools": ["switch"], "ended": false}
   },
+  "voice_message": {
+    "groups": ["vm"],
+    "about": "Voice message (#5, round 2): asks the name, records the visitor's dictation while staying silent (recording card up), stops on 'Done', reads back Sam Fortin and the length, sends on the yes (real Resend, sandbox inbox, OGG attached), confirms, ends on goodbye.",
+    "voice": "en",
+    "lines": [
+      ["English.", 11],
+      ["Hi, I'd like to leave a voice message for Nicolas.", 10],
+      ["My name is Sam Fortin.", 13],
+      ["Hi Nicolas, it's Sam. Please call me back about the demo next week.", 1],
+      ["Done.", 12],
+      ["Yes, that's right, please send it.", 14],
+      ["Thanks, goodbye!", 20]
+    ],
+    "expect": {
+      "logs": [
+        "record_voice_message: recording for Nicolas Bastien",
+        "/voice message: stopped \\((stop word|silence)\\)/",
+        "/voice message: ready for Nicolas Bastien/",
+        "/send_voice_message: sent to Nicolas Bastien/",
+        "/screen card: .*recording.*on/",
+        "/screen card: .*recording.*off/"
+      ],
+      "notLogs": ["/voice message: stopped \\((no speech|max length|failed)\\)/"],
+      "say": [["recording your message"], ["/sam|fortin/"], ["/second/"], ["sent"]],
+      "notSaid": ["/demo next week/"],
+      "tools": ["end_conversation"],
+      "notTools": ["take_message"],
+      "ended": true
+    }
+  },
   "press_screen": {
     "groups": ["screen"],
     "about": "Screen buttons (#2): names where the sound button is without pressing anything, then presses public_meeting when asked to open the public meeting room.",

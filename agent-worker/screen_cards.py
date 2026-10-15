@@ -57,6 +57,12 @@ def directions_card(lang: str | None) -> dict:
     return _with_lang({"type": "directions", "address": OFFICE_ADDRESS, "maps_url": OFFICE_MAPS_URL}, lang)
 
 
+def recording_card(status: str, lang: str | None) -> dict:
+    """The voice-message state (#5, round 2): "on" shows the red "Recording —
+    say done when finished" card while the visitor dictates, "off" removes it."""
+    return _with_lang({"type": "recording", "status": status}, lang)
+
+
 # The on-screen buttons Mia can press herself (#2, worker.py's press_button).
 # Must match PRESS_BUTTONS in src/lib/screenProtocol.ts: the screen ignores a
 # press with any other name.

@@ -206,10 +206,14 @@ def _one_line(text: str, limit: int) -> str:
     return " ".join(text.split())[:limit]
 
 
-async def _send_email(what: str, to: list[str], subject: str, body: str, reply_to: str = "") -> bool:
+async def _send_email(
+    what: str, to: list[str], subject: str, body: str, reply_to: str = "", attachments: list[dict] | None = None
+) -> bool:
     """Send one email through Resend. True only if Resend accepted it.
 
-    `what` names the caller (the tool) in the logs.
+    `what` names the caller (the tool) in the logs. `attachments`: Resend's
+    shape, [{"filename", "content" (base64), "content_type"}] — a voice
+    message's recording rides along this way (voice_message.py).
     """
     api_key = os.environ.get("RESEND_API_KEY", "").strip()
     sender = os.environ.get("RESEND_FROM_EMAIL", "").strip()
@@ -220,6 +224,8 @@ async def _send_email(what: str, to: list[str], subject: str, body: str, reply_t
     payload: dict = {"from": sender, "to": to, "subject": subject, "html": body}
     if EMAIL_RE.match(reply_to):
         payload["reply_to"] = reply_to
+    if attachments:
+        payload["attachments"] = attachments
 
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as http:

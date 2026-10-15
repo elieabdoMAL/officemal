@@ -70,11 +70,17 @@ export type ScreenMessage =
   | { type: "message_sent"; kind?: SentKind; to?: string; lang?: Lang }
   | { type: "project_request"; status: ProjectStatus; fields: ProjectFields; lang?: Lang }
   | { type: "directions"; address: string; maps_url: string; lang?: Lang }
+  | { type: "recording"; status: RecordingStatus; lang?: Lang }
   | { type: "press"; button: PressButton }
   | { type: "call_open"; url: string; token: string; to?: string; lang?: Lang }
   | { type: "call_close" }
   | { type: "call_answered" }
   | { type: "dismiss" };
+
+// A voice message is being recorded (#5, round 2): "on" shows the red
+// "● Recording — say 'done' when finished" card while the visitor dictates,
+// "off" removes it (the worker's record_voice_message).
+export type RecordingStatus = "on" | "off";
 
 const SENT_KINDS: SentKind[] = ["message", "notify", "alert", "suggestion", "project_request", "meeting"];
 
@@ -130,6 +136,9 @@ export function parseScreenMessage(raw: unknown): ScreenMessage | null {
       if (typeof o.maps_url !== "string" || !/^https:\/\/\S+$/.test(o.maps_url) || o.maps_url.length > 500) return null;
       return { type: "directions", address: o.address.trim().slice(0, 200), maps_url: o.maps_url, lang };
     }
+    case "recording":
+      if (o.status !== "on" && o.status !== "off") return null;
+      return { type: "recording", status: o.status, lang };
     case "press":
       if (!PRESS_BUTTONS.includes(o.button as PressButton)) return null;
       return { type: "press", button: o.button as PressButton };

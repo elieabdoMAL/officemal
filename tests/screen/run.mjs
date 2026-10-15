@@ -126,6 +126,24 @@ async function embedAlone(browser) {
   check((await card.textContent() ?? "").includes("Scan for directions"), 'lang en says "Scan for directions"');
   await page.evaluate(() => window.miaDev.screen({ type: "dismiss" }));
 
+  // The recording card (#5, round 2): on shows it, off removes it (and only it).
+  const recDrew = await page.evaluate(() => [
+    Boolean(window.miaDev.screen({ type: "recording", status: "on", lang: "en" })),
+    window.miaDev.screen({ type: "recording", status: "paused" }),
+  ]);
+  check(recDrew[0] && recDrew[1] === null, "recording on accepted, unknown status refused");
+  const rec = page.locator('[data-card="recording"]');
+  check(await rec.isVisible().catch(() => false), "recording card is up");
+  check((await rec.textContent() ?? "").includes("Say “done” when you're finished"), "it says how to finish (lang en)");
+  check((await rec.locator("button").count()) === 0, "no × on it: it is a state, not content");
+  await shot(page, "embed_recording");
+  await page.evaluate(() => window.miaDev.screen({ type: "recording", status: "off" }));
+  check(await rec.isHidden().catch(() => true), "recording off removes it");
+  await page.evaluate((m) => window.miaDev.screen(m), DIRECTIONS);
+  await page.evaluate(() => window.miaDev.screen({ type: "recording", status: "off" }));
+  check(await card.isVisible().catch(() => false), "a stray off never closes another card");
+  await page.evaluate(() => window.miaDev.screen({ type: "dismiss" }));
+
   await context.close();
 }
 
