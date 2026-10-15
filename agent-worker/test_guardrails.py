@@ -309,11 +309,15 @@ async def sent_claims() -> None:
         lines = [
             "Please send an email to Nicolas for me.",
             "I'm Rita Moreau.",
-            "Tell him the prototype looks great and I'd like to meet next week.",
+            "Tell him the prototype looks great and I'd like to meet next week. No need for my contact, he has it.",
             "Yes, that's right.",
+            # Her read-back of the name and message (#6 round 2) may take a turn of its own.
+            "Yes, all correct.",
         ]
         replies = []
         for line in lines:
+            if line == lines[-1] and recorded("message", n):
+                break
             before = len(recorded("message", n))
             r = await c.turn(line, "en")
             replies.append(r["reply"])
@@ -339,10 +343,13 @@ async def sent_claims() -> None:
         worker.send_message_email = failing
         try:
             await english(c)
+            n2 = len(calls)
             await c.turn("I want to leave a message for Alexandre.", "en")
             await c.turn("Omar Haddad.", "en")
-            await c.turn("Just tell him I dropped by.", "en")
+            await c.turn("Just tell him I dropped by. No need for a reply.", "en")
             r = await c.turn("Yes, correct.", "en")
+            if not [x for x in calls[n2:] if x[0] == "message-failed"]:  # the read-back took a turn (#6r2)
+                r = await c.turn("Yes, that's right.", "en")
         finally:
             worker.send_message_email = real
         tried = [x for x in calls if x[0] == "message-failed"]
@@ -354,8 +361,10 @@ async def sent_claims() -> None:
         n = len(calls)
         await c.turn("Can I leave a message for the team?", "en")
         await c.turn("Ben Carter.", "en")
-        await c.turn("I'd like a call back about a website for my bakery.", "en")
+        await c.turn("I'd like a call back about a website for my bakery. My number is 450 555 0177.", "en")
         r = await c.turn("Yes, perfect, thanks, bye!", "en")
+        if not recorded("message", n):  # the read-back took a turn (#6r2)
+            r = await c.turn("Yes, that's right, thanks, bye!", "en")
         check(len(recorded("message", n)) == 1, "one breath: message sent")
         check(has(r["reply"], "sent"), "one breath: says it's sent")
         # ENDING: send and confirm, then end only if the visitor has nothing more (worker.END_AFTER_SEND_S).
@@ -367,8 +376,10 @@ async def sent_claims() -> None:
         n = len(calls)
         await c.turn("I'd like to leave a message for Nicolas.", "en")
         await c.turn("Julie Roy.", "en")
-        await c.turn("Tell him the samples arrived.", "en")
+        await c.turn("Tell him the samples arrived. No need for a reply.", "en")
         r = await c.turn("Yes, that's it, thanks, bye!", "en")
+        if not recorded("message", n):  # the read-back took a turn (#6r2)
+            r = await c.turn("Yes, that's right, thanks, bye!", "en")
         check(len(recorded("message", n)) == 1 and not c.agent._ending, f"one breath 2: sent, not ended ({r['reply']!r})")
         r = await c.turn("Oh wait, what's your phone number?", "en")
         await asyncio.sleep(worker.END_AFTER_SEND_S + 2)

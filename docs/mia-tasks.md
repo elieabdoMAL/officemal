@@ -111,6 +111,29 @@ New abilities are added as **function tools** on `MiaAgent` in the worker.
   send-once checks as the emails. Off until `GOOGLE_CALENDAR_ID` and the
   service account key are set (setup: `agent-worker/README.md`, "Meeting
   calendar"); she then offers a message instead. `agent-worker/meetings.py`
+- Confirm before sending (round 2, #6): before every send — message, notice,
+  video call, suggestion with a name, meeting — she reads back the visitor's
+  full name and any phone or email in one combined question (spelling the name
+  when unsure) and sends only on their yes; a correction ("Gabriel, not
+  Debriel") is read back again and the corrected details are what is sent.
+  Enforced in code, not just the prompt: the tools refuse (NOT SENT) until the
+  name and contact appear in one of her earlier replies
+  (`worker.MiaAgent._send_confirmed`, `conversation_control.contact_read_back`),
+  and `take_message` also refuses in the turn the message was dictated. The
+  project request's read-back is its draft on screen, as before
+- Small talk and feelings (round 2, #1): "I'm tired", "busy day" get a warm
+  brief answer, never a lecture; a real request for emotional support gets at
+  most one short kind sentence per conversation that she can't help with that,
+  then what she can do (prompt, SMALL TALK AND FEELINGS)
+- Virtual office (round 2, #4): when a visitor wants to "go see" someone or
+  says they're here, she explains the 3D office is a virtual space — the team
+  works from the Sainte-Thérèse office (74 Turgeon Street) and remotely — and
+  offers the ways to reach them: notify, video call, message, meeting (prompt,
+  WHERE YOU ARE)
+- Directions (round 2, #7): asked where the office is or how to get there, she
+  gives the address and `show_directions` puts a card on screen with the
+  address and a QR code to Google Maps; she points out the QR code
+  (`screen_cards.directions_card`, `docs/screen-protocol.md` section 3)
 
 Tests for all the team tools and goodbye: `agent-worker/test_team_messages.py`
 (text conversations against the real Gemini, emails replaced by recorders).
@@ -125,6 +148,10 @@ The video call (#22): `agent-worker/test_staff_call.py` (call room, tokens,
 link, email, call states and guards offline; offer, call, no answer, cancel,
 answered against Gemini), and `tests/voice/call.mjs` (the full kiosk page and
 a phone through real LiveKit: answered, no answer, cancel; see its header).
+The round-2 notes (#1, #4, #6, #7): `agent-worker/test_round2.py`, same
+harness (read-back guards and the directions card offline; small talk,
+emotions once, the virtual office, the "Debriel" correction and directions
+against Gemini, in English and French).
 
 ## To build
 

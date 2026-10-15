@@ -248,6 +248,10 @@ async def offline() -> None:
         out = await agent.call_staff(None, member="Nicolas", visitor_name=name)
         check(out.startswith("NOT CALLED") and "name" in out, f"call_staff(visitor_name={name!r}) before any name: {out[:50]}")
     agent._visitor_lines.append("I'm Eve Adams.")
+    out = await agent.call_staff(None, member="Nicolas", visitor_name="Eve Adams")
+    check(out.startswith("NOT CALLED") and "read" in out, f"call_staff before the name was read back (#6r2): {out[:60]}")
+    agent._read_backs = [(0, "So that's Eve Adams — is that right?")]
+    agent._visitor_turns = 1
     for who in ("Marc Dupont", "the general inbox", "info"):
         out = await agent.call_staff(None, member=who, visitor_name="Eve Adams")
         check(out.startswith("NOT CALLED"), f"call_staff(member={who!r}): {out[:50]}")
@@ -293,27 +297,33 @@ async def her_next_words(c: Conversation, seen: int, within: float = 20.0) -> st
 
 
 async def placed_call(c: Conversation, n: int, *lines: str) -> FakeCall | None:
-    """Say `lines` (then "Yes please." if she only offered); the call she placed."""
+    """Say `lines` (then yeses for her offer and her read-back of the name,
+    #6r2); the call she placed."""
     for line in lines:
         await c.say(line)
-    if not recorded("call", n):
-        await c.say("Yes please.")
+    for line in ("Yes please.", "Yes, that's right."):
+        if recorded("call", n):
+            break
+        await c.say(line)
     check(len(recorded("call", n)) == 1, f"call placed: {recorded('call', n)}")
     return fake_calls[-1] if recorded("call", n) else None
 
 
 async def conv_offer() -> None:
-    print("— English, wants to talk to Nicolas: offer, yes with the name, call:")
+    print("— English, wants to talk to Nicolas: offer, yes with the name, read-back, call:")
     n = len(calls)
     async with Conversation("en") as c:
         r1 = await c.say("Hi, I'd like to talk to Nicolas, please.")
         check(has(r1, "call") and not recorded("call", n), f"offers to call, doesn't call yet: {r1!r}")
         r2 = await c.say("Yes please. I'm Sophie Martin.")
+        check(has(r2, "sophie", "martin"), f"reads the name back before calling (#6r2): {r2!r}")
+        check(not recorded("call", n), f"no call before the name is confirmed: {recorded('call', n)}")
+        r3 = await c.say("Yes, that's right.")
         check(c.agent.call_active, "the call is ringing")
     called = recorded("call", n)
     check(not has(r1, "i'm calling", "i am calling"), f"doesn't say she's calling before the yes: {r1!r}")
     check(len(called) == 1 and called[0][1:] == ("Nicolas Bastien", "Sophie Martin"), f"called Nicolas for Sophie Martin: {called}")
-    check(has(r2, "I'm calling Nicolas now"), f"says 'I'm calling Nicolas now': {r2!r}")
+    check(has(r3, "I'm calling Nicolas now"), f"says 'I'm calling Nicolas now': {r3!r}")
     opened = screens(n, "call_open")
     check(len(opened) == 1 and opened[0].get("to") == "Nicolas Bastien" and opened[0].get("lang") == "en"
           and opened[0].get("token") == "kiosk-token" and opened[0].get("url", "").startswith("wss://"),
@@ -330,6 +340,10 @@ async def conv_name_first() -> None:
         # Either order is fine (Gemini varies): the name first, or the offer first.
         check(has(r1, "name", "call"), f"asks for the name or offers the call: {r1!r}")
         await c.say("David Chen.")
+        for line in ("Yes, that's right.", "Yes, please call him."):  # the read-back (#6r2)
+            if recorded("call", n):
+                break
+            await c.say(line)
     called = recorded("call", n)
     check(len(called) == 1 and called[0][1:] == ("Alexandre Joset", "David Chen"), f"then calls Alexandre: {called}")
 
@@ -340,6 +354,11 @@ async def conv_someone() -> None:
     async with Conversation("en") as c:
         r1 = await c.say("Can I speak to a real person?")
         await c.say("Sure. My name is Tom Baker.")
+        # Her offer and her read-back of the name (#6r2) come in either order.
+        for line in ("Yes, that's right.", "Yes please, call him."):
+            if recorded("call", n):
+                break
+            await c.say(line)
     called = recorded("call", n)
     check(has(r1, "Nicolas", "name", "connect"), f"offers Nicolas or asks the name first: {r1!r}")
     check(len(called) == 1 and called[0][1] == "Nicolas Bastien", f"calls Nicolas: {called}")
@@ -360,6 +379,10 @@ async def conv_decline() -> None:
     async with Conversation("en") as c:
         await c.say("I'd like to talk to Nicolas.")
         await c.say("No, don't call him. Just let him know I'm here. I'm Marie Roy.")
+        for line in ("Yes, that's right.", "Yes, exactly."):  # the read-back (#6r2)
+            if recorded("notify", n):
+                break
+            await c.say(line)
     check(not recorded("call", n), f"no call: {recorded('call', n)}")
     notified = recorded("notify", n)
     check(len(notified) == 1 and notified[0][1] == "Nicolas Bastien", f"Nicolas notified instead: {notified}")
@@ -376,18 +399,26 @@ async def conv_no_answer_fr() -> None:
         async with Conversation("fr") as c:
             r1 = await c.say("Bonjour, je voudrais parler à Alexandre.")
             r2 = await c.say("Oui, appelez-le s'il vous plaît. Je m'appelle Lucie Bouchard.")
+            check(has(r2, "lucie", "bouchard"), f"reads the name back before calling (#6r2): {r2!r}")
+            r3 = await c.say("Oui, c'est bien ça.")
             called = recorded("call", n)
             check(has(r1, "appelle"), f"offers the call (FR): {r1!r}")
             check(len(called) == 1 and called[0][1:] == ("Alexandre Joset", "Lucie Bouchard"), f"calls Alexandre: {called}")
-            check(has(r2, "J'appelle Alexandre"), f"'J'appelle Alexandre maintenant' (FR): {r2!r}")
+            check(has(r3, "J'appelle Alexandre"), f"'J'appelle Alexandre maintenant' (FR): {r3!r}")
             seen = len(c.session.history.items)
             said = await her_next_words(c, seen, within=20)
             check(has(said, "Alexandre") and has(said, "message"), f"no answer: says so and offers a message: {said!r}")
             check(len(screens(n, "call_close")) == 1, "call window closed (call_close)")
             check(bool(fake_calls) and fake_calls[-1].closed, "call room deleted")
             check(not c.agent.call_active and c.agent.call_ended_at is not None, "the call is over")
-            await c.say("Oui, dites-lui que je repasserai demain matin.")
-            await c.say("Pas besoin de me rappeler. Oui, c'est parfait, envoyez-le.")
+            await c.say("Oui, dites-lui que je repasserai demain matin. Pas besoin de me rappeler.")
+            # Chat W saw the message go out without a read-back after a
+            # no-answer call: it must wait for the visitor's yes.
+            check(not recorded("message", n), f"the message is read back before it is sent: {recorded('message', n)}")
+            for line in ("Oui, c'est parfait, envoyez-le.", "Oui, c'est bien ça."):
+                if recorded("message", n):
+                    break
+                await c.say(line)
     finally:
         worker.CALL_ANSWER_TIMEOUT = real_timeout
     sent = recorded("message", n)

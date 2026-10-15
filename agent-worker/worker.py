@@ -66,6 +66,7 @@ from livekit.agents.stt import SpeechEventType
 from livekit.plugins import deepgram, google, simli
 
 from conversation_control import (
+    contact_read_back,
     fold,
     language_choice,
     language_switch,
@@ -86,11 +87,13 @@ from leads import (
     send_suggestion_email,
 )
 from screen_cards import (
+    DIRECTIONS_CARD_S,
     DRAFT_CARD_S,
     SENT_CARD_S,
     TOPIC_CONTROL,
     TOPIC_SCREEN,
     contact_card,
+    directions_card,
     gives_contact_details,
     message_sent,
     project_request,
@@ -506,14 +509,19 @@ NOTIFY_CLAIM = re.compile(
     r"\bI(?:'ve| have) (?:let (?!you\b)\w+ know|notified|informed)\b"
     r"|\bI(?:'m| am) (?:letting (?!you\b)\w+ know|notifying|informing)\b"
     r"|\bj'ai (?:prévenu|informé|avisé)\b"
-    r"|\bje (?:préviens|vais prévenir|l'informe|vais l'informer|l'avise)\b",
+    r"|\bje (?:préviens|vais prévenir|l'informe|vais l'informer|l'avise)\b"
+    # "J'informe Nicolas de votre arrivée" (seen 2026-10-12); "voulez-vous que
+    # j'informe Nicolas ?" is an offer, not a claim.
+    r"|(?<!que )\bj'(?:informe|avise|avertis)\b"
+    r"|\bje vais (?:informer|aviser|avertir)\b",
     re.IGNORECASE,
 )
 NOTIFY_CLAIM_NOTE = (
     "System check: in your last reply you told the visitor you let someone know they are here, "
-    "but notify_member was not called, so nobody was told. If you have the visitor's name and "
-    "know who they came to see, call notify_member now, then confirm it as its answer says. "
-    "Otherwise say in a few words that you have not told anyone yet, and ask for what is missing."
+    "but notify_member was not called, so nobody was told. If you have the visitor's name, read "
+    "back and confirmed, and know who they came to see, call notify_member now, then confirm it "
+    "as its answer says. Otherwise say in a few words that you have not told anyone yet, and read "
+    "their name back or ask for what is missing."
 )
 
 # "Please check your request on the screen" before show_project_request has
@@ -527,11 +535,13 @@ DRAFT_WORDS = re.compile(
     r"affichee|affichees|affiches|details?|informations?)\b"
 )
 # The screen's other uses: the contact card (whenever she gives the office's
-# details), the "sent" cards, and Infini View, which is moved around by touch.
+# details), the "sent" cards, the suggestion box, the directions card (#7,
+# round 2) and Infini View, which is moved around by touch.
 NOT_DRAFT_WORDS = re.compile(
     r"\b(contact|coordonnees|phone|telephone|number|numero|email|courriel|address|adresse|website|site|"
     r"sent|envoye|envoyee|message|confirmation|touch|touching|tap|pan|panning|slide|sliding|swipe|drag|"
-    r"toucher|touchez|glisser|glissez|appuyer|appuyez)\b"
+    r"toucher|touchez|glisser|glissez|appuyer|appuyez|suggestion|suggestions|sugger\w*|"
+    r"directions?|itineraire|carte|maps?|qr|scan\w*)\b"
 )
 STILL_HERE_NOTE = (
     "The conversation has not ended: after your goodbye, the visitor said something more. "
@@ -571,6 +581,26 @@ ALREADY_SENT = (
 NOT_THEIR_NAME = (
     "NOT SENT: {name!r} is not a name the visitor has told you in this conversation, so you do not "
     "have their name yet. Ask for it in one short question, then call this again with the name they say."
+)
+
+# Confirm before sending (#6, round 2): speech recognition mishears names
+# ("Gabriel" came through as "Debriel") and numbers, and an email cannot be
+# unsent. So every send tool refuses until the visitor's name (and the phone
+# or email going with it) was read back to them in an earlier reply — their
+# yes, or their correction, came after they heard it (MiaAgent._send_confirmed).
+NOT_CONFIRMED = (
+    "NOT SENT: you have not read {what} back to the visitor. Before any send, read back their full "
+    "name and any phone or email they gave, in one short sentence, and ask if it is right; ask them "
+    "to spell the name if you are not sure of it. Call this again, with what they confirmed, only "
+    "after they say yes or correct it."
+)
+
+# take_message in the same turn the message was dictated: she hasn't read it
+# back yet (the same check send_suggestion already makes).
+JUST_DICTATED = (
+    "NOT SENT yet: the visitor has only just dictated the message. Read it back once, with their "
+    "name and any phone or email they gave, ask whether it is right, and call this again once "
+    "they say yes."
 )
 
 # check_calendar / book_meeting when the calendar isn't set up (meetings.configured)
@@ -705,6 +735,10 @@ class MiaAgent(Agent):
         # Everything the visitor said so far (llm_node): a name a tool is
         # given must be one of theirs (_visitor_named).
         self._visitor_lines: list[str] = []
+        # Everything she said, per visitor turn (transcription_node, so only
+        # replies that actually played): a send goes out only after the name
+        # and contact were read back in an earlier turn (#6, _send_confirmed).
+        self._read_backs: list[tuple[int, str]] = []
         # The visitor turn in which notify_member last answered NOTIFIED (NOTIFY_CLAIM).
         self._notify_turn = -1
         # The visitor turn in which a tool last tried to send an email
@@ -786,6 +820,23 @@ class MiaAgent(Agent):
                 logger.info("visitor_name %r is %s's name, refused", name, member.full_name)
                 return False
         return True
+
+    def _send_confirmed(self, visitor_name: str, contact: str = "") -> str | None:
+        """#6 (round 2): before anything is sent, the visitor's name and the
+        phone or email going with it must have been read back to them in an
+        earlier reply, so their yes — or their correction — came after they
+        heard what she was about to send. None when that happened; otherwise
+        the NOT SENT answer telling her to read it back and ask first."""
+        earlier = [t for turn, t in self._read_backs if turn < self._visitor_turns]
+        missing: list[str] = []
+        if visitor_name.strip() and not visitor_said_name(visitor_name, earlier):
+            missing.append(f"the visitor's name, {visitor_name}")
+        if contact.strip() and not contact_read_back(contact, earlier):
+            missing.append(f"their contact, {contact}")
+        if not missing:
+            return None
+        logger.info("send refused, not read back yet: %s", " and ".join(missing))
+        return NOT_CONFIRMED.format(what=" and ".join(missing))
 
     def _just_dictated(self, text: str) -> bool:
         """True when `text` is mostly the visitor's latest words: they have
@@ -1021,6 +1072,9 @@ class MiaAgent(Agent):
                 shown = True
                 self._show_contact_card()
             yield chunk
+        if said.strip():
+            # What she said in this turn, for the read-back check (#6).
+            self._read_backs.append((self._visitor_turns, said))
         if NOTIFY_CLAIM.search(said) and not self._notifications_sent:
             self._spawn(self._check_notify_claim(self._visitor_turns, said))
 
@@ -1106,6 +1160,12 @@ class MiaAgent(Agent):
         if self._is_repeat("message", member.email, message):
             self._show_sent("message", self._display_name(member))
             return ALREADY_SENT.format(what="This message", to=member.full_name)
+        if self._just_dictated(message):
+            # Seen by Chat W after an unanswered call: the message went out in
+            # the same turn it was dictated, never read back.
+            return JUST_DICTATED
+        if (unconfirmed := self._send_confirmed(visitor_name, reply_contact)) is not None:
+            return unconfirmed
         if not await send_message_email(member, visitor_name, message, reply_contact):
             return "NOT SENT: the email could not be delivered. Say so plainly and give the contact details."
         self._messages_sent += 1
@@ -1146,6 +1206,8 @@ class MiaAgent(Agent):
         if self._is_repeat("notify", found.email, visitor_name):
             self._show_sent("notify", found.full_name)
             return ALREADY_SENT.format(what=f"The notice that {visitor_name} is here", to=found.full_name)
+        if (unconfirmed := self._send_confirmed(visitor_name)) is not None:
+            return unconfirmed
         if not await send_visitor_waiting_email(found, visitor_name, note):
             return "NOT SENT: the email could not be delivered. Say so plainly and give the contact details."
         logger.info("notify_member: told %s that %s is here", found.full_name, visitor_name)
@@ -1156,14 +1218,16 @@ class MiaAgent(Agent):
         # The words to say come with the result, not from the prompt: given
         # them up front, Gemini sometimes said "J'ai prévenu Alexandre" without
         # calling this at all (seen on the base branch 3 times out of 3).
+        # An email went out, that is all: never "{first} will get back to you"
+        # — a promise on someone else's behalf (boss note, 2026-10-12).
         first = found.first_name
         return (
             f"NOTIFIED {found.full_name} by email. Now tell the visitor, in their language, that you let "
-            f"{first} know they are here and that {first} will get back to them, then ask whether they "
-            f"would like to leave {first} a message too. For example, in English: I've let {first} know "
-            f"you're here, {first} will get back to you. Would you like to leave a message too? In French: "
-            f"J'ai prévenu {first} que vous êtes ici, {first} va vous revenir. Voulez-vous lui laisser un "
-            "message aussi ?"
+            f"{first} know they are here, then ask whether they would like to leave {first} a message too. "
+            f"An email went out, and that is all you know: never promise that {first} will come, answer or "
+            f"get back to them. For example, in English: I've let {first} know you're here. Would you like "
+            f"to leave a message too? In French: J'ai prévenu {first} que vous êtes ici. Voulez-vous lui "
+            "laisser un message aussi ?"
         )
 
     @function_tool()
@@ -1233,6 +1297,10 @@ class MiaAgent(Agent):
         if self._is_repeat("suggestion", INBOX.email, suggestion):
             self._show_sent("suggestion")
             return ALREADY_SENT.format(what="This suggestion", to="the team")
+        # A name or contact they gave must have been read back (#6); a
+        # suggestion with neither stays anonymous and needs no read-back.
+        if (unconfirmed := self._send_confirmed(visitor_name, reply_contact)) is not None:
+            return unconfirmed
         if not await send_suggestion_email(INBOX, suggestion, visitor_name, reply_contact):
             return "NOT SENT: the email could not be delivered. Say so plainly and give the contact details."
         self._suggestions_sent += 1
@@ -1305,6 +1373,24 @@ class MiaAgent(Agent):
         )
         logger.info("project request sent: %s", fields)
         return "SENT to the team's general inbox."
+
+    @function_tool()
+    async def show_directions(self, context: RunContext) -> str:
+        """Show the directions card on the kiosk screen: the office address and a QR code that opens Google Maps.
+
+        Call this, in the same reply where you give the address, whenever the
+        visitor asks where the office is, how to get there or how to find it,
+        or for the address, directions, a map or Google Maps.
+        """
+        # busy_for: saying the address right after would otherwise bring up
+        # the contact card over this one (gives_contact_details).
+        self._show(directions_card(self._chosen_language), busy_for=DIRECTIONS_CARD_S)
+        logger.info("directions card shown")
+        return (
+            "SHOWN: the directions card is on the screen, with the office address and a QR code that "
+            "opens Google Maps. Tell the visitor the address, seventy four Turgeon Street in Sainte "
+            "Therese, and that they can scan the QR code on the screen with their phone for directions."
+        )
 
     def _meeting_with(self, said: str):
         """(member, calendar key, name to say) for who a meeting is with, or
@@ -1441,6 +1527,8 @@ class MiaAgent(Agent):
                 f"NOT BOOKED AGAIN: this meeting with {name} is already booked in this conversation. "
                 "Tell the visitor it is already booked."
             )
+        if (unconfirmed := self._send_confirmed(visitor_name, contact)) is not None:
+            return unconfirmed.replace("NOT SENT", "NOT BOOKED", 1)
         topic = topic.strip()[:300]
         if not await meetings.create_meeting(start, minutes, key, name, visitor_name.strip(), contact, topic, ASSISTANT_NAME):
             return CALENDAR_UNREADABLE.replace("could not be read", "did not accept the booking")
@@ -1653,6 +1741,8 @@ class MiaAgent(Agent):
                 f"NOT CALLED AGAIN: you already called {found.first_name} in this conversation. Offer to take a "
                 f"message for {found.first_name}; call again only if the visitor clearly asks you to try again."
             )
+        if (unconfirmed := self._send_confirmed(visitor_name)) is not None:
+            return unconfirmed.replace("NOT SENT", "NOT CALLED", 1)
         call = await start_staff_call(found, visitor_name, ASSISTANT_NAME)
         if call is None:
             return "NOT CALLED: the call could not be placed. Say so plainly and offer to take a message instead."
