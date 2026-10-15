@@ -14,6 +14,7 @@ import asyncio
 import re
 import sys
 
+from conversation_control import speak_for_voice
 from test_team_messages import Conversation, calls, converse, install_recorders, test_find_member, use_assistant_name
 
 failures: list[str] = []
@@ -202,7 +203,12 @@ async def note7_infiniview() -> None:
     ])
     check(has(replies[0], "yes", "I am", "I'm in", "that's right", "indeed"), "#7 says yes, she's in Infini-View")
     check(has(replies[1], "touch", "pan", "slid", "swip", "drag"), "#7 explains touch and pan")
-    check(has(replies[2], "infini dash view"), "#8 says the web address infini dash view dot com")
+    # Spoken or written form: the voice-only rewrite (speak_addresses) turns
+    # "www.infini-view.com" into "w w w dot infini dash view dot com".
+    check(
+        has(replies[2], "infini dash view") or has(replies[2], "infini-view.com"),
+        "#8 gives the web address infini-view.com",
+    )
     check(has(replies[2], "door"), "#8 suggests the door for a demo")
     print("— #7/#8 French, Infini-View:")
     replies = await converse("fr", ["Est-ce que c'est Infini-View ici ? Où est-ce que je peux voir une démo ?"])
@@ -243,17 +249,26 @@ async def note21_impatient() -> None:
     check(has(replies[0], "limite"), "#21 limite de mon système (FR)")
 
 
+def _one_by_one(text: str, words: str) -> bool:
+    """'one, five, one, four' — or '1, 5, 1, 4', which the voice reads digit by digit."""
+    return has(text, words) or bool(re.search(r"1\D{1,4}5\D{1,4}1\D{1,4}4", text))
+
+
 async def note6_phone() -> None:
+    # Checked on what the visitor HEARS: her text after the worker's voice-only
+    # rewrite (tts_node -> speak_for_voice), which turns a written
+    # "514 573 2324" into grouped spoken digits. Captions keep the numerals.
     print("— #6 English, phone number then slowly:")
     replies = await converse("en", ["What's your phone number?", "Can you repeat it slowly please?"])
-    check(not re.search(r"\d", " ".join(replies)), "#6 no digits written as numerals")
-    check(not has(" ".join(replies), "hundred", "fourteen", "fifty", "seventy", "thirty", "twenty"), "#6 no grouped numbers")
-    check(has(replies[0], "five one four"), "#6 grouped digits")
-    check(has(replies[1], "one, five, one, four"), "#6 digit by digit when slow")
+    heard = [speak_for_voice(r, "en") for r in replies]
+    check(not has(" ".join(heard), "hundred", "fourteen", "fifty", "seventy", "thirty", "twenty"), "#6 no grouped numbers")
+    check(has(heard[0], "five one four"), "#6 grouped digits")
+    check(_one_by_one(heard[1], "one, five, one, four"), "#6 digit by digit when slow")
     print("— #6 French:")
     replies = await converse("fr", ["Quel est votre numéro de téléphone ?", "Pouvez-vous le répéter lentement ?"])
-    check(has(replies[0], "cinq un quatre"), "#6 chiffres groupés (FR)")
-    check(has(replies[1], "un, cinq, un, quatre"), "#6 chiffre par chiffre (FR)")
+    heard = [speak_for_voice(r, "fr") for r in replies]
+    check(has(heard[0], "cinq un quatre"), "#6 chiffres groupés (FR)")
+    check(_one_by_one(heard[1], "un, cinq, un, quatre"), "#6 chiffre par chiffre (FR)")
 
 
 async def note1_team() -> None:

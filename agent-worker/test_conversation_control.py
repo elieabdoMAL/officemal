@@ -13,6 +13,7 @@ from conversation_control import (
     language_switch,
     only_name,
     says_name,
+    speak_addresses,
     speak_digits,
     speak_digits_stream,
     visitor_said_name,
@@ -280,6 +281,34 @@ def test_digits_stream() -> None:
     print(f"✓ speak_digits_stream: {len(cases)} cases (numbers split across chunks)")
 
 
+def test_addresses() -> None:
+    check(
+        speak_addresses,
+        {
+            ("The demo reel is at www.infini-view.com.", "en"): "The demo reel is at w w w dot infini dash view dot com.",
+            ("La démo est sur www.infini-view.com.", "fr"): "La démo est sur w w w point infini tiret view point com.",
+            ("Write to info@mobileappslabs.com today", "en"): "Write to info at mobile apps labs dot com today",
+            ("Écrivez à info@mobileappslabs.com.", "fr"): "Écrivez à info arobase mobile apps labs point com.",
+            ("See https://mobileappslabs.com/fr/ for more", "en"): "See mobile apps labs dot com slash fr for more",
+            ("We are at 74 Turgeon Street. Open 9 to 5.", "en"): "We are at 74 Turgeon Street. Open 9 to 5.",
+            ("Thanks. That's all.", "en"): "Thanks. That's all.",
+        },
+        "speak_addresses",
+    )
+
+
+def test_addresses_stream() -> None:
+    cases = {
+        ("Visit www.infini-", "view.com for the demo."): "Visit w w w dot infini dash view dot com for the demo.",
+        ("Email info@mobile", "appslabs.com, or call 1 514 573 2324."): "Email info at mobile apps labs dot com, or call one, five one four, five seven three, two three two four.",
+        ("All good. ", "See you!"): "All good. See you!",
+    }
+    for chunks, expected in cases.items():
+        got = asyncio.run(_stream(list(chunks), "en"))
+        assert got == expected, f"stream {chunks!r} -> {got!r}, expected {expected!r}"
+    print(f"✓ addresses in the stream: {len(cases)} cases")
+
+
 if __name__ == "__main__":
     test_pause()
     test_name()
@@ -287,4 +316,6 @@ if __name__ == "__main__":
     test_visitor_name()
     test_digits()
     test_digits_stream()
+    test_addresses()
+    test_addresses_stream()
     print("all conversation_control tests passed")

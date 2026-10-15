@@ -496,8 +496,54 @@ def speak_digits(text: str, lang: str) -> str:
     return _RUN.sub(lambda m: _rewrite_run(m.group(0), lang), text)
 
 
-# What may still be the start of a number at the end of a streamed chunk.
-_OPEN_TAIL = re.compile(rf"(?:\+|\(|\d|{_SEP})*$")
+# Web and email addresses, for the voice only (captions keep them written).
+# Gemini writes "www.infini-view.com" or "info@mobileappslabs.com" even when the
+# prompt spells them out; read as-is the TTS runs "mobileappslabs" together and
+# may drop the dots and dashes.
+_ADDRESS = re.compile(
+    r"\b(?:https?://)?(?:[a-z0-9._%+-]+@)?(?:www\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:com|ca|net|org|io|fr)\b(?:/[\w./-]*)?",
+    re.IGNORECASE,
+)
+ADDRESS_WORDS = {
+    "en": {"@": " at ", ".": " dot ", "-": " dash ", "/": " slash ", "www": "w w w"},
+    "fr": {"@": " arobase ", ".": " point ", "-": " tiret ", "/": " barre oblique ", "www": "w w w"},
+}
+# Names the TTS can't split on its own.
+_ADDRESS_SPLITS = {"mobileappslabs": "mobile apps labs"}
+
+
+def _say_address(addr: str, lang: str) -> str:
+    words = ADDRESS_WORDS.get(lang, ADDRESS_WORDS["en"])
+    addr = re.sub(r"^https?://", "", addr, flags=re.IGNORECASE).rstrip("/")
+    parts = re.split(r"([@./-])", addr)
+    out = []
+    for p in parts:
+        if p in words:
+            out.append(words[p])
+        elif p.lower() == "www":
+            out.append(words["www"])
+        else:
+            out.append(_ADDRESS_SPLITS.get(p.lower(), p))
+    return re.sub(r"\s+", " ", "".join(out)).strip()
+
+
+def speak_addresses(text: str, lang: str) -> str:
+    """Rewrite web and email addresses the way a person says them.
+
+    "www.infini-view.com" -> "w w w dot infini dash view dot com"
+    "info@mobileappslabs.com" (fr) -> "info arobase mobile apps labs point com"
+    """
+    return _ADDRESS.sub(lambda m: _say_address(m.group(0), lang), text)
+
+
+def speak_for_voice(text: str, lang: str) -> str:
+    """Every voice-only rewrite: phone numbers and long digit runs, addresses."""
+    return speak_addresses(speak_digits(text, lang), lang)
+
+
+# What may still be the start of a number at the end of a streamed chunk, or
+# the unfinished end of an address ("…at www.infini-" + "view.com").
+_OPEN_TAIL = re.compile(rf"(?:(?:\+|\(|\d|{_SEP})*|\S*[@.\-]\S*|\S*www\S*)$", re.IGNORECASE)
 
 
 async def speak_digits_stream(text: AsyncIterable[str], lang: Callable[[], str]) -> AsyncIterator[str]:
@@ -512,7 +558,7 @@ async def speak_digits_stream(text: AsyncIterable[str], lang: Callable[[], str])
         pending += chunk
         cut = _OPEN_TAIL.search(pending).start()  # type: ignore[union-attr]
         if cut > 0:
-            yield speak_digits(pending[:cut], lang())
+            yield speak_for_voice(pending[:cut], lang())
             pending = pending[cut:]
     if pending:
-        yield speak_digits(pending, lang())
+        yield speak_for_voice(pending, lang())
